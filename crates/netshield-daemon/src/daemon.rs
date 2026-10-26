@@ -124,8 +124,12 @@ fn install_signal_handlers() -> std::io::Result<()> {
    Ok(())
 }
 
-/// Brings the nftables table up: adopt, replace or install.
-fn adopt_or_install(config: &Config) -> Result<(), DaemonError> {
+/// Brings the nftables table up: adopt, replace or install, then verify it.
+///
+/// Returns whether [`firewall::verify`] confirmed the table at startup, which is what
+/// [`StatusInfo::table_verified`] publishes. There is no state in which the table failed
+/// the check: that is an error, not a status.
+fn adopt_or_install(config: &Config) -> Result<bool, DaemonError> {
    // Verify is the only reliable existence check: it fails both when the table is absent
    // and when it exists but is not the table this configuration describes.
    if firewall::verify(config.queue_num, config.dns_queue_num).is_ok() {
@@ -135,7 +139,7 @@ fn adopt_or_install(config: &Config) -> Result<(), DaemonError> {
          config.queue_num,
          config.dns_queue_num
       );
-      return Ok(());
+      return Ok(true);
    }
 
    info!(
@@ -149,7 +153,7 @@ fn adopt_or_install(config: &Config) -> Result<(), DaemonError> {
       true,
    )?;
    firewall::verify(config.queue_num, config.dns_queue_num)?;
-   Ok(())
+   Ok(true)
 }
 
 /// The daemon's runtime state, owned by the main loop.
@@ -167,6 +171,7 @@ struct Daemon {
    queue_drops: u64,
    last_gui_spawn: Option<Instant>,
    silent_warned: bool,
+   table_verified: bool,
 }
 
 impl Daemon {
@@ -177,6 +182,7 @@ impl Daemon {
       ipc: IpcHandle,
       queue: NfQueue,
       dns_cache: Arc<Mutex<DnsCache>>,
+      table_verified: bool,
    ) -> Self {
       let policy = Policy::new(ruleset_from_store(&store), config.default_action);
       let started_at = now_secs();
@@ -194,6 +200,7 @@ impl Daemon {
          queue_drops: 0,
          last_gui_spawn: None,
          silent_warned: false,
+         table_verified,
       }
    }
 
@@ -214,7 +221,7 @@ impl Daemon {
          pending_prompts: self.pending.len(),
          queue_num: self.config.queue_num,
          queue_drops: self.queue_drops,
-         fail_open: false,
+         table_verified: self.table_verified,
          started_at: self.started_at,
       }
    }
@@ -255,7 +262,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       store.rules().len(),
       config.rules_path.display()
    );
-   adopt_or_install(&config)?;
+   let table_verified = adopt_or_install(&config)?;
 
    let (ipc, queue, dns_queue) = match start_runtime(&config) {
       Ok(started) => started,
@@ -281,7 +288,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       return Err(err);
    }
 
-   let mut daemon = Daemon::start(config, store, ipc, queue, cache);
+   let mut daemon = Daemon::start(config, store, ipc, queue, cache, table_verified);
    daemon.publish_rules();
    daemon.publish_status();
    info!(
@@ -930,12 +937,17 @@ fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
 /// The transport payload of one captured IP packet, and whether it is TCP.
 ///
 /// `packet::parse` reports the addresses and ports but not where the transport payload
-/// starts, and the DNS parsers need exactly those bytes; a DNS message read from the start
-/// of the IP header would decode the IP header as a DNS header. Every offset is checked,
-/// so a truncated or hostile datagram yields `None` rather than a panic.
-fn transport_payload(payload: &[u8]) -> Option<(&[u8], bool)> {
+/// starts, and the DNS parsers need exactly those bytes; a DNS message read from the
+/// start of the IP header would decode the IP header as a DNS header, which is how the
+/// first live run managed to parse nothing at all. The returned slice starts after the
+/// UDP header's fixed eight bytes, or after the variable-length TCP header.
+///
+/// Every offset is checked, so a truncated or hostile datagram yields `None` rather than
+/// a panic; a transport header with no payload (an eight-byte UDP datagram, a bare TCP
+/// header) is `None` too, because there is no DNS message to hand to the parser.
+pub(crate) fn transport_payload(payload: &[u8]) -> Option<(&[u8], bool)> {
    let first = *payload.first()?;
-   let (start, end, proto) = match first >> 4 {
+   let (transport, end, proto) = match first >> 4 {
       4 => {
          let ihl = usize::from(first & 0x0f);
          if ihl < 5 {
@@ -1008,12 +1020,28 @@ fn transport_payload(payload: &[u8]) -> Option<(&[u8], bool)> {
       _ => return None,
    };
 
-   let body = payload.get(start..end)?;
-   match proto {
-      6 => Some((body, true)),
-      17 => Some((body, false)),
-      _ => None,
+   let start = match proto {
+      // TCP's data offset is the high nibble of byte 12 of its header, in 32-bit words;
+      // five words (20 bytes) is the minimum a header can be.
+      6 => {
+         let data_offset = usize::from(*payload.get(transport.checked_add(12)?)? >> 4) * 4;
+         if data_offset < 20 {
+            return None;
+         }
+         transport.checked_add(data_offset)?
+      }
+      // The UDP header is always exactly eight bytes.
+      17 => transport.checked_add(8)?,
+      _ => return None,
+   };
+
+   // A header that claims more bytes than the datagram holds, and a transport header
+   // with no payload at all, both leave nothing for the DNS parser.
+   if start >= end {
+      return None;
    }
+   let body = payload.get(start..end)?;
+   Some((body, proto == 6))
 }
 
 /// Validates the machine is ready to run the daemon, then leaves it as it was found.
@@ -1127,5 +1155,262 @@ mod tests {
          data.l4,
          L4Payload::Tcp { flags, .. } if !flags.syn()
       ));
+   }
+
+   /// The DNS transaction id the fixtures below carry.
+   const DNS_ID: u16 = 0x4242;
+
+   /// The client port a DNS answer is delivered to, chosen so its high byte has `QR`
+   /// clear: a parser handed the UDP header instead of the message would read the
+   /// destination port as the DNS flags and report [`DnsError::NotResponse`].
+   const CLIENT_PORT: u16 = 20_001;
+
+   /// The address the fixture's `A` record points at.
+   const ANSWER: [u8; 4] = [93, 184, 216, 34];
+
+   fn labels(name: &str) -> Vec<u8> {
+      let mut bytes = Vec::new();
+      for label in name.split('.') {
+         bytes.push(label.len() as u8);
+         bytes.extend_from_slice(label.as_bytes());
+      }
+      bytes.push(0);
+      bytes
+   }
+
+   /// A real `example.com A 93.184.216.34` response, transaction id [`DNS_ID`].
+   fn a_record_response() -> Vec<u8> {
+      let mut msg = vec![0u8; 12];
+      msg[0..2].copy_from_slice(&DNS_ID.to_be_bytes());
+      msg[2] = 0x81; // QR set, recursion desired
+      msg[3] = 0x80; // recursion available
+      msg[4..6].copy_from_slice(&1u16.to_be_bytes()); // qdcount
+      msg[6..8].copy_from_slice(&1u16.to_be_bytes()); // ancount
+      msg.extend_from_slice(&labels("example.com"));
+      msg.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+      msg.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+      msg.extend_from_slice(&[0xc0, 0x0c]); // the question's name, compressed
+      msg.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+      msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+      msg.extend_from_slice(&300u32.to_be_bytes()); // TTL
+      msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+      msg.extend_from_slice(&ANSWER);
+      msg
+   }
+
+   /// An IPv4 packet with `options` bytes of IP options and `proto` as its transport.
+   fn ipv4_packet(proto: u8, transport: &[u8], options: usize) -> Vec<u8> {
+      assert_eq!(
+         options % 4,
+         0,
+         "IP options are padded to 32-bit words"
+      );
+      let header = 20 + options;
+      let total = header + transport.len();
+      let mut bytes = vec![0u8; header];
+      bytes[0] = 0x40 | (header / 4) as u8;
+      bytes[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+      bytes[8] = 64;
+      bytes[9] = proto;
+      bytes[12..16].copy_from_slice(&[192, 0, 2, 53]);
+      bytes[16..20].copy_from_slice(&[192, 0, 2, 10]);
+      // IP options are padding (option 0, end of list).
+      bytes.extend_from_slice(transport);
+      bytes
+   }
+
+   /// A UDP datagram carrying `dns`, source port 53 to the fixture's client port.
+   fn udp_datagram(dns: &[u8]) -> Vec<u8> {
+      let mut bytes = vec![0u8; 8];
+      bytes[0..2].copy_from_slice(&53u16.to_be_bytes());
+      bytes[2..4].copy_from_slice(&CLIENT_PORT.to_be_bytes());
+      bytes[4..6].copy_from_slice(&((8 + dns.len()) as u16).to_be_bytes());
+      bytes.extend_from_slice(dns);
+      bytes
+   }
+
+   /// A TCP segment with `data_offset` words of header (`options` fills the rest) that
+   /// carries `dns` behind the two-byte length prefix DNS over TCP requires.
+   fn tcp_segment(dns: &[u8], data_offset: u8, options: &[u8]) -> Vec<u8> {
+      let header = usize::from(data_offset) * 4;
+      assert_eq!(header, 20 + options.len());
+      let mut bytes = vec![0u8; header];
+      bytes[0..2].copy_from_slice(&53u16.to_be_bytes());
+      bytes[2..4].copy_from_slice(&CLIENT_PORT.to_be_bytes());
+      bytes[12] = data_offset << 4;
+      bytes[20..].copy_from_slice(options);
+      bytes.extend_from_slice(&(dns.len() as u16).to_be_bytes());
+      bytes.extend_from_slice(dns);
+      bytes
+   }
+
+   fn ipv6_packet(next_header: u8, transport: &[u8]) -> Vec<u8> {
+      let mut bytes = vec![0u8; 40];
+      bytes[0] = 0x60;
+      bytes[4..6].copy_from_slice(&(transport.len() as u16).to_be_bytes());
+      bytes[6] = next_header;
+      bytes[7] = 64;
+      bytes[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 53]);
+      bytes[24..40].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]);
+      bytes.extend_from_slice(transport);
+      bytes
+   }
+
+   /// The exact test that would have caught the live defect: an IPv4/UDP answer whose
+   /// payload must start at the DNS message, not at the UDP header.
+   #[test]
+   fn ipv4_udp_dns_answer_reaches_the_parser_and_the_cache() {
+      let dns = a_record_response();
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+
+      let (body, tcp) = transport_payload(&packet).expect("the UDP payload is found");
+      assert!(!tcp, "UDP is not TCP");
+      assert_eq!(
+         body.get(0..2),
+         Some(DNS_ID.to_be_bytes().as_slice()),
+         "the payload starts at the DNS transaction id, not the UDP header"
+      );
+      let records = parse_response(body).expect("the answer parses");
+      assert_eq!(records.len(), 1);
+      assert_eq!(records[0].name, "example.com");
+      assert_eq!(
+         records[0].kind,
+         netshield_core::dns::RecordKind::A
+      );
+      assert_eq!(
+         records[0].target,
+         Target::Address(IpAddr::V4(std::net::Ipv4Addr::from(ANSWER)))
+      );
+
+      // And the daemon's own caching path learns the name for that address, which is what
+      // a prompt needs to offer a domain scope.
+      let cache = Mutex::new(DnsCache::new());
+      cache_answer(&cache, &packet);
+      let addr = IpAddr::V4(std::net::Ipv4Addr::from(ANSWER));
+      assert_eq!(
+         cache.lock().expect("dns cache").primary(addr, now_secs()),
+         Some("example.com")
+      );
+   }
+
+   #[test]
+   fn ipv6_udp_dns_answer_reaches_the_parser() {
+      let dns = a_record_response();
+      let packet = ipv6_packet(17, &udp_datagram(&dns));
+
+      let (body, tcp) = transport_payload(&packet).expect("the UDP payload is found");
+      assert!(!tcp);
+      assert_eq!(
+         body.get(0..2),
+         Some(DNS_ID.to_be_bytes().as_slice())
+      );
+      let records = parse_response(body).expect("the answer parses");
+      assert_eq!(records.len(), 1);
+      assert_eq!(
+         records[0].target,
+         Target::Address(IpAddr::V4(std::net::Ipv4Addr::from(ANSWER)))
+      );
+   }
+
+   #[test]
+   fn tcp_data_offset_is_honoured_with_options_present() {
+      let dns = a_record_response();
+      let options = [0x01, 0x01, 0x08, 0x0a, 0, 0, 0, 1, 0, 0, 0, 2];
+      let segment = tcp_segment(&dns, 8, &options);
+      let packet = ipv4_packet(6, &segment, 0);
+
+      let (body, tcp) = transport_payload(&packet).expect("the TCP payload is found");
+      assert!(tcp, "the transport is TCP");
+      assert_eq!(
+         usize::from(u16::from_be_bytes([body[0], body[1]])),
+         dns.len(),
+         "the two-byte length prefix belongs to the payload"
+      );
+      let records = parse_tcp_response(body).expect("the TCP answer parses");
+      assert_eq!(records.len(), 1);
+      assert_eq!(records[0].name, "example.com");
+   }
+
+   #[test]
+   fn a_non_zero_ipv4_ihl_still_finds_the_payload() {
+      let dns = a_record_response();
+      // Twenty bytes of IP options, so the transport header starts at 40, not 20.
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 20);
+      assert_eq!(
+         packet[0] & 0x0f,
+         10,
+         "the fixture has a 40-byte IP header"
+      );
+
+      let (body, _) = transport_payload(&packet).expect("the payload is found");
+      assert_eq!(
+         body.get(0..2),
+         Some(DNS_ID.to_be_bytes().as_slice())
+      );
+      assert!(parse_response(body).is_ok());
+   }
+
+   #[test]
+   fn a_udp_datagram_without_payload_is_none() {
+      let packet = ipv4_packet(17, &udp_datagram(&[]), 0);
+      assert_eq!(
+         packet.len(),
+         28,
+         "20-byte IP header plus 8-byte UDP header"
+      );
+      assert!(transport_payload(&packet).is_none());
+   }
+
+   #[test]
+   fn claimed_lengths_past_the_buffer_are_none() {
+      let dns = a_record_response();
+
+      // The IP total length claims bytes the capture does not hold.
+      let mut overlong = ipv4_packet(17, &udp_datagram(&dns), 0);
+      overlong[2..4].copy_from_slice(&2000u16.to_be_bytes());
+      assert!(transport_payload(&overlong).is_none());
+
+      // The IPv6 payload length makes the same claim.
+      let mut overlong_v6 = ipv6_packet(17, &udp_datagram(&dns));
+      overlong_v6[4..6].copy_from_slice(&2000u16.to_be_bytes());
+      assert!(transport_payload(&overlong_v6).is_none());
+
+      // IPv6 with the fixed 40-byte header as the whole datagram: the buffer is shorter
+      // than the header it claims.
+      let mut truncated_v6 = ipv6_packet(17, &udp_datagram(&dns));
+      truncated_v6.truncate(30);
+      truncated_v6[4..6].copy_from_slice(&(udp_datagram(&dns).len() as u16).to_be_bytes());
+      assert!(transport_payload(&truncated_v6).is_none());
+
+      // A TCP header that claims eight words (32 bytes) while only 24 bytes of segment
+      // were captured, so the payload would start past the end of the datagram.
+      let segment = tcp_segment(&dns, 8, &[0x01; 12]);
+      let mut short_tcp = ipv4_packet(6, &segment[..24], 0);
+      short_tcp[20 + 12] = 8 << 4;
+      assert!(transport_payload(&short_tcp).is_none());
+   }
+
+   #[test]
+   fn every_prefix_of_a_valid_packet_is_ok_or_none_and_never_panics() {
+      let dns = a_record_response();
+      for packet in [
+         ipv4_packet(17, &udp_datagram(&dns), 0),
+         ipv4_packet(6, &tcp_segment(&dns, 8, &[0x01; 12]), 0),
+         ipv6_packet(17, &udp_datagram(&dns)),
+      ] {
+         for len in 0..=packet.len() {
+            if let Some((body, tcp)) = transport_payload(&packet[..len]) {
+               assert!(
+                  !body.is_empty(),
+                  "a returned payload is never empty"
+               );
+               let _ = if tcp {
+                  parse_tcp_response(body)
+               } else {
+                  parse_response(body)
+               };
+            }
+         }
+      }
    }
 }

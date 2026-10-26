@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 use log::{error, info};
 use netshield_core::Config;
+use netshield_core::config::LogLevel;
 use netshield_daemon::daemon;
 use netshield_daemon::firewall::{self, FirewallError};
 use netshield_daemon::ipc_server;
@@ -250,7 +251,15 @@ fn main() -> ExitCode {
       }
    };
 
-   logging::init(log::LevelFilter::Info);
+   // The logger has to be installed before anything can be logged, but every mode that
+   // has a configuration installs it at the configured level: a daemon that only ever
+   // logged at Info hid the debug-level DNS parse failure behind a setting it recorded
+   // and never applied. `--help` and `--version` load no configuration and only print.
+   let level = match args.mode {
+      Mode::Help | Mode::Version => LogLevel::Info,
+      Mode::Probe | Mode::Daemon | Mode::Check => config_level(&args.config),
+   };
+   logging::init(logging::level_filter(level));
 
    match args.mode {
       Mode::Help => {
@@ -284,6 +293,14 @@ fn main() -> ExitCode {
          }
       }
    }
+}
+
+/// The configured verbosity, or the default when no configuration could be read.
+///
+/// A configuration that does not parse is reported by the mode itself, in the mode's own
+/// error format; guessing a level here must not pre-empt that message.
+fn config_level(path: &std::path::Path) -> LogLevel {
+   Config::load(path).map(|config| config.log_level).unwrap_or_default()
 }
 
 /// Whether the process holds root, read from `/proc` so no raw syscall is needed here.

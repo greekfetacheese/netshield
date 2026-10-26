@@ -692,7 +692,7 @@ mod tests {
          pending_prompts: 0,
          queue_num: 0,
          queue_drops: 0,
-         fail_open: false,
+         table_verified: true,
          started_at: 1,
       }
    }

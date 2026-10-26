@@ -224,9 +224,11 @@ pub struct StatusInfo {
    pub pending_prompts: usize,
    pub queue_num: u16,
    pub queue_drops: u64,
-   /// True while the nftables `bypass` flag is in force, which means traffic is not
-   /// actually being filtered.
-   pub fail_open: bool,
+   /// True when the daemon verified the nftables table at startup, whether it adopted an
+   /// existing one or installed a fresh one. False is not a fail-open promise: the only
+   /// way to observe enforcement from inside the daemon is this check, and an unverified
+   /// table is a startup error, not a running state.
+   pub table_verified: bool,
    pub started_at: u64,
 }
 
@@ -384,7 +386,7 @@ mod tests {
             pending_prompts: 1,
             queue_num: 0,
             queue_drops: 2,
-            fail_open: false,
+            table_verified: true,
             started_at: 100,
          }),
          Response::Error {
