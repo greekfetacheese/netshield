@@ -41,6 +41,8 @@ dependencies = [
  "libc",
  "log",
  "netshield-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
