@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use netshield_core::connection::{Family, L4Proto};
-use netshield_core::ipc::{ConnectionEvent, ConnectionView, Mode, Request, Response};
+use netshield_core::ipc::{ConnectionEvent, ConnectionView, Mode, Request, Response, StatusInfo};
 use netshield_core::rule::Rule;
 
 use crate::Cli;
@@ -39,6 +39,8 @@ pub struct App {
    alert: bool,
    pending_prompts: usize,
    mode: Mode,
+   /// Latest snapshot; `None` until the daemon answers the first `Status` request.
+   status: Option<StatusInfo>,
    next_refresh: Instant,
    rules: Vec<Rule>,
    confirm: ui::rules::Confirm,
@@ -93,6 +95,7 @@ impl App {
          alert: cli.alert,
          pending_prompts: 0,
          mode: Mode::Alert,
+         status: None,
          next_refresh: Instant::now() + REFRESH_EVERY,
          rules: Vec::new(),
          confirm: ui::rules::Confirm::default(),
@@ -111,6 +114,7 @@ impl App {
                   Response::Status(status) => {
                      self.mode = status.mode;
                      self.pending_prompts = status.pending_prompts;
+                     self.status = Some(status);
                   }
                   Response::Prompt(_) => self.pending_prompts += 1,
                   Response::PromptClosed { .. } => {
@@ -217,11 +221,16 @@ impl App {
             let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
             self.apply_actions(actions);
          }
-         _ => {
-            ui.heading(self.page.name());
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("This page is not implemented yet.").weak());
+         Page::Settings => {
+            if let Some(mode) = ui::settings::show(ui, self.mode) {
+               if let Some(client) = &self.ipc {
+                  client.send(&Request::SetMode { mode });
+               }
+               // Move the radio at once instead of waiting a round trip for the daemon.
+               self.mode = mode;
+            }
          }
+         Page::Status => ui::status::show(ui, self.status.as_ref(), unix_now()),
       }
    }
 }
@@ -250,6 +259,13 @@ impl eframe::App for App {
          self.page_content(ui);
       });
    }
+}
+
+/// Seconds since the unix epoch; the UI clock, never used for enforcement.
+fn unix_now() -> u64 {
+   SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// One fake verdict so `--mock` exercises the log without a daemon.
@@ -298,9 +314,7 @@ fn synthetic_event() -> ConnectionEvent {
       },
    ];
 
-   let at = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .map_or(0, |elapsed| elapsed.as_secs());
+   let at = unix_now();
    let sample = &SAMPLES[(at / 5) as usize % SAMPLES.len()];
 
    ConnectionEvent {

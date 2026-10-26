@@ -2,3 +2,5 @@
 
 pub mod connections;
 pub mod rules;
+pub mod settings;
+pub mod status;
