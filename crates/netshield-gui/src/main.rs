@@ -1,4 +1,5 @@
 mod app;
+mod ipc;
 mod theme;
 
 fn main() -> eframe::Result {
