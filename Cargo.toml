@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/netshield-core", "crates/netshield-daemon"]
+members = ["crates/netshield-core", "crates/netshield-daemon", "crates/netshield-gui"]
 
 [workspace.package]
 version = "0.1.0"

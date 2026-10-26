@@ -1,0 +1,21 @@
+[package]
+name = "netshield-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "NetShield desktop GUI"
+
+[[bin]]
+name = "netshield-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "links", "wayland", "x11"] }
+egui = "0.37"
+egui-elements = { version = "1.4.0", features = ["full"] }
+egui-elegance = "0.17"
+egui-lucide = "0.2"
+netshield-core = { path = "../netshield-core" }
+serde_json = { workspace = true }
+log = { workspace = true }
