@@ -180,7 +180,7 @@ struct Rule {
     enabled: bool,
     app: AppMatcher,        // Any | Path(exact) | Unknown | Exe(sha256)
     dest: DestMatcher,      // Any | Domain { host, subdomains } | Ip(Cidr) | Port(u16)
-    action: Action,         // Allow | Deny
+    action: Action,         // Allow | Deny  (Reject is deferred to v2)
     duration: Duration,     // Once | Session | Forever
     note: Option<String>,
     created_at: u64,
@@ -189,19 +189,28 @@ struct Rule {
 }
 ```
 
-Specificity, highest first — the winner is the most specific matching rule:
+Specificity, highest first. The comparison is **lexicographic on (app rank, destination
+rank)**: application scope is the outer dimension, so a rule about one application always
+outranks a rule about all applications. That ordering is deliberate — a global
+"allow * → github.com" must never punch a hole in an application-level deny.
 
-| Rank | Destination matcher      | Example                                    |
-|------|--------------------------|--------------------------------------------|
-| 4    | `Domain` exact           | app X → `api.github.com`                   |
-| 3    | `Domain` + subdomains    | app X → `*.github.com`                     |
-| 2    | `Ip` (CIDR)              | app X → `140.82.0.0/16`                    |
-| 1    | `Port`                   | app X → any host, port 443                 |
-| 0    | `Any`                    | app X → anywhere                           |
+| Rank | App matcher                        | Example                        |
+|------|------------------------------------|--------------------------------|
+| 2    | `Exe(path)` / `Unknown`            | `firefox` · unattributable socket |
+| 0    | `Any`                              | every application              |
+
+| Rank | Destination matcher  | Example                                   |
+|------|----------------------|-------------------------------------------|
+| 40   | `Domain` exact       | app X → `api.github.com`                  |
+| 30   | `Domain` + subdomains| app X → `*.github.com`                    |
+| 20   | `Ip` (CIDR)          | app X → `140.82.0.0/16`                   |
+| 10   | `Port`               | app X → any host, port 443                |
+| 0    | `Any`                | app X → anywhere                          |
 
 Ties break by `Deny` before `Allow` (the safe default), then by most recently updated.
 An application with no matching rule falls through to the configured default action:
 `prompt` (v1 default), `allow` or `deny`.
+
 
 Durations:
 
