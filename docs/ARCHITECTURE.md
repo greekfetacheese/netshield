@@ -292,7 +292,9 @@ Workspace, three crates, no async runtime (blocking threads are correct here and
 - `netshield-core` — no I/O: models, rule engine, DNS/​packet parsers, config, IPC types.
   Deps: `serde`, `serde_json`.
 - `netshield-daemon` — netlink, nftables, `/proc`, IPC server. Deps: `netshield-core`,
-  `libc`, `log`.
+  `libc`, `log`, plus `serde`/`serde_json` for the rule store and the control protocol
+  (both already in the tree through core; the store is JSON by design so it can be read and
+  hand-edited).
 - `netshield-gui` — eframe/egui + `egui-elements`, `egui-elegance`, `egui-lucide`
   (pinned to the versions Zeus uses), `netshield-core`, `log`.
 

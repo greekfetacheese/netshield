@@ -10,9 +10,11 @@ which phase is current.
 1. **Read the design doc first.** If the brief and `docs/ARCHITECTURE.md` disagree, stop
    and report the contradiction — do not pick one.
 2. **No new dependencies.** The dependency set is a design decision, not an
-   implementation detail: `netshield-core` has `serde` + `serde_json` and nothing else;
-   the daemon adds `libc` and `log`; the GUI adds the egui stack pinned to the versions
-   in `Cargo.toml`. Anything else needs the orchestrator's approval first.
+   implementation detail: `netshield-core` has `serde` + `serde_json` and nothing else; the
+   daemon adds `libc`, `log`, and `serde`/`serde_json` (the rule store and the control
+   protocol are JSON, and both crates are already in the tree via core); the GUI adds the
+   egui stack pinned to the versions in `Cargo.toml`. Anything else needs the orchestrator's
+   approval first.
 3. **No async runtime.** Threads and blocking I/O. Never introduce `tokio`/`async-std`.
 4. **No `unsafe` outside `netshield-daemon/src/netlink/`** (and the `/proc` reads if a
    raw syscall is genuinely required). Every `unsafe` block carries a comment naming its
