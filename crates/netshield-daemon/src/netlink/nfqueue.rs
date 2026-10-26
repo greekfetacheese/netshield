@@ -222,6 +222,15 @@ impl NfQueue {
       Ok(())
    }
 
+   /// Bounds every later receive with `SO_RCVTIMEO`.
+   ///
+   /// Delegates to the transport so the daemon loop can wait for a packet, a prompt
+   /// deadline and a shutdown flag at the same time. A timeout surfaces as `EAGAIN` from
+   /// [`NfQueue::recv`], which the caller treats as "nothing happened".
+   pub fn set_recv_timeout(&self, timeout: std::time::Duration) -> io::Result<()> {
+      self.socket.set_recv_timeout(timeout)
+   }
+
    /// The queue number this handle is bound to.
    pub fn queue_num(&self) -> u16 {
       self.queue

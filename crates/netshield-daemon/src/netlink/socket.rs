@@ -171,6 +171,35 @@ impl NetlinkSocket {
       self.deferred.pop_front()
    }
 
+   /// Bounds every later receive with `SO_RCVTIMEO`.
+   ///
+   /// The daemon loop is otherwise blocked in `recv` indefinitely, which would make it
+   /// miss prompt deadlines, IPC requests and the SIGTERM flag. A timeout surfaces as
+   /// `EAGAIN`/`EWOULDBLOCK` from `recv_datagram`, which the caller treats as "nothing
+   /// happened, go around the loop". Passing a zero duration disables the timeout.
+   pub fn set_recv_timeout(&self, timeout: std::time::Duration) -> io::Result<()> {
+      let tv = libc::timeval {
+         tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+         tv_usec: libc::suseconds_t::from(timeout.subsec_micros()),
+      };
+      // SAFETY: the descriptor is owned by `self` and open, and `tv` is a fully
+      // initialised `timeval` whose size is passed with the pointer; the kernel only
+      // reads it for the duration of the call.
+      let set = unsafe {
+         libc::setsockopt(
+            self.fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&tv as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+         )
+      };
+      if set < 0 {
+         return Err(io::Error::last_os_error());
+      }
+      Ok(())
+   }
+
    fn send_raw(&self, datagram: &[u8]) -> io::Result<()> {
       // Netlink requires either a connected socket or an explicit destination; without
       // one `send` fails with EDESTADDRREQ. `nl_pid = 0` addresses the kernel.
@@ -210,6 +239,42 @@ impl NetlinkSocket {
          return Ok(());
       }
    }
+}
+
+/// Reads the peer's UID from a connected Unix socket.
+///
+/// This lives beside the netlink transport because it is a raw `getsockopt` call and
+/// `unsafe` is confined to this module tree; `std`'s `UnixStream::peer_cred` is still
+/// unstable, so the daemon's control socket cannot authenticate peers without it.
+///
+/// `SO_PEERCRED` reports the credentials the peer held when it connected, not at the time
+/// of the call, so a later setuid cannot launder an unauthorised connection.
+pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
+   // SAFETY: `ucred` is a plain C struct with no invalid bit patterns; all-zero bytes are
+   // a valid initial value that `getsockopt` overwrites.
+   let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+   let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+   // SAFETY: the caller passes an open socket descriptor; `cred` is a live, correctly
+   // sized `ucred` and `len` its length, both handed to the kernel for writing only.
+   let got = unsafe {
+      libc::getsockopt(
+         fd,
+         libc::SOL_SOCKET,
+         libc::SO_PEERCRED,
+         (&mut cred as *mut libc::ucred).cast(),
+         &mut len,
+      )
+   };
+   if got < 0 {
+      return Err(io::Error::last_os_error());
+   }
+   if len as usize != std::mem::size_of::<libc::ucred>() {
+      return Err(io::Error::new(
+         io::ErrorKind::InvalidData,
+         "SO_PEERCRED returned a credential of the wrong size",
+      ));
+   }
+   Ok(cred.uid)
 }
 
 /// Builds one netlink datagram: header, then the caller's payload.

@@ -1,14 +1,20 @@
-//! `netshieldd`: CLI, and the `--probe` harness that proves interception on a live host.
+//! `netshieldd`: the CLI, the daemon entry point, `--check`, and the `--probe` harness.
 //!
-//! The probe is deliberately small: install the table from ARCHITECTURE §2, verify the
-//! kernel holds it, then read the connection queue and answer every packet with `Accept`
-//! while printing what arrived. It exists so the orchestrator can watch a real packet
-//! traverse nftables → nfnetlink → this process, on the real machine, without guessing.
+//! A bare invocation runs the daemon; `--check` validates the machine without leaving the
+//! table behind. The probe is deliberately small: install the table from ARCHITECTURE §2,
+//! verify the kernel holds it, then read the connection queue and answer every packet with
+//! `Accept` while printing what arrived. It exists so the orchestrator can watch a real
+//! packet traverse nftables → nfnetlink → this process, on the real machine, without
+//! guessing.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use log::{error, info};
+use netshield_core::Config;
+use netshield_daemon::daemon;
 use netshield_daemon::firewall::{self, FirewallError};
+use netshield_daemon::ipc_server;
 use netshield_daemon::logging;
 use netshield_daemon::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 
@@ -16,16 +22,26 @@ const USAGE: &str = "\
 netshieldd — NetShield's root firewall daemon
 
 USAGE:
-    netshieldd                     run the daemon (not implemented yet; prints this)
+    netshieldd                     run the daemon
+    netshieldd --check             validate the machine and exit
     netshieldd --probe [OPTIONS]   install the ruleset and prove packet interception
     netshieldd --help
     netshieldd --version
+
+OPTIONS (daemon and --check):
+    --config PATH        daemon configuration (default /etc/netshield/config.json)
+    --rules PATH         rule store (default /etc/netshield/rules.json)
+    --socket PATH        control socket (default from the configuration)
 
 OPTIONS (--probe):
     --queue N            NFQUEUE number for new-flow connection packets (default 0)
     --dns-queue N        NFQUEUE number for DNS answer packets (default 1)
     --filter-loopback    also queue loopback traffic (off by default; ARCHITECTURE §2)
     --count N            exit after N connection packets (default: run until interrupted)
+
+The daemon loads the rule store, adopts a verified table or installs one, then answers
+every queued connection: a matching rule decides at once, an unmatched flow prompts until
+the timeout denies it. SIGTERM/SIGINT remove the table and the socket.
 
 The probe prints the rendered ruleset, installs it in one nft transaction, verifies the
 installed table, then logs every queued packet and accepts it. The table is removed on
@@ -40,12 +56,20 @@ struct Args {
    dns_queue: u16,
    filter_loopback: bool,
    count: Option<u64>,
+   /// `--config`, or the documented default.
+   config: PathBuf,
+   /// `--rules`; `None` keeps the path the configuration names.
+   rules: Option<PathBuf>,
+   /// `--socket`; `None` keeps the path the configuration names.
+   socket: Option<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
-   /// No arguments: the real daemon loop arrives in the next task.
-   Usage,
+   /// No arguments: run the daemon.
+   Daemon,
+   /// `--check`: validate the machine, then leave it as it was found.
+   Check,
    Help,
    Version,
    Probe,
@@ -54,11 +78,14 @@ enum Mode {
 impl Default for Args {
    fn default() -> Self {
       Self {
-         mode: Mode::Usage,
+         mode: Mode::Daemon,
          queue: 0,
          dns_queue: 1,
          filter_loopback: false,
          count: None,
+         config: PathBuf::from("/etc/netshield/config.json"),
+         rules: None,
+         socket: None,
       }
    }
 }
@@ -104,7 +131,20 @@ fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Args, ArgError>
          "--help" | "-h" => parsed.mode = Mode::Help,
          "--version" | "-V" => parsed.mode = Mode::Version,
          "--probe" => parsed.mode = Mode::Probe,
+         "--check" => parsed.mode = Mode::Check,
          "--filter-loopback" => parsed.filter_loopback = true,
+         "--config" => {
+            let value = iter.next().ok_or(ArgError::MissingValue("--config"))?;
+            parsed.config = PathBuf::from(value);
+         }
+         "--rules" => {
+            let value = iter.next().ok_or(ArgError::MissingValue("--rules"))?;
+            parsed.rules = Some(PathBuf::from(value));
+         }
+         "--socket" => {
+            let value = iter.next().ok_or(ArgError::MissingValue("--socket"))?;
+            parsed.socket = Some(PathBuf::from(value));
+         }
          "--queue" => {
             let value = iter.next().ok_or(ArgError::MissingValue("--queue"))?;
             parsed.queue = parse_u16("--queue", value)?;
@@ -213,10 +253,6 @@ fn main() -> ExitCode {
    logging::init(log::LevelFilter::Info);
 
    match args.mode {
-      Mode::Usage => {
-         eprintln!("{USAGE}");
-         ExitCode::from(2)
-      }
       Mode::Help => {
          println!("{USAGE}");
          ExitCode::SUCCESS
@@ -232,6 +268,38 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
          }
       },
+      Mode::Daemon | Mode::Check => {
+         if !is_root() {
+            // Reuse the firewall's message verbatim: it is the same refusal the probe has
+            // always produced, and it names the capability the caller is missing.
+            eprintln!("netshieldd: {}", FirewallError::NotRoot);
+            return ExitCode::FAILURE;
+         }
+         match load_and_run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+               eprintln!("netshieldd: {err}");
+               ExitCode::FAILURE
+            }
+         }
+      }
+   }
+}
+
+/// Whether the process holds root, read from `/proc` so no raw syscall is needed here.
+fn is_root() -> bool {
+   ipc_server::effective_uid() == Some(0)
+}
+
+/// Loads the configuration and dispatches to the daemon or to `--check`.
+fn load_and_run(args: &Args) -> Result<(), String> {
+   let config = Config::load(&args.config).map_err(|err| err.to_string())?;
+   let rules = args.rules.clone().unwrap_or_else(|| config.rules_path.clone());
+   let socket = args.socket.clone().unwrap_or_else(|| config.socket_path.clone());
+
+   match args.mode {
+      Mode::Check => daemon::check(config, &rules).map_err(|err| err.to_string()),
+      _ => daemon::run(config, &rules, &socket).map_err(|err| err.to_string()),
    }
 }
 
@@ -348,8 +416,43 @@ mod tests {
    }
 
    #[test]
-   fn bare_invocation_is_usage() {
-      assert_eq!(args(&[]).unwrap().mode, Mode::Usage);
+   fn bare_invocation_runs_the_daemon() {
+      assert_eq!(args(&[]).unwrap().mode, Mode::Daemon);
+   }
+
+   #[test]
+   fn check_and_paths_are_parsed() {
+      let parsed = args(&[
+         "--check",
+         "--config",
+         "/tmp/config.json",
+         "--rules",
+         "/tmp/rules.json",
+         "--socket",
+         "/tmp/control.sock",
+      ])
+      .unwrap();
+      assert_eq!(parsed.mode, Mode::Check);
+      assert_eq!(parsed.config, PathBuf::from("/tmp/config.json"));
+      assert_eq!(
+         parsed.rules,
+         Some(PathBuf::from("/tmp/rules.json"))
+      );
+      assert_eq!(
+         parsed.socket,
+         Some(PathBuf::from("/tmp/control.sock"))
+      );
+   }
+
+   #[test]
+   fn daemon_paths_default_to_the_documented_locations() {
+      let parsed = args(&[]).unwrap();
+      assert_eq!(
+         parsed.config,
+         PathBuf::from("/etc/netshield/config.json")
+      );
+      assert_eq!(parsed.rules, None);
+      assert_eq!(parsed.socket, None);
    }
 
    #[test]
@@ -411,6 +514,18 @@ mod tests {
       assert!(matches!(
          args(&["--probe", "--count", "0"]),
          Err(ArgError::OutOfRange { .. })
+      ));
+      assert!(matches!(
+         args(&["--config"]),
+         Err(ArgError::MissingValue("--config"))
+      ));
+      assert!(matches!(
+         args(&["--rules"]),
+         Err(ArgError::MissingValue("--rules"))
+      ));
+      assert!(matches!(
+         args(&["--socket"]),
+         Err(ArgError::MissingValue("--socket"))
       ));
    }
 
