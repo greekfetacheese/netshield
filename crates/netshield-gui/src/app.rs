@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use netshield_core::connection::{Family, L4Proto};
 use netshield_core::ipc::{ConnectionEvent, ConnectionView, Mode, Request, Response};
+use netshield_core::rule::Rule;
 
 use crate::Cli;
 use crate::connlog::ConnectionLog;
@@ -39,6 +40,11 @@ pub struct App {
    pending_prompts: usize,
    mode: Mode,
    next_refresh: Instant,
+   rules: Vec<Rule>,
+   confirm: ui::rules::Confirm,
+   /// Set when a mutation went out; the next update rewrites the rule list instead of
+   /// waiting up to `REFRESH_EVERY` for the periodic tick.
+   refresh_rules: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,7 @@ impl App {
          let client = IpcClient::spawn(cli.socket.clone());
          client.send(&Request::Subscribe);
          client.send(&Request::Status);
+         client.send(&Request::ListRules);
          Some(client)
       };
 
@@ -87,6 +94,9 @@ impl App {
          pending_prompts: 0,
          mode: Mode::Alert,
          next_refresh: Instant::now() + REFRESH_EVERY,
+         rules: Vec::new(),
+         confirm: ui::rules::Confirm::default(),
+         refresh_rules: false,
       }
    }
 
@@ -106,9 +116,18 @@ impl App {
                   Response::PromptClosed { .. } => {
                      self.pending_prompts = self.pending_prompts.saturating_sub(1);
                   }
+                  Response::Rules { rules } => self.rules = rules,
                   _ => {}
                },
             }
+         }
+      }
+
+      // A mutation invalidates the table; rewrite it now rather than on the slow tick.
+      if self.refresh_rules {
+         self.refresh_rules = false;
+         if let Some(client) = &self.ipc {
+            client.send(&Request::ListRules);
          }
       }
 
@@ -120,6 +139,7 @@ impl App {
          self.log.push(&synthetic_event());
       } else if let Some(client) = &self.ipc {
          client.send(&Request::Status);
+         client.send(&Request::ListRules);
       }
       self.next_refresh = now + REFRESH_EVERY;
    }
@@ -167,10 +187,36 @@ impl App {
       ui.label(egui::RichText::new(text).weak().small());
    }
 
+   /// Sends the intents the Rules page collected, then re-lists so the table reflects
+   /// the daemon's answer without waiting for the five-second tick.
+   fn apply_actions(&mut self, actions: ui::rules::Actions) {
+      if actions.toggles.is_empty() && actions.deletes.is_empty() {
+         return;
+      }
+      let mut listed = false;
+      if let Some(client) = &self.ipc {
+         for (id, enabled) in actions.toggles {
+            client.send(&Request::SetRuleEnabled { id, enabled });
+         }
+         for id in actions.deletes {
+            client.send(&Request::DeleteRule { id });
+         }
+         // The daemon answers in order, so listing now reflects the mutations above
+         // instead of leaving the table stale for up to a refresh interval.
+         listed = client.send(&Request::ListRules);
+      }
+      // The queue is gone; retry the list on the next update.
+      self.refresh_rules = !listed;
+   }
+
    /// The selected page, or a placeholder for the slices that follow.
    fn page_content(&mut self, ui: &mut egui::Ui) {
       match self.page {
          Page::Connections => ui::connections::show(ui, &self.log),
+         Page::Rules => {
+            let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
+            self.apply_actions(actions);
+         }
          _ => {
             ui.heading(self.page.name());
             ui.add_space(4.0);
