@@ -8,7 +8,11 @@
 
 pub mod config;
 pub mod connection;
+pub mod dns;
+pub mod dns_cache;
+pub mod ipc;
 pub mod ipnet;
+pub mod packet;
 pub mod rule;
 pub mod ruleset;
 
