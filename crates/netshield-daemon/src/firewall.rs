@@ -163,6 +163,16 @@ pub fn verify(queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
       }
    };
 
+   verify_listing(&listing, queue, dns_queue)?;
+   info!("verified table inet {TABLE}: chains output/dns_in, queues {queue}/{dns_queue}");
+   Ok(())
+}
+
+/// Checks a listing for both chains and both queue numbers.
+///
+/// Split from [`verify`] so the token-level matching is exercised without running `nft`;
+/// this is the same check the live probe performs.
+fn verify_listing(listing: &str, queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
    for chain in ["chain output", "chain dns_in"] {
       if !listing.contains(chain) {
          return Err(FirewallError::Verify(format!(
@@ -170,7 +180,7 @@ pub fn verify(queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
          )));
       }
    }
-   let queues = listed_queues(&listing);
+   let queues = listed_queues(listing);
    for wanted in [queue, dns_queue] {
       if !queues.iter().any(|listed| *listed == wanted.to_string()) {
          return Err(FirewallError::Verify(format!(
@@ -178,7 +188,6 @@ pub fn verify(queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
          )));
       }
    }
-   info!("verified table inet {TABLE}: chains output/dns_in, queues {queue}/{dns_queue}");
    Ok(())
 }
 
@@ -259,14 +268,36 @@ fn nft(args: &[&str], stdin: Option<&str>) -> Result<String, FirewallError> {
    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Every `queue num <n>` value in an `nft list table` listing, as written.
+/// Every queue number in an `nft list table` listing, as written.
+///
+/// nftables echoes the rendered `queue num <n>` as `queue flags bypass to <n>`, so both
+/// verdict forms are read. Matching is token-level and comments are stripped first, so a
+/// number in a comment or an interface name cannot be mistaken for a queue verdict.
 fn listed_queues(listing: &str) -> Vec<String> {
-   let tokens: Vec<&str> = listing.split_whitespace().collect();
-   tokens
-      .windows(3)
-      .filter(|window| window[0] == "queue" && window[1] == "num")
-      .map(|window| window[2].to_owned())
-      .collect()
+   let mut queues = Vec::new();
+   for line in listing.lines() {
+      let rule = line.split(" comment ").next().unwrap_or(line);
+      let tokens: Vec<&str> = rule.split_whitespace().collect();
+      for (index, token) in tokens.iter().enumerate() {
+         if *token != "queue" {
+            continue;
+         }
+         let mut cursor = index + 1;
+         while let Some(next) = tokens.get(cursor) {
+            match *next {
+               "num" | "to" => {
+                  if let Some(number) = tokens.get(cursor + 1) {
+                     queues.push((*number).to_owned());
+                  }
+                  break;
+               }
+               "flags" | "bypass" => cursor += 1,
+               _ => break,
+            }
+         }
+      }
+   }
+   queues
 }
 
 #[cfg(test)]
@@ -343,6 +374,54 @@ mod tests {
       let listing = "queue num 0 bypass\nqueue num 1 bypass\nqueue num 10 bypass";
       assert_eq!(listed_queues(listing), ["0", "1", "10"]);
       assert!(!listed_queues(listing).iter().any(|queue| queue == "2"));
+   }
+
+   /// The real `nft list table inet netshield` output captured on nftables 1.0.9.
+   /// The indentation is a tab, and the spacing is nft's, not the renderer's.
+   const FIXTURE: &str = "table inet netshield {\n\tchain output {\n\t\ttype filter hook output priority mangle; policy accept;\n\t\toifname \"lo\" return comment \"netshield: loopback is not filtered\"\n\t\ttcp flags syn / fin,syn,rst,ack queue flags bypass to 0 comment \"netshield: tcp syn\"\n\t\tct state new queue flags bypass to 0 comment \"netshield: non-tcp new flow\"\n\t}\n\n\tchain dns_in {\n\t\ttype filter hook input priority mangle; policy accept;\n\t\tudp sport 53 queue flags bypass to 1 comment \"netshield: dns answers\"\n\t\ttcp sport 53 queue flags bypass to 1 comment \"netshield: dns answers over tcp\"\n\t}\n}\n";
+
+   #[test]
+   fn real_nft_listing_verifies_both_queues() {
+      assert!(
+         FIXTURE.contains('\t'),
+         "the captured fixture is tab-indented"
+      );
+      assert_eq!(listed_queues(FIXTURE), ["0", "0", "1", "1"]);
+      verify_listing(FIXTURE, 0, 1).expect("the table NetShield installed must verify");
+   }
+
+   #[test]
+   fn real_nft_listing_rejects_a_missing_queue() {
+      assert!(verify_listing(FIXTURE, 0, 2).is_err());
+   }
+
+   #[test]
+   fn chains_without_a_queue_verdict_fail() {
+      let listing = "table inet netshield {\n\tchain output {\n\t\tct state new return\n\t}\n\tchain dns_in {\n\t\tudp sport 53 return\n\t}\n}\n";
+      assert!(verify_listing(listing, 0, 1).is_err());
+   }
+
+   #[test]
+   fn a_single_digit_queue_is_not_satisfied_by_a_longer_number() {
+      let listing = "\tchain output {\n\t\tct state new queue flags bypass to 10\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 10\n\t}\n";
+      assert!(verify_listing(listing, 10, 10).is_ok());
+      assert!(verify_listing(listing, 1, 10).is_err());
+   }
+
+   #[test]
+   fn a_number_inside_a_comment_is_not_a_queue_verdict() {
+      let listing = "\tchain output {\n\t\tct state new return comment \"queue num 1\"\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 0 comment \"queue num 1\"\n\t}\n";
+      assert!(verify_listing(listing, 0, 0).is_ok());
+      assert!(verify_listing(listing, 0, 1).is_err());
+   }
+
+   #[test]
+   fn renderer_form_queue_num_also_verifies() {
+      let listing = ruleset_text(0, 1, false);
+      assert!(listing.contains("queue num 0"));
+      assert!(!listing.contains("queue flags bypass to"));
+      assert_eq!(listed_queues(&listing), ["0", "0", "1", "1"]);
+      verify_listing(&listing, 0, 1).expect("the renderer's own syntax must verify too");
    }
 
    #[test]
