@@ -48,7 +48,7 @@ Options:
       --socket PATH    control socket to connect to
                        [default: /run/netshield/control.sock]
       --mock           run with no daemon, showing synthetic connection events
-      --alert          start minimised, showing only connection alerts (used by the daemon)
+      --alert          start hidden and show only alerts (a root daemon never launches a GUI)
 ";
 
 impl Cli {
@@ -197,7 +197,7 @@ mod tests {
       for flag in ["--socket", "--mock", "--alert", "--version", "--help"] {
          assert!(text.contains(flag), "help is missing {flag}");
       }
-      assert!(text.contains("start minimised, showing only connection alerts"));
+      assert!(text.contains("start hidden and show only alerts"));
       assert_eq!(parse(&["-h"]), parse(&["--help"]));
    }
 

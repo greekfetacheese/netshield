@@ -217,6 +217,7 @@ pub fn layout_height_estimate() -> f32 {
       + SMALL_ROW
       + RADIO_ROW
       + SECTION_GAP
+      + SMALL_ROW
       + RADIO_ROW
       + RADIO_ROW
       + SECTION_GAP
@@ -315,10 +316,12 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
 
 /// The scope radios, the domain `Only this domain` applies to, and the subdomain opt-in.
 ///
-/// The domain label shares the radio's line so the choice reads as one sentence. The
-/// subdomain checkbox is indented to the radio's *text*, not its circle, and stays
+/// The muted `Scope` label keeps `This connection` from reading as a fourth duration
+/// option. The domain label shares the radio's line so the choice reads as one sentence.
+/// The subdomain checkbox is indented to the radio's *text*, not its circle, and stays
 /// disabled until the domain scope is both offered and selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
+   ui.label(RichText::new("Scope").small().weak());
    ui.radio_value(&mut state.scope_domain, false, "This connection");
 
    let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
