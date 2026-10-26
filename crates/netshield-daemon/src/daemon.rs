@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use log::{debug, error, info, warn};
 use netshield_core::config::Config;
 use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
-use netshield_core::dns::{DnsRecord, Target, parse_response, parse_tcp_response};
+use netshield_core::dns::{DnsRecord, RecordKind, Target, parse_response, parse_tcp_response};
 use netshield_core::dns_cache::DnsCache;
 use netshield_core::ipc::{
    ConnectionEvent, ConnectionView, DecideRequest, Mode, PromptRequest, Request, Resolution,
@@ -963,6 +963,34 @@ fn spawn_dns_reader(
       .map_err(DaemonError::Thread)
 }
 
+/// How many CNAME edges the cache will walk backwards before giving up.
+///
+/// Eight is far beyond any legitimate chain (`www.iana.org` uses one), and the cap is what
+/// makes a hostile or broken answer terminate; the cache still records what it reached.
+const MAX_CNAME_HOPS: usize = 8;
+
+/// Recovers the name the application asked for by walking CNAME edges backwards.
+///
+/// An answer's `A`/`AAAA` record is owned by the *canonical* name, so the address points at
+/// the CNAME target rather than the query. Every edge is `owner -> target`, and the walk
+/// follows the edge whose target is the current name until no edge matches, at most
+/// [`MAX_CNAME_HOPS`] times, stopping early if a name repeats so a cycle cannot spin.
+fn queried_name(owner: &str, edges: &[(String, String)]) -> String {
+   let mut current = owner.to_owned();
+   let mut seen = vec![current.clone()];
+   for _ in 0..MAX_CNAME_HOPS {
+      let Some((parent, _)) = edges.iter().find(|(_, target)| *target == current) else {
+         break;
+      };
+      if seen.iter().any(|name| name == parent) {
+         break;
+      }
+      current = parent.clone();
+      seen.push(current.clone());
+   }
+   current
+}
+
 /// Parses one DNS answer and inserts every usable record into the cache.
 fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
    let family = payload.first().map(|first| first >> 4);
@@ -993,9 +1021,27 @@ fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
 
    let now = now_secs();
    let mut cache = cache.lock().expect("dns cache");
+
+   // The edges that link every address back to the name the application queried. They are
+   // collected first because a CNAME may follow the address it points at in the answer.
+   let mut edges = Vec::new();
+   for record in &records {
+      if record.kind == RecordKind::Cname
+         && let Target::Name(target) = &record.target
+      {
+         edges.push((record.name.clone(), target.clone()));
+      }
+   }
+
    for record in records {
       if let Target::Address(addr) = record.target {
-         cache.insert(addr, &record.name, record.ttl, now);
+         let root = queried_name(&record.name, &edges);
+         // The record's own name is inserted first so the recovered root, which the prompt
+         // should display, ends up as the most recently inserted name.
+         if root != record.name {
+            cache.insert(addr, &record.name, record.ttl, now);
+         }
+         cache.insert(addr, &root, record.ttl, now);
          debug!(
             "dns: {} -> {} ttl={}",
             record.name, addr, record.ttl
@@ -1291,6 +1337,152 @@ mod tests {
       msg.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
       msg.extend_from_slice(&ANSWER);
       msg
+   }
+
+   /// One answer in a fixture response: owner name, wire type code and RDATA.
+   struct FixtureRecord<'a> {
+      owner: &'a str,
+      kind: u16,
+      rdata: Vec<u8>,
+   }
+
+   /// A `CNAME` answer from `owner` to `target`.
+   fn cname_record<'a>(owner: &'a str, target: &str) -> FixtureRecord<'a> {
+      FixtureRecord {
+         owner,
+         kind: 5,
+         rdata: labels(target),
+      }
+   }
+
+   /// An `A` answer owned by `owner` carrying `addr`.
+   fn address_record<'a>(owner: &'a str, addr: [u8; 4]) -> FixtureRecord<'a> {
+      FixtureRecord {
+         owner,
+         kind: 1,
+         rdata: addr.to_vec(),
+      }
+   }
+
+   /// A response to `question` carrying `answers` in the order given.
+   fn dns_response(question: &str, answers: &[FixtureRecord<'_>]) -> Vec<u8> {
+      let mut msg = vec![0u8; 12];
+      msg[0..2].copy_from_slice(&DNS_ID.to_be_bytes());
+      msg[2] = 0x81; // QR set, recursion desired
+      msg[3] = 0x80; // recursion available
+      msg[4..6].copy_from_slice(&1u16.to_be_bytes()); // qdcount
+      msg[6..8].copy_from_slice(&(answers.len() as u16).to_be_bytes());
+      msg.extend_from_slice(&labels(question));
+      msg.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+      msg.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+      for answer in answers {
+         msg.extend_from_slice(&labels(answer.owner));
+         msg.extend_from_slice(&answer.kind.to_be_bytes());
+         msg.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+         msg.extend_from_slice(&300u32.to_be_bytes()); // TTL
+         msg.extend_from_slice(&(answer.rdata.len() as u16).to_be_bytes());
+         msg.extend_from_slice(&answer.rdata);
+      }
+      msg
+   }
+
+   /// The live CDN shape: the address belongs to the CNAME target, but the prompt must
+   /// offer the name the application actually asked for.
+   #[test]
+   fn a_cname_chain_reports_the_queried_name_as_primary() {
+      let dns = dns_response(
+         "www.example.com",
+         &[
+            cname_record("www.example.com", "cdn.example.net"),
+            address_record("cdn.example.net", [93, 184, 216, 34]),
+         ],
+      );
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+
+      let cache = Mutex::new(DnsCache::new());
+      cache_answer(&cache, &packet);
+      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 34]));
+      let cache = cache.lock().expect("dns cache");
+      let now = now_secs();
+      assert_eq!(
+         cache.primary(addr, now),
+         Some("www.example.com"),
+         "the queried name is what the prompt displays"
+      );
+      assert!(
+         cache.names_for(addr, now).contains(&"cdn.example.net"),
+         "the CNAME target stays available as detail"
+      );
+   }
+
+   /// A two-hop chain must walk every edge, not just the last one.
+   #[test]
+   fn a_two_hop_cname_chain_resolves_to_the_first_owner() {
+      let dns = dns_response(
+         "a.example",
+         &[
+            cname_record("a.example", "b.example"),
+            cname_record("b.example", "c.example"),
+            address_record("c.example", [93, 184, 216, 35]),
+         ],
+      );
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+
+      let cache = Mutex::new(DnsCache::new());
+      cache_answer(&cache, &packet);
+      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 35]));
+      assert_eq!(
+         cache.lock().expect("dns cache").primary(addr, now_secs()),
+         Some("a.example")
+      );
+   }
+
+   /// A cycle must terminate and still cache the address under a stable name.
+   #[test]
+   fn a_cname_cycle_terminates_and_caches_a_stable_name() {
+      let dns = dns_response(
+         "x.example",
+         &[
+            cname_record("x.example", "y.example"),
+            cname_record("y.example", "x.example"),
+            address_record("y.example", [93, 184, 216, 36]),
+         ],
+      );
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+
+      let cache = Mutex::new(DnsCache::new());
+      cache_answer(&cache, &packet);
+      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 36]));
+      let now = now_secs();
+      assert_eq!(
+         cache.lock().expect("dns cache").primary(addr, now),
+         Some("x.example")
+      );
+
+      // The walk stops at the repeated name, so the same answer always lands on the same
+      // root instead of ping-ponging between the two owners.
+      cache_answer(&cache, &packet);
+      assert_eq!(
+         cache.lock().expect("dns cache").primary(addr, now),
+         Some("x.example")
+      );
+   }
+
+   /// A CNAME with no address record behind it must not invent an address mapping.
+   #[test]
+   fn a_cname_without_an_address_record_caches_nothing() {
+      let dns = dns_response(
+         "www.example.com",
+         &[cname_record("www.example.com", "cdn.example.net")],
+      );
+      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+
+      let cache = Mutex::new(DnsCache::new());
+      cache_answer(&cache, &packet);
+      assert!(
+         cache.lock().expect("dns cache").is_empty(),
+         "a name alone is not an address mapping"
+      );
    }
 
    /// An IPv4 packet with `options` bytes of IP options and `proto` as its transport.
