@@ -225,6 +225,17 @@ against that exact name, with an optional `subdomains` flag that also matches
 `*.host`. No public-suffix guessing: `ads.example.co.uk` yields the exact host and the
 user may add subdomains, but nothing silently widens to `co.uk`.
 
+### First-run defaults
+
+A user must never be asked about their own DNS. On first start (no rule store yet) the
+daemon seeds exactly one rule — `allow`, `Forever`, application = the systemd-resolved
+executable path, destination = `Port(53)` — and writes it to the store, so it appears in the
+GUI's rule list and can be inspected or deleted like any other rule. It is keyed on the
+binary path rather than the resolver's UID, which differs between machines. If no resolver
+binary is found the seed is skipped with a `warn!`: a machine whose resolver is unattributed
+will prompt, and that is better than a silent allow.
+
+
 ## 7. DNS attribution
 
 Domain-scoped decisions need name ↔ address correlation. The daemon listens on queue 1
