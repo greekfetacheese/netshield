@@ -1,41 +1,58 @@
 # NetShield
 
-A Linux application firewall: every new outbound connection is held in the kernel until
-you decide what happens to it, per application — with the ability to scope a decision to
-the specific domain being contacted.
+NetShield is a Linux application firewall: the root daemon `netshieldd` holds the first
+packet of every new outbound flow in the kernel and asks the unprivileged `netshield-gui`
+what to do with it, per application, with an optional scope to the domain being contacted.
+Rules and decisions are persisted as JSON in `/etc/netshield`.
 
-Inspired by OpenSnitch and Little Snitch; pure Rust, egui GUI, nftables + NFQUEUE beneath.
+## Install
 
-**Status: early development.** The architecture is settled (`docs/ARCHITECTURE.md`) and
-the build plan is in `docs/PLAN.md`. Nothing is installed or usable yet.
+Linux with nftables and systemd, root for the daemon, and a logged-in user for the GUI.
+Build the binaries first, then install them:
 
-## How it works, in one paragraph
-
-`netshieldd` (root) installs a single nftables table that queues the first packet of every
-new outbound flow — TCP via a SYN match, everything else via conntrack — into an NFQUEUE
-it reads over a raw netlink socket. For each queued packet it resolves the owning process
-from `/proc`, matches the connection against the rule store, and answers the kernel
-immediately (allow/deny) or holds it while `netshield-gui` (unprivileged) shows an alert.
-The rules are per application and can be scoped to a domain learned from DNS answers, so
-"allow Firefox to reach api.github.com" is a rule you can actually express.
-
-If the daemon dies, the queue's `bypass` flag makes the kernel accept traffic rather than
-freeze the machine; that is a deliberate fail-open choice, recorded at boot in the GUI.
-
-## Repository layout
-
+```sh
+cargo build --release
+sudo packaging/install.sh --bin-dir target/release
 ```
-crates/netshield-core     models, rule engine, packet/DNS parsers, IPC types (no I/O)
-crates/netshield-daemon   netlink NFQUEUE transport, nftables, /proc attribution, IPC server
-crates/netshield-gui      egui GUI: connection log, rule manager, alert windows
-docs/                     architecture and build plan
-packaging/                systemd unit, install script
+
+The installer never builds. It installs `netshieldd` and `netshield-gui` to
+`/usr/local/bin`, writes `/etc/netshield/config.json` (keeping an existing one), installs
+the hardened systemd unit and the XDG autostart entry, and enables the service. Use
+`--prefix DIR` to install under a different prefix, and `--help` for every flag. It
+refuses to run while OpenSnitch is active: stop and disable OpenSnitch first.
+
+## First run
+
+The daemon creates the rule store on first start, and the GUI starts with your session
+from `/etc/xdg/autostart/netshield-gui.desktop` and connects to
+`/run/netshield/control.sock`. New connections then raise an alert; Allow or Deny, choose
+how long the decision lasts, and optionally scope it to the observed domain. If the GUI is
+not running when a prompt is raised, the daemon logs a warning and denies the prompt when
+it times out.
+
+## Uninstall
+
+```sh
+sudo packaging/install.sh --uninstall   # keeps /etc/netshield
+sudo packaging/install.sh --purge       # also removes /etc/netshield
 ```
+
+Both stop and disable the service, remove the unit, the autostart entry and the binaries,
+and delete the `inet netshield` nftables table.
+
+## Known limitations
+
+- Linux only; the firewall is nftables and the daemon is a systemd service.
+- Outbound traffic only: inbound connections are not filtered.
+- No blocklists yet; every rule is per application or per domain.
+- `Reject` (TCP RST) is deferred; a denied flow is dropped.
+- Domain learning depends on plaintext DNS, so clients using DoH/DoT show an address
+  rather than a name.
 
 ## Requirements
 
-Linux with nftables (kernel ≥ 5.10 realistic, developed against 7.0), Rust ≥ 1.90,
-systemd. Root is required for the daemon; the GUI runs as the logged-in user.
+Linux with nftables (kernel ≥ 5.10 realistic, developed against 7.0), Rust ≥ 1.90 to
+build, systemd. Root is required for the daemon; the GUI runs as the logged-in user.
 
 ## Licence
 

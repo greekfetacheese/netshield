@@ -101,8 +101,9 @@ Known and documented gaps (honest limits of a userspace firewall):
   prompt lifecycle and the control socket. Threads: queue-0 reader, queue-1 reader,
   control-socket acceptor, prompt supervisor (timeouts), signal handler.
 - **`netshield-gui`** (user) connects to the control socket, renders the connection log,
-  the rule manager and settings, and owns the alert windows. If it is not running the
-  daemon launches it in alert mode (`netshield-gui --alert`) on the first prompt.
+  the rule manager and settings, and owns the alert windows. It is started at login by an
+  XDG autostart entry. The root daemon never spawns a GUI, because a root-owned GUI would
+  render on the user's display with full privileges.
 - **IPC** is a `SOCK_STREAM` Unix socket, newline-delimited JSON. The daemon is the
   server; it authenticates each connection with `SO_PEERCRED` and rejects any UID other
   than `allowed_uid` (default: the user who owns the session, configured at install).
@@ -262,8 +263,8 @@ Consequences worth stating plainly:
 3. `Decide { id, action, duration, scope }` arrives → verdict every packet id of that
    flow, write the rule for the chosen duration, log the decision, broadcast the event.
 4. Timeout (`prompt_timeout_secs`, default 30) → `Deny`, logged as a timeout.
-5. GUI absent/unreachable → try to spawn `netshield-gui --alert` once; if that fails
-   after a grace period, apply the configured default action for each pending prompt.
+5. GUI absent/unreachable → the daemon warns once per prompt and the prompt is denied when
+   it times out; it never spawns a GUI.
 6. Duplicate flows while a prompt is open (same app, same destination) join the open
    prompt instead of stacking new windows; the alert shows "n pending" and the decisions
    apply together.
@@ -276,13 +277,20 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
 - `/etc/netshield/rules.json` — `Forever` rules, same atomic-write path, hot-reloaded.
-- `/run/netshield/control.sock` — `0660`, owned by root and the GUI's group.
-- `/etc/systemd/system/netshield.service` — `Type=notify` or `simple` with
-  `Restart=on-failure`, `CAP_NET_ADMIN`/`CAP_NET_RAW` only, `NoNewPrivileges=yes`,
-  `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`.
-- `install.sh` — builds, installs binaries, writes the systemd unit with the invoking
-  user's UID recorded as `allowed_uid`, enables the service, and refuses to run while
-  another application firewall (OpenSnitch) is active.
+- `/run/netshield/control.sock` — `0660`, owned by `allowed_uid` and that user's primary
+  group when `allowed_uid` is set (chown after bind; the `SO_PEERCRED` check is still
+  enforced), `root:root` otherwise.
+- `/etc/systemd/system/netshield.service` — `Type=simple` with `Restart=on-failure`,
+  `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`, `NoNewPrivileges=yes`,
+  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`. `NET_ADMIN` programs
+  nftables and owns the NFQUEUE sockets; `SYS_PTRACE` and `DAC_READ_SEARCH` are required
+  to read `/proc/<pid>/exe` and `/proc/<pid>/fd` for processes of other users (the
+  resolver runs as its own uid), without which attribution degrades to `Unknown` and
+  every DNS lookup would prompt.
+- `install.sh` — installs prebuilt binaries (`--bin-dir`), writes the systemd unit and
+  the XDG autostart entry with the invoking user's UID recorded as `allowed_uid`, enables
+  the service, and refuses to run while another application firewall (OpenSnitch) is
+  active. It never builds; the GUI is launched by the session's autostart entry.
 
 ## 10. Crates and dependencies
 

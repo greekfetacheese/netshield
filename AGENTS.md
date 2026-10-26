@@ -17,7 +17,9 @@ which phase is current.
    approval first.
 3. **No async runtime.** Threads and blocking I/O. Never introduce `tokio`/`async-std`.
 4. **No `unsafe` outside `netshield-daemon/src/netlink/`** (and the `/proc` reads if a
-   raw syscall is genuinely required). Every `unsafe` block carries a comment naming its
+   raw syscall is genuinely required), with one sanctioned exception: the `libc::chown`
+   call in `crates/netshield-daemon/src/ipc_server.rs::chown_socket`, which hands the
+   control socket to `allowed_uid`. Every `unsafe` block carries a comment naming its
    invariant, and the module keeps its inputs bounds-checked before it is reached.
 5. **Never `cargo fmt` workspace-wide.** Format touched files only:
    `rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true <file>`

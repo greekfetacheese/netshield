@@ -1,0 +1,49 @@
+[Unit]
+Description=NetShield outbound application firewall
+Documentation=file:///usr/share/doc/netshield/README.md
+DefaultDependencies=no
+Before=network-pre.target shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/netshield/config.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/netshieldd
+ExecStopPost=-nft delete table inet netshield
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+
+# The daemon needs NET_ADMIN to program nftables and to bind the NFQUEUE sockets it owns.
+# It needs SYS_PTRACE and DAC_READ_SEARCH to read /proc/<pid>/exe and /proc/<pid>/fd for
+# processes of other users (the resolver runs as its own uid): without them attribution
+# silently degrades to Unknown and every DNS lookup would prompt.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+RuntimeDirectory=netshield
+RuntimeDirectoryMode=0750
+StateDirectory=netshield
+StateDirectoryMode=0700
+ReadWritePaths=/etc/netshield
+
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

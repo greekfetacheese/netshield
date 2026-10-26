@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -50,10 +49,6 @@ use crate::store::{RuleStore, StoreError};
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// Minimum gap between attempts to spawn the GUI, so a crash-looping binary cannot turn
-/// into a fork bomb.
-const GUI_SPAWN_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Minimum gap between `dns: no name` debug lines for one address.
 const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
@@ -163,6 +158,19 @@ fn adopt_or_install(config: &Config) -> Result<bool, DaemonError> {
    Ok(true)
 }
 
+/// The warning emitted when a prompt is raised with no GUI attached.
+///
+/// The GUI is started by the session's XDG autostart entry; the daemon never spawns one,
+/// because a root-owned GUI on the user's display would run with full privileges. A
+/// prompt that nobody can answer therefore ends in the timeout denial, which the warning
+/// states up front.
+fn missing_client_warning(id: u64, app: &str, dest: &str, timeout_secs: u64) -> String {
+   format!(
+      "no GUI is connected; prompt {id} for {app} -> {dest} will be denied in {timeout_secs}s \
+       unless a GUI attaches"
+   )
+}
+
 /// The daemon's runtime state, owned by the main loop.
 struct Daemon {
    config: Config,
@@ -176,7 +184,6 @@ struct Daemon {
    mode: Mode,
    started_at: u64,
    queue_drops: u64,
-   last_gui_spawn: Option<Instant>,
    silent_warned: bool,
    table_verified: bool,
    dns_misses: MissLimiter,
@@ -206,7 +213,6 @@ impl Daemon {
          mode: Mode::Alert,
          started_at,
          queue_drops: 0,
-         last_gui_spawn: None,
          silent_warned: false,
          table_verified,
          dns_misses: MissLimiter::new(),
@@ -663,11 +669,12 @@ impl Daemon {
          timeout,
          Instant::now(),
       );
+      let timeout_secs = self.config.prompt_timeout_secs;
       let view = self.view(connection);
       self.ipc.broadcast(&Response::Prompt(PromptRequest {
          id,
          connection: view,
-         timeout_secs: self.config.prompt_timeout_secs,
+         timeout_secs,
          domain_scope_available: connection.domain.is_some(),
          pending: self.pending.len().saturating_sub(1),
       }));
@@ -680,32 +687,16 @@ impl Daemon {
       );
 
       if !self.ipc.is_subscribed() {
-         self.spawn_gui();
+         let dest = format!(
+            "{}:{}",
+            connection.remote.addr, connection.remote.port
+         );
+         warn!(
+            "{}",
+            missing_client_warning(id, &connection.app_name(), &dest, timeout_secs,)
+         );
       }
       self.publish_status();
-   }
-
-   /// Tries to launch the GUI in alert mode, at most once per cooldown.
-   fn spawn_gui(&mut self) {
-      let Some(path) = self.config.gui_path.clone() else {
-         return;
-      };
-      if self.last_gui_spawn.is_some_and(|at| at.elapsed() < GUI_SPAWN_COOLDOWN) {
-         return;
-      }
-      self.last_gui_spawn = Some(Instant::now());
-
-      match Command::new(&path).arg("--alert").spawn() {
-         Ok(child) => info!(
-            "spawned {} --alert (pid {})",
-            path.display(),
-            child.id()
-         ),
-         Err(err) => warn!(
-            "could not spawn the GUI at {}: {err}",
-            path.display()
-         ),
-      }
    }
 
    /// Times out expired prompts, expires grants and prunes the DNS cache.
@@ -1224,6 +1215,15 @@ mod tests {
       assert!(would_block(&timed_out));
       assert!(would_block(&again));
       assert!(!would_block(&denied));
+   }
+
+   #[test]
+   fn a_prompt_with_no_client_warns_and_names_the_denial_timeout() {
+      assert_eq!(
+         missing_client_warning(7, "firefox", "198.51.100.20:443", 30),
+         "no GUI is connected; prompt 7 for firefox -> 198.51.100.20:443 will be denied in \
+          30s unless a GUI attaches"
+      );
    }
 
    #[test]

@@ -16,9 +16,11 @@
 //! limit.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -110,6 +112,74 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
 /// never a wildcard, matching [`netshield_core::Config::allowed_uid`].
 fn peer_allowed(uid: u32, allowed_uid: Option<u32>) -> bool {
    uid == 0 || Some(uid) == allowed_uid
+}
+
+/// The ownership the control socket gets after bind: uid, gid and mode.
+///
+/// Without an `allowed_uid` the socket stays `root:root 0660`. With one it is handed to
+/// that user and their primary group so their GUI can open it, and `SO_PEERCRED` still
+/// decides which UIDs may actually use it. A user whose group cannot be resolved keeps
+/// the safe `root:root` default rather than guessing a gid.
+fn socket_ownership(allowed_uid: Option<u32>) -> (u32, u32, u32) {
+   match allowed_uid.and_then(|uid| primary_gid(uid).map(|gid| (uid, gid))) {
+      Some((uid, gid)) => (uid, gid, 0o660),
+      None => (0, 0, 0o660),
+   }
+}
+
+/// The primary gid of `uid`, read from `/etc/passwd`.
+///
+/// Reading the passwd file rather than calling `getpwuid_r` keeps the ownership fix to a
+/// single `unsafe` call (`chown`). A malformed line is skipped, never a panic.
+fn primary_gid(uid: u32) -> Option<u32> {
+   let passwd = fs::read_to_string("/etc/passwd").ok()?;
+   passwd.lines().find_map(|line| {
+      let mut fields = line.split(':');
+      let _name = fields.next()?;
+      let _password = fields.next()?;
+      let entry_uid: u32 = fields.next()?.parse().ok()?;
+      let entry_gid: u32 = fields.next()?.parse().ok()?;
+      (entry_uid == uid).then_some(entry_gid)
+   })
+}
+
+/// Hands the socket to `allowed_uid` and its primary group, then applies the mode.
+///
+/// The mode is set after the chown because `chown` clears the set-id bits; doing it in
+/// this order means a later ownership change can never relax the access bits. A missing
+/// passwd entry leaves the socket `root:root`, which the GUI cannot open, so it is
+/// logged rather than guessed at.
+fn apply_socket_ownership(path: &Path, allowed_uid: Option<u32>) -> io::Result<()> {
+   let (uid, gid, mode) = socket_ownership(allowed_uid);
+   let mut ownership = Ok(());
+   if let Some(requested) = allowed_uid {
+      if uid == requested {
+         ownership = chown_socket(path, uid, gid);
+      } else {
+         warn!(
+            "could not look up the primary group of uid {requested}: the control socket \
+             stays root:root and the GUI cannot connect"
+         );
+      }
+   }
+   fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+   ownership
+}
+
+/// Changes ownership of the socket file at `path` to `uid:gid`.
+fn chown_socket(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+   let path = CString::new(path.as_os_str().as_bytes())
+      .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+   // SAFETY: `path` is a valid NUL-terminated C string built from a `Path` (a path byte
+   // cannot contain a NUL without failing the conversion above), and `uid`/`gid` are
+   // passed by value. `-1` is not passed for either field, so ownership is the only
+   // attribute this call changes.
+   let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+   if result == 0 {
+      Ok(())
+   } else {
+      Err(io::Error::last_os_error())
+   }
 }
 
 /// The snapshots the server answers from, published by the daemon loop.
@@ -251,7 +321,12 @@ impl IpcServer {
 
       remove_stale_socket(socket_path)?;
       let listener = UnixListener::bind(socket_path)?;
-      fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660))?;
+      if let Err(err) = apply_socket_ownership(socket_path, allowed_uid) {
+         warn!(
+            "could not give the control socket to allowed uid {allowed_uid:?}: {err}; \
+             the GUI cannot connect"
+         );
+      }
 
       let (sender, receiver) = mpsc::channel();
       info!(
@@ -337,7 +412,7 @@ impl IpcHandle {
    ///
    /// Every authenticated connection receives broadcasts — the protocol has no separate
    /// "listening" flag that could suppress a prompt — so a connected client counts as a
-   /// subscriber, which is what the GUI-spawn decision needs.
+   /// subscriber, which is what the "no GUI attached" warning needs.
    pub fn is_subscribed(&self) -> bool {
       self.clients() > 0
    }
@@ -724,6 +799,23 @@ mod tests {
       assert!(peer_allowed(1000, Some(1000)));
       assert!(!peer_allowed(1000, None), "None means root only");
       assert!(!peer_allowed(1001, Some(1000)));
+   }
+
+   #[test]
+   fn socket_ownership_defaults_to_root_root_when_no_uid_is_allowed() {
+      assert_eq!(socket_ownership(None), (0, 0, 0o660));
+   }
+
+   // The chown itself is not tested: it needs root and a real user's passwd entry, and
+   // the socket path is a live filesystem object. Only the decision is unit-tested.
+   #[test]
+   fn socket_ownership_keeps_the_mode_after_a_chown() {
+      let (uid, gid, mode) = socket_ownership(Some(0));
+      assert_eq!((uid, gid), (0, 0), "root's primary group is 0");
+      assert_eq!(
+         mode, 0o660,
+         "chown clears set-id bits, so the mode is applied after"
+      );
    }
 
    #[test]

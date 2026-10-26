@@ -54,11 +54,12 @@ after. This is the phase that proves the whole premise, so it is verified by han
 - DNS queue thread: parse answers into the cache (always ACCEPT).
 - Verdict loop: attribution → ruleset → verdict or prompt; flow-grant cache; joining
   duplicate flows to one prompt; PID self-exclusion.
-- `prompts.rs`: pending prompts, packet-id sets, deadline, timeout → deny, GUI
-  spawn-on-demand, default-action fallback.
+- `prompts.rs`: pending prompts, packet-id sets, deadline, timeout → deny, default-action
+  fallback.
 - `ipc_server.rs`: SO_PEERCRED check, subscribe/broadcast of events, rule CRUD, status.
 - `store.rs`: atomic rules.json persistence, hot reload, validation on load.
-- systemd unit and `install.sh`.
+- systemd unit and `install.sh`: the installer expects prebuilt binaries (`--bin-dir`),
+  never builds, and the GUI is launched by the session's autostart entry.
 
 Gate: on the live machine, an unseen binary produces exactly one prompt; Allow-forever
 persists a rule; Deny drops; timeout denies; killing the daemon restores unfiltered

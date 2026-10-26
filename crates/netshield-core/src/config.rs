@@ -49,8 +49,6 @@ pub struct Config {
    /// `None` means root only. It is never a wildcard: a missing value must not widen the
    /// socket permissions to every user.
    pub allowed_uid: Option<u32>,
-   /// GUI binary to spawn on demand, or `None` to never spawn one.
-   pub gui_path: Option<PathBuf>,
    pub log_level: LogLevel,
    /// Unix socket the GUI connects to.
    pub socket_path: PathBuf,
@@ -66,7 +64,6 @@ impl Default for Config {
          prompt_timeout_secs: 30,
          default_action: DefaultAction::Prompt,
          allowed_uid: None,
-         gui_path: None,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
          rules_path: PathBuf::from("/etc/netshield/rules.json"),
@@ -202,7 +199,6 @@ mod tests {
       assert_eq!(config.prompt_timeout_secs, 30);
       assert_eq!(config.default_action, DefaultAction::Prompt);
       assert_eq!(config.allowed_uid, None);
-      assert_eq!(config.gui_path, None);
       assert_eq!(config.log_level, LogLevel::Info);
       assert_eq!(
          config.socket_path,
@@ -260,7 +256,6 @@ mod tests {
          prompt_timeout_secs: 45,
          default_action: DefaultAction::Deny,
          allowed_uid: Some(1000),
-         gui_path: Some(PathBuf::from("/usr/bin/netshield-gui")),
          log_level: LogLevel::Trace,
          ..Config::default()
       };
