@@ -17,10 +17,13 @@ use netshield_core::rule::{Action, Duration};
 pub const WIDTH: f32 = 480.0;
 
 /// The host window's height. [`layout_height_estimate`] must stay below it.
-pub const HEIGHT: f32 = 380.0;
+pub const HEIGHT: f32 = 404.0;
 
-/// Inner margin of the alert panel, in points.
-const PANEL_MARGIN: f32 = 14.0;
+/// Inner margin of the alert panel, in points, applied on all four sides.
+const PANEL_MARGIN: i8 = 14;
+
+/// Extra gap at the top of the content, inside the panel margin.
+const PANEL_TOP_GAP: f32 = 4.0;
 
 /// The central panel's own margin around the alert frame, top plus bottom.
 const PANEL_CHROME: f32 = 16.0;
@@ -122,7 +125,7 @@ impl Default for AlertState {
 
 /// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
 ///
-/// The fixed layout is sized for the 480x380 host: app name, destination, duration, scope,
+/// The fixed layout is sized for the 480x404 host: app name, destination, duration, scope,
 /// countdown and the two action buttons all fit without scrolling. The app row is drawn
 /// first so a future section cannot push it off the top again; [`layout_height_estimate`]
 /// is the budget that guards that. There are no keyboard shortcuts; Escape deliberately
@@ -144,6 +147,7 @@ pub fn ui(
    );
 
    egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
+      ui.add_space(PANEL_TOP_GAP);
       ui.spacing_mut().item_spacing.y = SECTION_GAP;
 
       // The app row goes first: the user must always know which program is asking.
@@ -219,7 +223,7 @@ pub fn layout_height_estimate() -> f32 {
       + COUNTDOWN_HEIGHT
       + SECTION_GAP
       + BUTTON_HEIGHT;
-   sections + 2.0 * PANEL_MARGIN + PANEL_CHROME
+   sections + 2.0 * f32::from(PANEL_MARGIN) + PANEL_CHROME + PANEL_TOP_GAP
 }
 
 /// The process name, with the right-aligned owner ids when the daemon attributed it.
