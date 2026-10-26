@@ -1,8 +1,10 @@
 //! NetShield desktop GUI entry point and its hand-rolled options parser.
 
+mod alert;
 mod app;
 mod connlog;
 mod ipc;
+mod mock;
 mod theme;
 mod ui;
 
@@ -105,11 +107,27 @@ fn main() -> eframe::Result {
       }
    };
 
-   let options = eframe::NativeOptions {
-      viewport: egui::ViewportBuilder::default()
+   // In `--alert` mode the root window is the prompt itself, so it opens at the panel's
+   // fixed size and cannot be resized out of the layout. Normal mode keeps the shell.
+   let viewport = if cli.alert {
+      egui::ViewportBuilder::default()
+         .with_title("NetShield")
+         .with_inner_size([460.0, 260.0])
+         .with_min_inner_size([460.0, 260.0])
+         .with_max_inner_size([460.0, 260.0])
+         .with_resizable(false)
+         .with_always_on_top()
+         // Starts hidden; the app shows it from `App::logic` when the first prompt
+         // arrives, which still runs for a hidden window.
+         .with_visible(false)
+   } else {
+      egui::ViewportBuilder::default()
          .with_title("NetShield")
          .with_inner_size([980.0, 640.0])
-         .with_min_inner_size([760.0, 480.0]),
+         .with_min_inner_size([760.0, 480.0])
+   };
+   let options = eframe::NativeOptions {
+      viewport,
       ..Default::default()
    };
    eframe::run_native(
