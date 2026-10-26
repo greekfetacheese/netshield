@@ -9,6 +9,10 @@
 //! never fatal, while `BIND`, `PARAMS`, `QUEUE_MAXLEN` and `FLAGS` are the steps whose
 //! failure would leave the queue misconfigured, so they are fatal. Configuration is ACKed;
 //! verdicts are not, because they sit on the packet hot path.
+//!
+//! One received datagram may carry several packet messages, so [`NfQueue::recv`] drains
+//! every one of them: each packet id owes the kernel exactly one verdict, and a message
+//! skipped here would sit unverdicted until the queue was destroyed.
 
 use std::io;
 
@@ -23,7 +27,7 @@ const NFQNL_MSG_VERDICT: u16 = 1;
 const NFQNL_MSG_CONFIG: u16 = 2;
 
 const NFQNL_CFG_CMD_BIND: u8 = 1;
-const NFQNL_CFG_CMD_PF_UNBIND: u8 = 2;
+const NFQNL_CFG_CMD_PF_UNBIND: u8 = 4;
 const NFQNL_CFG_CMD_PF_BIND: u8 = 3;
 
 const NFQA_CFG_CMD: u16 = 1;
@@ -184,12 +188,16 @@ impl NfQueue {
       })
    }
 
-   /// Blocks for one datagram and returns the packet it carried, or `None` when the
-   /// datagram held no `NFQNL_MSG_PACKET` (an ACK, a non-packet nfnetlink message).
+   /// Appends every queued packet carried by one datagram to `out` and returns how many
+   /// were appended. A datagram may carry several packet messages, so a caller must never
+   /// assume one; `out` lets the caller reuse its allocation on the hot path.
    ///
-   /// A malformed packet message is an error: answering with a guessed verdict would
-   /// either drop traffic that should flow or accept traffic that should not.
-   pub fn recv(&mut self) -> Result<Option<Packet>, NfqError> {
+   /// A datagram with no `NFQNL_MSG_PACKET` (an ACK, other nfnetlink traffic) returns
+   /// `Ok(0)`: there is nothing to answer and the caller may block again. A malformed
+   /// packet message is an error even when other messages were fine: answering with a
+   /// guessed verdict would either drop traffic that should flow or accept traffic that
+   /// should not, and the packet it describes must stay visibly unverdicted.
+   pub fn recv(&mut self, out: &mut Vec<Packet>) -> Result<usize, NfqError> {
       let n = match self.socket.take_deferred() {
          Some(datagram) => {
             if datagram.len() > self.recv_buf.len() {
@@ -203,15 +211,7 @@ impl NfQueue {
          }
          None => self.socket.recv_datagram(&mut self.recv_buf)?,
       };
-      for msg in MessageIter::new(&self.recv_buf[..n]) {
-         let msg = msg.map_err(|err| NfqError::Protocol(err.to_string()))?;
-         if msg.msg_type == queue_msg(NFQNL_MSG_PACKET) {
-            return parse_packet(msg.payload).map(Some);
-         }
-         // ACKs and other nfnetlink traffic are not packets; the caller gets `None` and
-         // may block again.
-      }
-      Ok(None)
+      drain_packets(&self.recv_buf[..n], out)
    }
 
    /// Answers one packet id. Fire-and-forget: a verdict is on the hot path and the kernel
@@ -226,6 +226,25 @@ impl NfQueue {
    pub fn queue_num(&self) -> u16 {
       self.queue
    }
+}
+
+/// Appends every packet message framed in one received datagram to `out`.
+///
+/// Split out from [`NfQueue::recv`] so the coalescing case is unit-tested against a
+/// hand-built datagram with no socket: returning on the first packet message used to
+/// leave the rest of the datagram's packet ids unverdicted.
+fn drain_packets(datagram: &[u8], out: &mut Vec<Packet>) -> Result<usize, NfqError> {
+   let mut appended = 0;
+   for msg in MessageIter::new(datagram) {
+      let msg = msg.map_err(|err| NfqError::Protocol(err.to_string()))?;
+      if msg.msg_type == queue_msg(NFQNL_MSG_PACKET) {
+         out.push(parse_packet(msg.payload)?);
+         appended += 1;
+      }
+      // ACKs and other nfnetlink traffic are not packets; keep draining so a packet
+      // that shares the datagram with them is not lost.
+   }
+   Ok(appended)
 }
 
 /// `CONFIG`/`CMD` payload: `nfgenmsg` plus `nfqnl_msg_config_cmd` bytes.
@@ -599,6 +618,71 @@ mod tests {
          &msg[24..28],
          &[NFQNL_CFG_CMD_PF_BIND, 0, 0, AF_INET6]
       );
+   }
+
+   #[test]
+   fn pf_unbind_is_command_four_for_both_families() {
+      for pf in [AF_INET, AF_INET6] {
+         let msg = frame(
+            queue_msg(NFQNL_MSG_CONFIG),
+            5,
+            1,
+            &config_cmd(3, NFQNL_CFG_CMD_PF_UNBIND, pf),
+         );
+         assert_eq!(msg.len(), 28);
+         assert_eq!(
+            &msg[20..24],
+            &[8, 0, 1, 0],
+            "attr: len 8, type NFQA_CFG_CMD"
+         );
+         assert_eq!(
+            &msg[24..28],
+            &[4, 0, 0, pf],
+            "unbind command 4, family {pf}"
+         );
+      }
+   }
+
+   #[test]
+   fn one_datagram_drains_every_packet() {
+      let mut first = [0u8; PACKET_HDR_LEN];
+      first[0..4].copy_from_slice(&0x11u32.to_be_bytes());
+      first[6] = 3;
+      let mut second = [0u8; PACKET_HDR_LEN];
+      second[0..4].copy_from_slice(&0x22u32.to_be_bytes());
+      second[6] = 3;
+      let mut datagram =
+         packet_datagram(&[(NFQA_PACKET_HDR, &first), (NFQA_PAYLOAD, b"first packet")]);
+      datagram.extend_from_slice(&packet_datagram(&[
+         (NFQA_PACKET_HDR, &second),
+         (NFQA_PAYLOAD, b"second packet"),
+      ]));
+      assert_eq!(
+         MessageIter::new(&datagram).count(),
+         2,
+         "the datagram must hold two framed messages"
+      );
+
+      // The drain is exercised directly: it is the part that used to return on the first
+      // packet and silently drop the rest of the datagram.
+      let mut out = Vec::new();
+      let count = drain_packets(&datagram, &mut out).unwrap();
+      assert_eq!(count, 2);
+      assert_eq!(out.len(), 2);
+      assert_eq!(
+         (out[0].id, out[0].payload.as_slice()),
+         (0x11, &b"first packet"[..])
+      );
+      assert_eq!(
+         (out[1].id, out[1].payload.as_slice()),
+         (0x22, &b"second packet"[..])
+      );
+
+      // An ACK-only datagram carries no packet, and the caller gets `Ok(0)`.
+      let mut out = Vec::new();
+      let ack = frame(socket::NLMSG_ERROR, 0, 1, &0i32.to_ne_bytes());
+      assert_eq!(drain_packets(&ack, &mut out).unwrap(), 0);
+      assert!(out.is_empty());
    }
 
    #[test]

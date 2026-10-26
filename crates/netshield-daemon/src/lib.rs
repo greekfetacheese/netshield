@@ -6,8 +6,9 @@
 //! no C — so the wire format is implemented and unit-tested here rather than delegated
 //! to a library whose behaviour would then be a dependency of the firewall's correctness.
 //!
-//! Only the transport lives in this crate today. The rule engine and the process
-//! attribution built on top of it consume `netshield-core`'s pure model, which is why the
-//! dependency edge exists before the first use.
+//! The transport lives in [`netlink`] and the table that feeds it in [`firewall`]; both
+//! are unit-tested, and [`probe`] (in the binary) wires them together on a live machine.
 
+pub mod firewall;
+pub mod logging;
 pub mod netlink;
