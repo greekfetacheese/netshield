@@ -56,4 +56,5 @@ build, systemd. Root is required for the daemon; the GUI runs as the logged-in u
 
 ## Licence
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Dual-licensed under MIT or Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
