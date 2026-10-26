@@ -60,8 +60,12 @@ require_root() {
 
 refuse_second_firewall() {
    if systemctl is-active --quiet opensnitch; then
-      fail "OpenSnitch is active; two firewalls must not share NFQUEUE. Run:
+      if [ "$DRY_RUN" -eq 1 ]; then
+         note "warning: OpenSnitch is active; a real install would refuse because two firewalls must not share NFQUEUE. Continuing because this is only a dry run."
+      else
+         fail "OpenSnitch is active; two firewalls must not share NFQUEUE. Run:
   systemctl stop opensnitch && systemctl disable opensnitch"
+      fi
    fi
 }
 
