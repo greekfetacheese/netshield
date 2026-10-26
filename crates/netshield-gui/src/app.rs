@@ -247,6 +247,10 @@ impl App {
       };
 
       if self.last_alert_id != Some(first.id) {
+         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            alert::WIDTH,
+            alert::HEIGHT,
+         )));
          ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
          ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::AlwaysOnTop,
@@ -284,7 +288,7 @@ impl App {
       let mut state = self.alerts.remove(&prompt.id).unwrap_or_default();
       let builder = egui::ViewportBuilder::default()
          .with_title("NetShield")
-         .with_inner_size([460.0, 260.0])
+         .with_inner_size([alert::WIDTH, alert::HEIGHT])
          .with_resizable(false)
          .with_always_on_top()
          .with_visible(true);

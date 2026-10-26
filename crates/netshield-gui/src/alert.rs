@@ -14,7 +14,40 @@ use netshield_core::ipc::{ConnectionView, DecideRequest, PromptRequest, ScopeCho
 use netshield_core::rule::{Action, Duration};
 
 /// The host window's width; the panel never outgrows it.
-const WIDTH: f32 = 460.0;
+pub const WIDTH: f32 = 480.0;
+
+/// The host window's height. [`layout_height_estimate`] must stay below it.
+pub const HEIGHT: f32 = 380.0;
+
+/// Inner margin of the alert panel, in points.
+const PANEL_MARGIN: f32 = 14.0;
+
+/// The central panel's own margin around the alert frame, top plus bottom.
+const PANEL_CHROME: f32 = 16.0;
+
+/// Vertical gap between two sections.
+const SECTION_GAP: f32 = 6.0;
+
+/// Height of the bold process-name row.
+const APP_ROW: f32 = 22.0;
+
+/// Height of a default body line.
+const BODY_ROW: f32 = 17.0;
+/// Height of a small or monospace line.
+const SMALL_ROW: f32 = 12.0;
+/// Height of the destination line.
+const DESTINATION_ROW: f32 = 26.0;
+/// Height of one radio row, including the hit target.
+const RADIO_ROW: f32 = 22.0;
+/// Height of the `N more waiting` line.
+const PENDING_ROW: f32 = 12.0;
+/// Height of the countdown bar.
+const COUNTDOWN_HEIGHT: f32 = 18.0;
+/// Height of the Deny/Allow buttons.
+const BUTTON_HEIGHT: f32 = 32.0;
+
+/// Longest process name drawn before it is elided; the row must stay one line.
+const APP_NAME_CHARS: usize = 30;
 
 /// Red fill of the Deny button. White text keeps the contrast well above 4.5:1.
 const DENY_FILL: Color32 = Color32::from_rgb(0xB3, 0x2D, 0x2D);
@@ -89,69 +122,114 @@ impl Default for AlertState {
 
 /// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
 ///
-/// The fixed layout is sized for the 460x260 host: destination, duration, scope, countdown
-/// and the two action buttons all fit without scrolling. There are no keyboard shortcuts;
-/// Escape deliberately does nothing, because a stray key must not decide a firewall rule.
+/// The fixed layout is sized for the 480x380 host: app name, destination, duration, scope,
+/// countdown and the two action buttons all fit without scrolling. The app row is drawn
+/// first so a future section cannot push it off the top again; [`layout_height_estimate`]
+/// is the budget that guards that. There are no keyboard shortcuts; Escape deliberately
+/// does nothing, because a stray key must not decide a firewall rule.
 pub fn ui(
    ui: &mut Ui,
    prompt: &PromptRequest,
    state: &mut AlertState,
    remaining_secs: f32,
 ) -> Option<Decision> {
-   ui.set_max_width(WIDTH);
-   ui.spacing_mut().item_spacing.y = 2.0;
-
    let view = &prompt.connection;
    let mut decision = None;
 
-   if prompt.pending > 0 {
-      ui.label(RichText::new(format!("{} more waiting", prompt.pending)).small().weak());
-   }
-
-   app_row(ui, view);
-   ui.label(RichText::new("wants to connect to").weak());
-   destination(ui, view);
-   ui.label(RichText::new(protocol_line(view)).weak());
-
-   duration_row(ui, state);
-   scope_row(ui, prompt, state);
-
-   ui.add(
-      egui::ProgressBar::new(progress_fraction(
-         remaining_secs,
-         prompt.timeout_secs,
-      ))
-      .desired_height(12.0)
-      .text(countdown_text(remaining_secs)),
+   // The constants exist to catch a section that outgrows the fixed host window; the
+   // matching test below states the spare margin the real layout must leave.
+   debug_assert!(
+      layout_height_estimate() <= HEIGHT,
+      "the alert layout outgrew its {HEIGHT}pt host window",
    );
 
-   ui.add_space(2.0);
-   ui.with_layout(
-      egui::Layout::right_to_left(egui::Align::Center),
-      |ui| {
-         let allow = egui::Button::new(RichText::new("Allow").color(BUTTON_TEXT).strong())
-            .fill(ALLOW_FILL)
-            .min_size(egui::vec2(130.0, 30.0));
-         if ui.add(allow).clicked() {
-            decision = Some(decision_for(state, prompt, Action::Allow));
-         }
+   egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
+      ui.spacing_mut().item_spacing.y = SECTION_GAP;
 
-         let deny = egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong())
-            .fill(DENY_FILL)
-            .min_size(egui::vec2(130.0, 30.0));
-         if ui.add(deny).clicked() {
+      // The app row goes first: the user must always know which program is asking.
+      app_row(ui, view);
+      if prompt.pending > 0 {
+         ui.label(RichText::new(format!("{} more waiting", prompt.pending)).small().weak());
+      }
+
+      ui.add_space(SECTION_GAP);
+      ui.label(RichText::new("wants to connect to").weak());
+      destination(ui, view);
+      ui.label(RichText::new(protocol_line(view)).weak());
+
+      ui.add_space(SECTION_GAP);
+      duration_section(ui, state);
+
+      ui.add_space(SECTION_GAP);
+      scope_section(ui, prompt, state);
+
+      ui.add_space(SECTION_GAP);
+      let width = ui.available_width();
+      ui.add(
+         egui::ProgressBar::new(progress_fraction(
+            remaining_secs,
+            prompt.timeout_secs,
+         ))
+         .desired_width(width)
+         .desired_height(COUNTDOWN_HEIGHT)
+         .text(countdown_text(remaining_secs)),
+      );
+
+      ui.add_space(SECTION_GAP);
+      ui.columns(2, |columns| {
+         let deny =
+            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
+         let deny_width = columns[0].available_width();
+         if columns[0].add_sized(egui::vec2(deny_width, BUTTON_HEIGHT), deny).clicked() {
             decision = Some(decision_for(state, prompt, Action::Deny));
          }
-      },
-   );
+
+         let allow =
+            egui::Button::new(RichText::new("Allow").color(BUTTON_TEXT).strong()).fill(ALLOW_FILL);
+         let allow_width = columns[1].available_width();
+         if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
+            decision = Some(decision_for(state, prompt, Action::Allow));
+         }
+      });
+   });
 
    decision
 }
 
+/// Conservative vertical budget of every section the panel can draw, in points.
+///
+/// It is deliberately generous: a real render must fit the configured window with room to
+/// spare, and the test below keeps a future section from silently clipping the app row.
+/// The `pending` line is always counted, even though it only appears when prompts queue.
+pub fn layout_height_estimate() -> f32 {
+   let sections = PENDING_ROW
+      + SECTION_GAP
+      + APP_ROW
+      + SECTION_GAP
+      + BODY_ROW
+      + DESTINATION_ROW
+      + SMALL_ROW
+      + SECTION_GAP
+      + SMALL_ROW
+      + RADIO_ROW
+      + SECTION_GAP
+      + RADIO_ROW
+      + RADIO_ROW
+      + SECTION_GAP
+      + COUNTDOWN_HEIGHT
+      + SECTION_GAP
+      + BUTTON_HEIGHT;
+   sections + 2.0 * PANEL_MARGIN + PANEL_CHROME
+}
+
 /// The process name, with the right-aligned owner ids when the daemon attributed it.
+///
+/// The name is elided rather than wrapped, so a long program name can never spill into
+/// the destination's line.
 fn app_row(ui: &mut Ui, view: &ConnectionView) {
    ui.horizontal(|ui| {
-      ui.heading(app_name(view));
+      let name = elide(&app_name(view), APP_NAME_CHARS);
+      ui.add(egui::Label::new(RichText::new(name).size(20.0).strong()).truncate());
 
       let mut ids = Vec::new();
       if let Some(pid) = view.pid {
@@ -169,6 +247,21 @@ fn app_row(ui: &mut Ui, view: &ConnectionView) {
          );
       }
    });
+}
+
+/// Shortens `text` to at most `max_chars` characters, ending in `…` when it was cut.
+///
+/// Character-based so a multi-byte program name is never split mid-codepoint. Pure, so
+/// the layout can trim a heading before egui ever measures it.
+pub fn elide(text: &str, max_chars: usize) -> String {
+   if max_chars == 0 {
+      return String::new();
+   }
+   if text.chars().count() <= max_chars {
+      return text.to_owned();
+   }
+   let kept: String = text.chars().take(max_chars - 1).collect();
+   format!("{kept}…")
 }
 
 /// The destination: the learned hostname when there is one, the address otherwise.
@@ -199,45 +292,54 @@ fn protocol_line(view: &ConnectionView) -> String {
    line
 }
 
-/// `For` plus exactly one selected duration.
-fn duration_row(ui: &mut Ui, state: &mut AlertState) {
+/// The duration radios, under a muted `Duration` label.
+///
+/// Radios rather than a pill row: they say the three choices are mutually exclusive, and
+/// there is no orphan `For` label left over from the old layout.
+fn duration_section(ui: &mut Ui, state: &mut AlertState) {
+   ui.label(RichText::new("Duration").small().weak());
    ui.horizontal(|ui| {
-      ui.label("For");
       for (value, label) in [
          (Duration::Once, "Once"),
          (Duration::Session, "Until restart"),
          (Duration::Forever, "Forever"),
       ] {
-         if ui.selectable_label(state.duration == value, label).clicked() {
-            state.duration = value;
-         }
+         ui.radio_value(&mut state.duration, value, label);
       }
    });
 }
 
-/// The scope radios, the domain they will apply to, and the subdomain opt-in.
-fn scope_row(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
+/// The scope radios, the domain `Only this domain` applies to, and the subdomain opt-in.
+///
+/// The domain label shares the radio's line so the choice reads as one sentence. The
+/// subdomain checkbox is indented to the radio's *text*, not its circle, and stays
+/// disabled until the domain scope is both offered and selected.
+fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
+   ui.radio_value(&mut state.scope_domain, false, "This connection");
+
+   let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
    ui.horizontal(|ui| {
-      ui.radio_value(&mut state.scope_domain, false, "This connection");
+      let enabled = prompt.domain_scope_available && host.is_some();
       let domain = ui.add_enabled(
-         prompt.domain_scope_available,
+         enabled,
          egui::RadioButton::new(state.scope_domain, "Only this domain"),
       );
       if domain.clicked() {
          state.scope_domain = true;
       }
+      if let Some(host) = host {
+         ui.label(RichText::new(host).small().weak());
+      }
    });
 
-   if state.scope_domain
-      && let Some(host) = prompt.connection.domain.as_deref().filter(|host| !host.is_empty())
-   {
-      ui.label(RichText::new(format!("Applies to {host}")).small().weak());
-   }
-
-   ui.add_enabled(
-      state.scope_domain,
-      egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
-   );
+   let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+   ui.horizontal(|ui| {
+      ui.add_space(indent);
+      ui.add_enabled(
+         state.scope_domain && prompt.domain_scope_available,
+         egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
+      );
+   });
 }
 
 /// `Auto-deny in <n>s`, or the denying state once the deadline has passed.
@@ -390,6 +492,125 @@ mod tests {
             host: "www.google.com".to_owned(),
             subdomains: false,
          }
+      );
+   }
+
+   #[test]
+   fn tmp_measure_sections() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let mut out: Vec<(&str, f32, f32)> = Vec::new();
+      for pending in [0usize, 2] {
+         let mut p = prompt(Some("www.google.com"), true);
+         p.pending = pending;
+         for _ in 0..3 {
+            out.clear();
+            let mut state = AlertState::new();
+            let mut output = ctx.run_ui(input.clone(), |ctx| {
+               egui::CentralPanel::default().show(ctx, |ui| {
+                  let f = egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
+                     ui.spacing_mut().item_spacing.y = SECTION_GAP;
+                     let mut m = |ui: &mut Ui, name: &'static str, kind: u8| {
+                        let a = ui.cursor().min.y;
+                        match kind {
+                           0 => app_row(ui, &p.connection),
+                           1 => {
+                              if p.pending > 0 {
+                                 ui.label(
+                                    RichText::new(format!("{} more waiting", p.pending))
+                                       .small()
+                                       .weak(),
+                                 );
+                              }
+                           }
+                           2 => {
+                              ui.label(RichText::new("wants to connect to").weak());
+                           }
+                           3 => destination(ui, &p.connection),
+                           4 => {
+                              ui.label(RichText::new(protocol_line(&p.connection)).weak());
+                           }
+                           5 => duration_section(ui, &mut state),
+                           6 => scope_section(ui, &p, &mut state),
+                           7 => {
+                              let width = ui.available_width();
+                              ui.add(
+                                 egui::ProgressBar::new(0.5)
+                                    .desired_width(width)
+                                    .desired_height(COUNTDOWN_HEIGHT)
+                                    .text("Auto-deny in 18s"),
+                              );
+                           }
+                           8 => {
+                              ui.columns(2, |columns| {
+                                 let w = columns[0].available_width();
+                                 columns[0].add_sized(
+                                    egui::vec2(w, BUTTON_HEIGHT),
+                                    egui::Button::new(
+                                       RichText::new("Deny").color(BUTTON_TEXT).strong(),
+                                    )
+                                    .fill(DENY_FILL),
+                                 );
+                                 let w = columns[1].available_width();
+                                 columns[1].add_sized(
+                                    egui::vec2(w, BUTTON_HEIGHT),
+                                    egui::Button::new(
+                                       RichText::new("Allow").color(BUTTON_TEXT).strong(),
+                                    )
+                                    .fill(ALLOW_FILL),
+                                 );
+                              });
+                           }
+                           9 => ui.add_space(SECTION_GAP),
+                           _ => {}
+                        }
+                        out.push((name, a, ui.cursor().min.y - a));
+                     };
+                     m(ui, "app", 0);
+                     m(ui, "pending", 1);
+                     m(ui, "space", 9);
+                     m(ui, "wants", 2);
+                     m(ui, "dest", 3);
+                     m(ui, "proto", 4);
+                     m(ui, "space", 9);
+                     m(ui, "duration", 5);
+                     m(ui, "space", 9);
+                     m(ui, "scope", 6);
+                     m(ui, "space", 9);
+                     m(ui, "countdown", 7);
+                     m(ui, "space", 9);
+                     m(ui, "buttons", 8);
+                  });
+                  let _ = f;
+               });
+            });
+            output.textures_delta.clear();
+         }
+         println!("--- pending = {pending}");
+         for (n, a, v) in &out {
+            println!("{n:10} at {a:6.1} h={v:5.1}");
+         }
+      }
+   }
+
+   /// The panel's vertical budget must fit the host window with room to spare.
+   ///
+   /// [`layout_height_estimate`] counts every section but not this spare margin, so a
+   /// section added without growing [`HEIGHT`] fails here instead of clipping the app row.
+   #[test]
+   fn layout_estimate_leaves_headroom_in_the_host_window() {
+      const MARGIN: f32 = 24.0;
+      let estimate = layout_height_estimate();
+      assert!(
+         HEIGHT > estimate + MARGIN,
+         "layout estimate {estimate} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
       );
    }
 
