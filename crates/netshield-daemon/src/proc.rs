@@ -35,6 +35,12 @@ const MAX_PIDS: usize = 4096;
 /// Most descriptors one pid's scan may examine.
 const MAX_FDS: usize = 4096;
 
+/// Most unconnected UDP rows one lookup may consider as ownership candidates.
+///
+/// A local port shared by more sockets than this is not a desktop resolver pattern; the
+/// cap keeps the candidate list bounded even when the table is adversarially large.
+const MAX_UDP_CANDIDATES: usize = 64;
+
 /// Most bytes of `/proc/<pid>/cmdline` kept after joining its NUL-separated arguments.
 const MAX_CMDLINE: usize = 4096;
 
@@ -132,43 +138,55 @@ impl Attributor {
             return self.unknown(&format!("cannot read /proc/net/{table}: {error}"));
          }
       };
-      let Some(inode) = find_inode(&text, family, local, remote) else {
+      let candidates = inode_candidates(&text, family, local, remote, proto);
+      if candidates.is_empty() {
          return self.unknown(&format!(
             "no /proc/net/{table} row for {} -> {}",
             endpoint_label(local),
             endpoint_label(remote)
          ));
-      };
-      if inode == 0 {
+      }
+      if candidates.len() == 1 && candidates[0] == 0 {
          // TIME_WAIT and friends keep a table row but no live socket to own it.
          return self.unknown("the matching socket row has inode 0");
       }
 
-      let owner = match self.cached_owner(inode, uid) {
-         Some(owner) => owner,
-         None => match self.scan_for_inode(inode, uid) {
-            Some(owner) => owner,
-            None => {
-               return self.unknown(&format!(
-                  "no /proc/<pid>/fd link owns inode {inode}"
-               ));
-            }
-         },
+      let owner = candidate_owner(&candidates, uid, |inode| {
+         match self.cached_owner(inode, uid) {
+            Some(owner) => Some(owner),
+            None => self.scan_for_inode(inode, uid),
+         }
+      });
+      let (inode, pid, process_uid) = match owner {
+         CandidateOwner::Found { inode, pid, uid } => (inode, pid, uid),
+         CandidateOwner::Mismatch {
+            inode,
+            pid,
+            packet_uid,
+            owner_uid,
+         } => {
+            // The fd exists but belongs to someone else than the packet said: the socket
+            // was reused between the queue and this scan. Guessing would grant the wrong
+            // application's policy.
+            self.stats.misses += 1;
+            warn!(
+               "attribution refused for inode {inode}: packet uid {packet_uid} but \
+                /proc/{pid} is owned by uid {owner_uid}"
+            );
+            return Attribution::Unknown;
+         }
+         CandidateOwner::Ambiguous => {
+            return self.unknown(
+               "several unconnected UDP sockets share the local port and the packet has no uid",
+            );
+         }
+         CandidateOwner::Missing => {
+            return self.unknown(&format!(
+               "no /proc/<pid>/fd link owns any of the {} candidate inode(s)",
+               candidates.len()
+            ));
+         }
       };
-      let (pid, process_uid) = owner;
-      if let Some(packet_uid) = uid
-         && packet_uid != process_uid
-      {
-         // The fd exists but belongs to someone else than the packet said: the socket
-         // was reused between the queue and this scan. Guessing would grant the wrong
-         // application's policy.
-         self.stats.misses += 1;
-         warn!(
-            "attribution refused for inode {inode}: packet uid {packet_uid} but \
-             /proc/{pid} is owned by uid {process_uid}"
-         );
-         return Attribution::Unknown;
-      }
 
       let Some(process) = read_process(pid, process_uid) else {
          return self.unknown(&format!(
@@ -376,33 +394,139 @@ fn decode_v6(hex: &str) -> Option<IpAddr> {
    Some(IpAddr::V6(Ipv6Addr::from(bytes)))
 }
 
-/// Finds the inode of the row matching both endpoints.
+/// Iterates the parseable rows of a `/proc/net/{tcp,udp}` table as
+/// `(local, remote, inode)`.
 ///
 /// Field layout, from the kernel's header: 1 local, 2 remote, 3 state, 7 uid, 9 inode.
 /// A malformed or header line is skipped rather than treated as an error; the table is
 /// kernel output and one unparsable line must not hide the socket on another line.
-fn find_inode(
+fn socket_rows(
+   text: &str,
+   family: Family,
+) -> impl Iterator<Item = ((IpAddr, u16), (IpAddr, u16), u64)> + '_ {
+   text.lines().filter_map(move |line| {
+      let fields: Vec<&str> = line.split_whitespace().collect();
+      if fields.len() <= 9 {
+         return None;
+      }
+      let local = decode_endpoint(fields[1], family)?;
+      let remote = decode_endpoint(fields[2], family)?;
+      let inode = fields[9].parse::<u64>().ok()?;
+      Some((local, remote, inode))
+   })
+}
+
+/// Returns the inode candidates for a flow, best match first.
+///
+/// TCP is exact-only: an unconnected socket is indistinguishable from another flow on the
+/// same port, so a loose fallback would attribute one application's packet to another.
+///
+/// UDP may be unconnected, which is how the system resolver and most DNS clients send.
+/// Their table row keeps the wildcard local address and an unspecified remote even after
+/// `sendto()`, while the queued packet carries the interface address. The fallback accepts
+/// rows on the packet's local port whose remote is unspecified and whose local address is
+/// either unspecified or the packet's local address. All such rows are returned because
+/// the uid cross-check and the fd scan are what pick the owner; the packet tuple alone
+/// cannot. An exact row always wins and is returned alone.
+fn inode_candidates(
    text: &str,
    family: Family,
    local: (IpAddr, u16),
    remote: (IpAddr, u16),
-) -> Option<u32> {
-   for line in text.lines() {
-      let fields: Vec<&str> = line.split_whitespace().collect();
-      if fields.len() <= 9 {
+   proto: L4Proto,
+) -> Vec<u64> {
+   let mut rows = socket_rows(text, family);
+   let exact = rows.find(|(row_local, row_remote, _)| *row_local == local && *row_remote == remote);
+   if let Some((_, _, inode)) = exact {
+      return vec![inode];
+   }
+   if proto != L4Proto::Udp {
+      return Vec::new();
+   }
+
+   let mut candidates = Vec::new();
+   for (row_local, row_remote, inode) in socket_rows(text, family) {
+      if row_local.1 != local.1 {
          continue;
       }
-      let Some(parsed_local) = decode_endpoint(fields[1], family) else {
+      if !row_remote.0.is_unspecified() || row_remote.1 != 0 {
          continue;
-      };
-      let Some(parsed_remote) = decode_endpoint(fields[2], family) else {
+      }
+      if !row_local.0.is_unspecified() && row_local.0 != local.0 {
          continue;
-      };
-      if parsed_local == local && parsed_remote == remote {
-         return fields[9].parse::<u32>().ok();
+      }
+      if inode == 0 {
+         // A table row without a live socket, e.g. TIME_WAIT, can never own the packet.
+         continue;
+      }
+      candidates.push(inode);
+      if candidates.len() == MAX_UDP_CANDIDATES {
+         break;
       }
    }
-   None
+   candidates
+}
+
+/// The outcome of trying inode candidates against `/proc/<pid>/fd`.
+#[derive(Debug, PartialEq, Eq)]
+enum CandidateOwner {
+   /// The candidate's owner agrees with the kernel-supplied uid (or no uid was supplied).
+   Found { inode: u32, pid: u32, uid: u32 },
+   /// The only candidate found is owned by a different uid than the packet's.
+   Mismatch {
+      inode: u32,
+      pid: u32,
+      packet_uid: u32,
+      owner_uid: u32,
+   },
+   /// Several candidates exist and the packet carries no uid to disambiguate them.
+   Ambiguous,
+   /// No candidate inode is held by any readable process.
+   Missing,
+}
+
+/// Tries candidates in order until one yields an owner that agrees with `uid`.
+///
+/// `owner_of` is injected so this selection logic can be exercised without a live `/proc`.
+fn candidate_owner(
+   candidates: &[u64],
+   uid: Option<u32>,
+   mut owner_of: impl FnMut(u32) -> Option<(u32, u32)>,
+) -> CandidateOwner {
+   if uid.is_none() && candidates.len() > 1 {
+      // Two sockets can share a local port; without the kernel uid there is no evidence
+      // to pick one, and a wrong application in a firewall prompt is worse than Unknown.
+      return CandidateOwner::Ambiguous;
+   }
+   let mut mismatch = None;
+   for &candidate in candidates {
+      let Ok(inode) = u32::try_from(candidate) else {
+         continue;
+      };
+      let Some((pid, owner_uid)) = owner_of(inode) else {
+         continue;
+      };
+      if let Some(wanted) = uid
+         && wanted != owner_uid
+      {
+         mismatch.get_or_insert((inode, pid, wanted, owner_uid));
+         continue;
+      }
+      return CandidateOwner::Found {
+         inode,
+         pid,
+         uid: owner_uid,
+      };
+   }
+   match mismatch {
+      Some((inode, pid, packet_uid, owner_uid)) => CandidateOwner::Mismatch {
+         inode,
+         pid,
+         packet_uid,
+         owner_uid,
+      },
+      None => CandidateOwner::Missing,
+   }
 }
 
 /// Opens `/proc/<pid>/fd` and collects the socket inodes it holds.
@@ -526,6 +650,27 @@ mod tests {
    1: 0100007F:0C08 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 233146 1 0000000000000000 100 0 0 10 0
 ";
 
+   /// `/proc/net/udp` captured on the development machine, in the same verbatim style as
+   /// the TCP fixtures: one unconnected DNS socket that has only `sendto()`-ed (the kernel
+   /// keeps the wildcard local address and an unspecified remote while the queued packet
+   /// carries the interface address), one connected socket on another port, a duplicate
+   /// port-only socket that shares its port, and TIME_WAIT-style rows with inode 0.
+   const UDP_FIXTURE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:8000 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 34567 2 0000000000000000 0
+   1: 00000000:8001 00000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 34570 2 0000000000000000 0
+   2: 0501A8C0:8001 01010101:0035 01 00000000:00000000 00:00000000 00000000  1000        0 45678 1 0000000000000000 20 4 30 10 -1
+   3: 00000000:8002 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 0 2 0000000000000000 0
+   4: 00000000:8002 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 45679 2 0000000000000000 0
+   5: 00000000:8003 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 0 2 0000000000000000 0
+";
+
+   /// `/proc/net/udp6` captured on the same machine: an unconnected `[::]` socket.
+   const UDP6_FIXTURE: &str = "\
+  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:8000 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000   991        0 56789 2 0000000000000000 0
+";
+
    /// `/proc/net/tcp6` captured on the same machine: the `::1:631` listener row.
    const TCP6_FIXTURE: &str = "\
   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -544,6 +689,18 @@ mod tests {
       fs::metadata(format!("{PROC}/{}", std::process::id()))
          .expect("read our own /proc entry")
          .uid()
+   }
+
+   /// The exact-match lookup as TCP uses it; the existing fixtures exercise this path.
+   fn find_inode(
+      text: &str,
+      family: Family,
+      local: (IpAddr, u16),
+      remote: (IpAddr, u16),
+   ) -> Option<u32> {
+      inode_candidates(text, family, local, remote, L4Proto::Tcp)
+         .first()
+         .and_then(|inode| u32::try_from(*inode).ok())
    }
 
    #[test]
@@ -642,6 +799,164 @@ mod tests {
             v6(Ipv6Addr::UNSPECIFIED, 0)
          ),
          Some(11_054)
+      );
+   }
+
+   #[test]
+   fn unconnected_udp_row_is_found_by_local_port() {
+      // The packet carries the interface address; the unconnected socket row keeps the
+      // wildcard local address and an unspecified remote, so an exact match cannot find it.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 32768),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         vec![34_567]
+      );
+   }
+
+   #[test]
+   fn connected_udp_row_is_matched_exactly_and_wins_over_a_port_only_row() {
+      // Row 2 is connect()ed: real local address and real remote. Row 1 is an unconnected
+      // socket on the same local port, so it is a valid port-only candidate for the same
+      // tuple, yet the exact row must win.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 32769),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         vec![45_678]
+      );
+      // Prove row 1 really is a candidate for that local port by changing only the remote.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 32769),
+            v4([9, 9, 9, 9], 53),
+            L4Proto::Udp
+         ),
+         vec![34_570]
+      );
+   }
+
+   #[test]
+   fn udp_port_only_candidate_must_share_the_local_port() {
+      // The fixture holds unconnected rows on ports 32768..32771; a packet on any other
+      // local port must not be matched to them just because the remote is unspecified.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 40_000),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         Vec::<u64>::new()
+      );
+   }
+
+   #[test]
+   fn tcp_never_falls_back_to_local_port_only() {
+      // The row's local port matches the packet, but its remote is the wildcard; TCP has
+      // no port-only stage, so this must stay unattributed.
+      assert_eq!(
+         inode_candidates(
+            TCP_FIXTURE,
+            Family::V4,
+            v4([127, 0, 0, 1], 3080),
+            v4([127, 0, 0, 1], 9),
+            L4Proto::Tcp
+         ),
+         Vec::<u64>::new()
+      );
+   }
+
+   #[test]
+   fn unconnected_udp6_row_matches_an_ipv6_packet() {
+      let local = v6("2001:db8::1".parse().expect("literal"), 32768);
+      let remote = v6(
+         "2606:4700::681a:868".parse().expect("literal"),
+         53,
+      );
+      assert_eq!(
+         inode_candidates(
+            UDP6_FIXTURE,
+            Family::V6,
+            local,
+            remote,
+            L4Proto::Udp
+         ),
+         vec![56_789]
+      );
+   }
+
+   #[test]
+   fn unconnected_udp_rows_with_inode_zero_are_skipped() {
+      // Port 32770 has a zero-inode row and a live row; only the live inode is a candidate.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 32770),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         vec![45_679]
+      );
+      // Port 32771 only has a zero-inode row: nothing to attribute.
+      assert_eq!(
+         inode_candidates(
+            UDP_FIXTURE,
+            Family::V4,
+            v4([192, 168, 1, 5], 32771),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         Vec::<u64>::new()
+      );
+   }
+
+   #[test]
+   fn udp_ambiguity_uses_the_packet_uid_to_pick_the_owner() {
+      let candidates = [11u64, 22, 33];
+      let owner_of = |inode: u32| match inode {
+         11 => None,
+         22 => Some((100, 991)),
+         33 => Some((200, 1000)),
+         _ => None,
+      };
+
+      // The first live candidate is owned by uid 1000, the second by the packet's 991; the
+      // uid cross-check must walk past the first to the one that agrees.
+      assert_eq!(
+         candidate_owner(&candidates, Some(991), owner_of),
+         CandidateOwner::Found {
+            inode: 22,
+            pid: 100,
+            uid: 991,
+         }
+      );
+      // Without the kernel uid there is no evidence to choose, so ambiguity is Unknown.
+      assert_eq!(
+         candidate_owner(&candidates, None, owner_of),
+         CandidateOwner::Ambiguous
+      );
+      // A uid that owns none of the candidates is refused, not guessed.
+      assert_eq!(
+         candidate_owner(&candidates, Some(7), owner_of),
+         CandidateOwner::Mismatch {
+            inode: 22,
+            pid: 100,
+            packet_uid: 7,
+            owner_uid: 991,
+         }
       );
    }
 
