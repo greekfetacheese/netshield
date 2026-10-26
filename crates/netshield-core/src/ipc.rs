@@ -143,7 +143,7 @@ impl ConnectionView {
 
 /// The destination scope a decision may create.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ScopeChoice {
    AnyConnection,
    Domain { host: String, subdomains: bool },
@@ -175,7 +175,10 @@ pub struct DecideRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum Request {
-   Hello { version: u32, kind: ClientKind },
+   Hello {
+      version: u32,
+      client: ClientKind,
+   },
    Subscribe,
    Decide(DecideRequest),
    ListRules,
@@ -324,7 +327,7 @@ mod tests {
       vec![
          Request::Hello {
             version: PROTOCOL_VERSION,
-            kind: ClientKind::Gui,
+            client: ClientKind::Gui,
          },
          Request::Subscribe,
          Request::Decide(DecideRequest {

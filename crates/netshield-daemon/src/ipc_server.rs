@@ -663,7 +663,7 @@ mod tests {
    fn hello(version: u32) -> Vec<u8> {
       encode_line(&Request::Hello {
          version,
-         kind: ClientKind::Cli,
+         client: ClientKind::Cli,
       })
       .expect("hello encodes")
    }
