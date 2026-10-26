@@ -17,6 +17,7 @@
 //! error, a malformed datagram or a cache miss all end in [`Verdict::Accept`], because a
 //! dropped DNS answer looks like a broken network and is not something a firewall may do.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -53,6 +54,12 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 /// Minimum gap between attempts to spawn the GUI, so a crash-looping binary cannot turn
 /// into a fork bomb.
 const GUI_SPAWN_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Minimum gap between `dns: no name` debug lines for one address.
+const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
+
+/// Upper bound on the addresses the DNS miss limiter remembers.
+const DNS_MISS_LIMIT: usize = 1024;
 
 /// Why the daemon or `--check` could not run.
 #[derive(Debug)]
@@ -172,6 +179,7 @@ struct Daemon {
    last_gui_spawn: Option<Instant>,
    silent_warned: bool,
    table_verified: bool,
+   dns_misses: MissLimiter,
 }
 
 impl Daemon {
@@ -201,6 +209,7 @@ impl Daemon {
          last_gui_spawn: None,
          silent_warned: false,
          table_verified,
+         dns_misses: MissLimiter::new(),
       }
    }
 
@@ -784,13 +793,21 @@ impl Daemon {
    }
 
    /// The name the DNS cache learned for `addr`, if one is still live.
-   fn domain_for(&self, addr: IpAddr) -> Option<String> {
-      self
+   ///
+   /// A miss is logged at most once per [`DNS_MISS_LOG_GAP`] per address: a busy machine
+   /// looks up a lot of uncached addresses, and each line would otherwise flood the
+   /// journal. Hits are never logged.
+   fn domain_for(&mut self, addr: IpAddr) -> Option<String> {
+      let name = self
          .dns_cache
          .lock()
          .expect("dns cache")
          .primary(addr, now_secs())
-         .map(str::to_owned)
+         .map(str::to_owned);
+      if name.is_none() && self.dns_misses.record(addr, Instant::now()) {
+         debug!("dns: no name for {addr}");
+      }
+      name
    }
 
    /// A display snapshot of one connection.
@@ -823,6 +840,37 @@ impl Daemon {
          via_prompt,
       };
       self.ipc.broadcast(&Response::Connection(event));
+   }
+}
+
+/// Remembers when each address last missed the DNS cache, so the miss debug line stays
+/// cheap on a machine that resolves many addresses the cache never saw.
+struct MissLimiter {
+   last: HashMap<IpAddr, Instant>,
+}
+
+impl MissLimiter {
+   fn new() -> Self {
+      Self {
+         last: HashMap::new(),
+      }
+   }
+
+   /// Whether a miss for `addr` at `now` should be logged. The entry is added or refreshed
+   /// only when it is, so a repeatedly missing address costs one hash lookup per second.
+   fn record(&mut self, addr: IpAddr, now: Instant) -> bool {
+      if let Some(at) = self.last.get(&addr) {
+         if now.duration_since(*at) < DNS_MISS_LOG_GAP {
+            return false;
+         }
+      } else if self.last.len() >= DNS_MISS_LIMIT {
+         self.last.retain(|_, at| now.duration_since(*at) < DNS_MISS_LOG_GAP);
+         if self.last.len() >= DNS_MISS_LIMIT {
+            return false;
+         }
+      }
+      self.last.insert(addr, now);
+      true
    }
 }
 
@@ -888,6 +936,17 @@ fn spawn_dns_reader(
             }
 
             for packet in packets.drain(..) {
+               // The one line that distinguishes "the queue delivered nothing" from the
+               // parser or the cache dropping the answer further down this path.
+               let from = parse(&packet.payload)
+                  .map(|parsed| parsed.src.to_string())
+                  .unwrap_or_else(|_| "?".to_owned());
+               debug!(
+                  "dns queue: id={} family={} len={} from={from}",
+                  packet.id,
+                  packet.family,
+                  packet.payload.len()
+               );
                cache_answer(&cache, &packet.payload);
                // Nothing on the DNS path may ever drop an answer: a parse failure is
                // logged at debug and the packet is still accepted.
@@ -906,8 +965,12 @@ fn spawn_dns_reader(
 
 /// Parses one DNS answer and inserts every usable record into the cache.
 fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
+   let family = payload.first().map(|first| first >> 4);
    let Some((body, tcp)) = transport_payload(payload) else {
-      debug!("DNS payload has no TCP/UDP transport; ignoring it");
+      debug!(
+         "DNS payload has no TCP/UDP transport; ignoring it (len={}, family={family:?})",
+         payload.len()
+      );
       return;
    };
 
@@ -920,7 +983,10 @@ fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
    let records: Vec<DnsRecord> = match records {
       Ok(records) => records,
       Err(err) => {
-         debug!("DNS answer could not be parsed: {err:?}");
+         debug!(
+            "DNS answer could not be parsed: {err:?} (len={}, family={family:?})",
+            payload.len()
+         );
          return;
       }
    };
@@ -930,6 +996,10 @@ fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
    for record in records {
       if let Target::Address(addr) = record.target {
          cache.insert(addr, &record.name, record.ttl, now);
+         debug!(
+            "dns: {} -> {} ttl={}",
+            record.name, addr, record.ttl
+         );
       }
    }
 }
@@ -1116,6 +1186,31 @@ mod tests {
       on_shutdown_signal(libc::SIGTERM);
       assert!(SHUTDOWN.load(Ordering::SeqCst));
       SHUTDOWN.store(false, Ordering::SeqCst);
+   }
+
+   #[test]
+   fn dns_miss_limiter_suppresses_a_repeat_within_the_gap() {
+      let mut limiter = MissLimiter::new();
+      let addr: IpAddr = "192.0.2.10".parse().expect("an IPv4 address");
+      let other: IpAddr = "192.0.2.11".parse().expect("another IPv4 address");
+      let start = Instant::now();
+
+      assert!(
+         limiter.record(addr, start),
+         "the first miss is emitted"
+      );
+      assert!(
+         !limiter.record(addr, start + Duration::from_millis(500)),
+         "a second miss inside the gap is suppressed"
+      );
+      assert!(
+         limiter.record(other, start + Duration::from_millis(500)),
+         "a different address is emitted immediately"
+      );
+      assert!(
+         limiter.record(addr, start + DNS_MISS_LOG_GAP),
+         "a miss after the gap is emitted again"
+      );
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
