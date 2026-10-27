@@ -1,19 +1,20 @@
 //! The application shell: navigation, the daemon poll and the current page.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use netshield_core::ipc::{DecideRequest, Mode, PromptRequest, Request, Response, StatusInfo};
 use netshield_core::rule::Rule;
 
-use crate::alert::{self, AlertState, Decision};
+use crate::alert::{self, AlertModel, AlertState, Decision};
 use crate::mock::{Mock, MockEvent};
 use crate::ui;
 use crate::{
    Cli,
    connlog::ConnectionLog,
-   ipc::{self, IpcClient},
+   ipc::{self, Decider, IpcClient},
 };
 
 /// How many connection rows the history keeps before dropping the oldest.
@@ -41,21 +42,23 @@ pub struct App {
    alert: bool,
    /// Unanswered prompts in arrival order; only the first one has a window.
    pending: Vec<PromptRequest>,
-   /// Selection state per prompt id; dropped together with the prompt.
+   /// Selection state per prompt id, for the `--alert` root window.
    alerts: HashMap<u64, AlertState>,
-   /// Wall-clock deadline per prompt id, derived from `timeout_secs` on arrival. The
+   /// Wall-clock deadline per prompt id, for the `--alert` root window's countdown. The
    /// daemon enforces the timeout; this clock only drives the countdown.
    prompt_deadlines: HashMap<u64, Instant>,
+   /// The floating alert's whole state, shared with the deferred viewport's paint callback,
+   /// which runs outside the main window's frames.
+   alert_model: Arc<Mutex<AlertModel>>,
+   /// Answers prompts from inside the alert viewport, where the main window's frames --
+   /// and therefore its own `IpcClient` sends -- do not run while it is minimised.
+   decider: Decider,
+   /// Whether the deferred alert viewport has been registered; registered once per prompt
+   /// and reused until the prompt is answered.
+   alert_viewport: bool,
    /// Last prompt whose window was raised, in both display modes, so the raise commands
    /// are sent once per prompt rather than every frame.
    last_alert_id: Option<u64>,
-   /// Prompts whose floating alert has already been focused and levelled from inside its
-   /// own viewport. Kept on `App` rather than in the closure because the immediate-viewport
-   /// closure can run more than once per prompt.
-   raised_alerts: HashSet<u64>,
-   /// Prompts whose alert had to be centred from inside its own viewport because the monitor
-   /// size was not known when it was created; keeps the fallback to one command per prompt.
-   centred_alerts: HashSet<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
@@ -106,6 +109,9 @@ impl App {
          client.send(&Request::ListRules);
          Some(client)
       };
+      // In `--mock` there is no socket thread to send to, so the handle goes nowhere; the
+      // alert still answers locally and the model is the only state that matters.
+      let decider = ipc.as_ref().map_or_else(Decider::silent, IpcClient::decider);
 
       Self {
          page: Page::Connections,
@@ -118,9 +124,10 @@ impl App {
          pending: Vec::new(),
          alerts: HashMap::new(),
          prompt_deadlines: HashMap::new(),
+         alert_model: Arc::new(Mutex::new(AlertModel::new())),
+         decider,
+         alert_viewport: false,
          last_alert_id: None,
-         raised_alerts: HashSet::new(),
-         centred_alerts: HashSet::new(),
          alert_hidden: false,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
@@ -195,13 +202,17 @@ impl App {
    }
 
    /// Queues one prompt, ignoring an id that is already queued.
+   ///
+   /// The prompt is also presented to the alert model, which starts its countdown. The
+   /// daemon only activates one prompt at a time, so a later one replaces the active alert.
    fn enqueue_prompt(&mut self, prompt: PromptRequest) {
       if self.pending.iter().any(|queued| queued.id == prompt.id) {
          return;
       }
-      let deadline = Instant::now() + Duration::from_secs(prompt.timeout_secs);
-      self.prompt_deadlines.insert(prompt.id, deadline);
+      let timeout = Duration::from_secs(prompt.timeout_secs);
+      self.prompt_deadlines.insert(prompt.id, Instant::now() + timeout);
       self.alerts.insert(prompt.id, AlertState::new());
+      self.model().present(prompt.clone(), timeout, Instant::now());
       self.pending.push(prompt);
    }
 
@@ -210,18 +221,23 @@ impl App {
       self.pending.retain(|queued| queued.id != id);
       self.alerts.remove(&id);
       self.prompt_deadlines.remove(&id);
-      self.raised_alerts.remove(&id);
-      self.centred_alerts.remove(&id);
+      let mut model = self.model();
+      if model.prompt().is_some_and(|prompt| prompt.id == id) {
+         model.clear();
+      }
    }
 
-   /// Reports whether this prompt's alert still needs raising, recording it as raised.
-   ///
-   /// The floating alert's viewport only exists inside its own closure, so the focus and
-   /// level commands must be sent from there -- and exactly once, because a repeated
-   /// `Focus` steals the keyboard continuously. The set lives on `App` because the
-   /// immediate-viewport closure can run more than once per frame.
-   fn raise_alert_once(&mut self, prompt_id: u64) -> bool {
-      self.raised_alerts.insert(prompt_id)
+   /// Seconds left on this prompt's deadline, as the `--alert` root window shows it.
+   fn remaining_secs(&self, id: u64) -> f32 {
+      self.prompt_deadlines.get(&id).map_or(0.0, |deadline| {
+         deadline.saturating_duration_since(Instant::now()).as_secs_f32()
+      })
+   }
+
+   /// The alert model, with a poisoned lock recovered rather than propagated: a panic in
+   /// the paint callback must not wedge the daemon-facing part of the window.
+   fn model(&self) -> std::sync::MutexGuard<'_, AlertModel> {
+      self.alert_model.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
    }
 
    /// Sends one decision (or, in `--mock`, only logs it) and closes the prompt locally.
@@ -244,13 +260,6 @@ impl App {
       ctx.request_repaint();
    }
 
-   /// Seconds left on this prompt's deadline, as the panel shows it.
-   fn remaining_secs(&self, id: u64) -> f32 {
-      self.prompt_deadlines.get(&id).map_or(0.0, |deadline| {
-         deadline.saturating_duration_since(Instant::now()).as_secs_f32()
-      })
-   }
-
    /// Raises the alert for a newly active prompt, or hides the `--alert` root when the
    /// queue drains.
    ///
@@ -263,7 +272,7 @@ impl App {
    /// Follows Zeus' `GUI::bring_to_front` for the `--alert` root only: unhide and unminimise
    /// it, then ask the window manager for critical attention. A floating alert has its own
    /// viewport, which does not exist yet at this point in the frame; it is activated,
-   /// levelled and centred from inside its own closure instead (see [`Self::floating_alert`]),
+   /// levelled and centred from inside its own closure instead (see [`Self::alert_window`]),
    /// and the main window is left completely alone. Answering a prompt is unchanged; this
    /// only raises it.
    fn alert_viewport(&mut self, ctx: &egui::Context) {
@@ -293,7 +302,7 @@ impl App {
       // Only the `--alert` root is commanded here, because there it *is* the alert. A
       // floating prompt never commands the root at all: the main window keeps whatever
       // size, place and minimised state the user left it in, and the alert raises itself
-      // from inside its own viewport (see `floating_alert`).
+      // from inside its own viewport (see `alert_window`).
       let root = egui::ViewportId::ROOT;
       if self.alert {
          ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Minimized(false));
@@ -331,65 +340,52 @@ impl App {
       }
    }
 
-   /// The normal-mode host: the oldest prompt in its own always-on-top window.
-   fn floating_alert(&mut self, ctx: &egui::Context) {
-      let Some(prompt) = self.pending.first().cloned() else {
+   /// Registers the alert's deferred viewport while a prompt is open, and stops registering
+   /// it once the prompt is gone so egui drops the window.
+   ///
+   /// This runs from `App::logic`, which eframe still calls for a minimised root window. A
+   /// deferred viewport owns its own paint loop, so this registration is what keeps the
+   /// alert alive -- and answering -- while the main window is iconified. Registration is
+   /// repeated every pass because egui drops any child viewport it was not shown again in
+   /// that pass; the same id and builder make that a no-op for the window itself.
+   ///
+   /// `--alert` mode is untouched: there the root window is already the alert.
+   fn alert_window(&mut self, ctx: &egui::Context) {
+      if self.alert {
          return;
-      };
-      let remaining = self.remaining_secs(prompt.id);
-      let mut state = self.alerts.remove(&prompt.id).unwrap_or_default();
-      let alert_size = egui::vec2(alert::WIDTH, alert::HEIGHT);
-      // A monitor size is only known once a viewport has reported one; on the prompt's first
-      // frame it is usually already there because the main window supplies it.
-      let monitor_size = ctx.input(|i| i.viewport().monitor_size);
+      }
+      if self.model().prompt().is_none() {
+         if self.alert_viewport {
+            // The last prompt was answered: hide now, then stop registering so the window
+            // is dropped instead of being left on screen blank until the next prompt.
+            ctx.send_viewport_cmd_to(
+               alert_viewport_id(),
+               egui::ViewportCommand::Visible(false),
+            );
+            self.alert_viewport = false;
+         }
+         return;
+      }
+
+      self.alert_viewport = true;
+      let model = Arc::clone(&self.alert_model);
+      let decider = self.decider.clone();
+      let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
       let mut builder = egui::ViewportBuilder::default()
          .with_title("NetShield")
          .with_inner_size([alert::WIDTH, alert::HEIGHT])
          .with_resizable(false)
          .with_always_on_top()
-         // Activation is a creation-time request: `ViewportCommand::Focus` sent to an
-         // immediate viewport is ignored by the window manager, so ask for it here instead.
-         .with_active(true)
-         .with_visible(true);
-      if let Some(monitor) = monitor_size {
-         builder = builder.with_position(centred_position(monitor, alert_size));
+         .with_visible(true)
+         .with_active(true);
+      // The monitor size is not known before a viewport has reported one; the closure
+      // centres the alert itself once it appears.
+      if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+         builder = builder.with_position(centred_position(monitor, size));
       }
-
-      let decision =
-         ctx.show_viewport_immediate(alert_viewport_id(prompt.id), builder, |ctx, _| {
-            // This `ctx` is the alert viewport's own context, the only one valid here: the
-            // viewport does not exist before this call. Raise it on its first frame only.
-            // Activation is not commanded here: `ViewportCommand::Focus` is ignored for an
-            // immediate viewport, so the builder's `with_active(true)` requests it at creation.
-            if self.raise_alert_once(prompt.id) {
-               ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                  egui::WindowLevel::AlwaysOnTop,
-               ));
-               ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                  egui::UserAttentionType::Critical,
-               ));
-            }
-            // The builder's position needs the monitor size, which is missing on the very
-            // first frame; centre the alert here once that size appears instead.
-            if !self.centred_alerts.contains(&prompt.id)
-               && let Some(monitor) = ctx.input(|i| i.viewport().monitor_size)
-            {
-               ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                  centred_position(monitor, alert_size).into(),
-               ));
-               self.centred_alerts.insert(prompt.id);
-            }
-            let mut decision = None;
-            egui::CentralPanel::default().show(ctx, |ui| {
-               decision = alert::ui(ui, &prompt, &mut state, remaining);
-            });
-            decision
-         });
-
-      self.alerts.insert(prompt.id, state);
-      if let Some(decision) = decision {
-         self.answer(ctx, prompt.id, decision);
-      }
+      ctx.show_viewport_deferred(alert_viewport_id(), builder, move |ui, _class| {
+         paint_alert(ui, &model, &decider);
+      });
    }
 
    /// The loud offline banner, shown above the page content.
@@ -488,6 +484,7 @@ impl eframe::App for App {
       self.update();
       ctx.request_repaint_after(POLL_EVERY);
       self.alert_viewport(ctx);
+      self.alert_window(ctx);
    }
 
    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -495,8 +492,6 @@ impl eframe::App for App {
          self.root_alert(ui);
          return;
       }
-
-      self.floating_alert(ui.ctx());
 
       egui::Panel::left("nav").exact_size(180.0).show(ui, |ui| {
          ui.add_space(8.0);
@@ -519,12 +514,66 @@ impl eframe::App for App {
    }
 }
 
-/// The viewport id the floating alert for `prompt_id` is shown in.
+/// The name the one alert viewport's id is hashed from.
 ///
-/// One id per prompt, shared by the `show_viewport_immediate` call and the raise commands,
-/// so the alert's own window is focused rather than a stale one for a previous prompt.
-fn alert_viewport_id(prompt_id: u64) -> egui::ViewportId {
-   egui::ViewportId::from_hash_of(("alert", prompt_id))
+/// A single id for every prompt: the window is registered once and reused, so each new
+/// prompt paints into the existing alert rather than opening a duplicate window.
+const ALERT_VIEWPORT: &str = "netshield-alert";
+
+/// The one viewport the floating alert is shown in.
+fn alert_viewport_id() -> egui::ViewportId {
+   egui::ViewportId::from_hash_of(ALERT_VIEWPORT)
+}
+
+/// Draws the alert into its own viewport and delivers the answer.
+///
+/// A free function, not a closure over `App`: the callback must be `Send + Sync + 'static`,
+/// and only the model and the send handle cross into it. Everything here -- raising,
+/// drawing, submitting, expiring and sending -- must happen in this callback, because the
+/// main window's `ui` pass does not run while it is minimised, which is exactly when the
+/// alert still has to work.
+fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider: &Decider) {
+   let ctx = ui.ctx().clone();
+   let mut model = model.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+   if model.raise_once().is_some() {
+      ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+      ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+         egui::WindowLevel::AlwaysOnTop,
+      ));
+      ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+         egui::UserAttentionType::Critical,
+      ));
+      if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+         let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
+         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+            centred_position(monitor, size).into(),
+         ));
+      }
+   }
+
+   let Some(prompt) = model.prompt().cloned() else {
+      return;
+   };
+   let remaining = model.remaining_secs(std::time::Instant::now()).unwrap_or(0.0);
+   if let Some(decision) = alert::ui(ui, &prompt, model.state_mut(), remaining) {
+      model.submit(decision);
+   }
+   if model.is_expired(std::time::Instant::now()) {
+      model.clear();
+   }
+   // Sending belongs here rather than in `App::update`: while the main window is
+   // minimised its update still runs, but a drain tied to that path would stall the
+   // answer the moment the parent stopped painting.
+   for request in model.take_outgoing() {
+      if !decider.send(&Request::Decide(request)) {
+         log::warn!("the ipc thread is gone; dropping a prompt answer");
+      }
+   }
+
+   // The countdown and the selection both have to keep moving while the main window is
+   // minimised, so ask for the next frame every frame; 10 Hz on a 480x440 window is cheap.
+   ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }
 
 /// Top-left position that centres a `size` window on a `monitor`.
@@ -552,6 +601,7 @@ mod tests {
 
    use netshield_core::connection::{Family, L4Proto};
    use netshield_core::ipc::ConnectionView;
+   use netshield_core::rule::Action;
 
    use super::*;
 
@@ -633,31 +683,69 @@ mod tests {
    }
 
    #[test]
-   fn answering_drops_the_centring_bookkeeping() {
+   fn a_queued_prompt_is_presented_to_the_alert_model() {
       let mut app = app();
+      assert!(
+         app.model().prompt().is_none(),
+         "an idle app has no alert"
+      );
+
       app.enqueue_prompt(prompt(1));
-      assert!(app.centred_alerts.insert(1));
-      app.remove_prompt(1);
-      assert!(!app.centred_alerts.contains(&1));
+      let mut model = app.model();
+      assert_eq!(model.prompt().map(|prompt| prompt.id), Some(1));
+      assert!(
+         model.remaining_secs(Instant::now()).is_some_and(|left| left > 29.0),
+         "the countdown must start from the prompt's own timeout"
+      );
+      assert_eq!(
+         model.raise_once(),
+         Some(1),
+         "a new prompt raises itself once"
+      );
+      assert_eq!(model.raise_once(), None, "and never twice");
    }
 
    #[test]
-   fn a_prompt_is_raised_once_until_it_is_answered() {
+   fn the_model_keeps_the_latest_active_prompt() {
       let mut app = app();
       app.enqueue_prompt(prompt(1));
       app.enqueue_prompt(prompt(2));
 
-      // The immediate-viewport closure may run more than once for one prompt; the second
-      // call must not send another `Focus`, which would steal the keyboard every frame.
-      assert!(app.raise_alert_once(1));
-      assert!(!app.raise_alert_once(1));
-      assert!(!app.raised_alerts.contains(&2));
+      // The daemon activates one prompt at a time; the newest one owns the alert window.
+      assert_eq!(
+         app.model().prompt().map(|prompt| prompt.id),
+         Some(2)
+      );
 
-      // Answering drops the bookkeeping, so a reused id is raised again.
+      // Closing the queued prompt leaves the model alone: it is not the active one.
       app.remove_prompt(1);
-      assert!(!app.raised_alerts.contains(&1));
+      assert_eq!(
+         app.model().prompt().map(|prompt| prompt.id),
+         Some(2)
+      );
+
+      app.remove_prompt(2);
+      assert!(app.model().prompt().is_none());
+   }
+
+   #[test]
+   fn answering_from_the_viewport_queues_one_decision_and_closes_the_alert() {
+      let mut app = app();
       app.enqueue_prompt(prompt(1));
-      assert!(app.raise_alert_once(1));
-      assert!(!app.raise_alert_once(1));
+
+      let decision = app.model().state_mut().decision(&prompt(1), Action::Deny);
+      app.model().submit(Decision {
+         action: decision.action,
+         duration: decision.duration,
+         scope: decision.scope,
+      });
+
+      let outgoing = app.model().take_outgoing();
+      assert_eq!(outgoing.len(), 1);
+      assert_eq!(outgoing[0].prompt_id, 1);
+      assert!(
+         app.model().prompt().is_none(),
+         "a submitted prompt stops painting"
+      );
    }
 }
