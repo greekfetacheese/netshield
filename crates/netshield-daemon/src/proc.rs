@@ -930,10 +930,7 @@ fn read_fd_dir(path: PathBuf) -> Result<Vec<u32>, ScanError> {
          continue;
       };
       seen += 1;
-      // `metadata` follows the link, so this is the time of the file behind the
-      // descriptor; the directory entry's own time is not what a recent socket changes.
-      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
-      entries.push((entry.file_name(), mtime));
+      entries.push((entry.file_name(), entry_mtime(&entry)));
    }
    let over_budget = seen > MAX_FDS;
    let mut inodes = Vec::new();
@@ -953,6 +950,17 @@ fn read_fd_dir(path: PathBuf) -> Result<Vec<u32>, ScanError> {
       return Err(ScanError::Budget(inodes));
    }
    Ok(inodes)
+}
+
+/// Returns a directory entry's own modification time, without following a symlink.
+///
+/// A `/proc` descriptor is a link: `socket:[<inode>]`, `/dev/null`, a pipe. Its link
+/// metadata is the descriptor's age, which is what this ordering is about, and
+/// `fs::metadata` would follow the link instead. For a socket that gives the socket inode's
+/// time (`0`) and for a regular file the target's age, so following the link would sort
+/// precisely the descriptors this scan is looking for into the untimed bucket.
+fn entry_mtime(entry: &fs::DirEntry) -> Option<SystemTime> {
+   entry.metadata().ok()?.modified().ok()
 }
 
 /// Sorts `(name, mtime)` descriptor entries newest-first, as OpenSnitch does; entries
@@ -2015,6 +2023,36 @@ mod tests {
       );
    }
 
+   /// The descriptor ordering must read the link's own time. A socket link's target does
+   /// not exist on disk, so following it yields no time at all and every socket would be
+   /// sorted last — the inverse of what the scan needs.
+   #[test]
+   fn descriptor_mtime_is_the_link_time_not_the_target_time() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let dir = std::env::temp_dir().join(format!("netshield-fd-mtime-{nanos}"));
+      fs::create_dir_all(&dir).expect("create the descriptor directory");
+      std::os::unix::fs::symlink("socket:[4242]", dir.join("fd-socket"))
+         .expect("create the socket link");
+
+      let entry = fs::read_dir(&dir)
+         .expect("read the descriptor directory")
+         .next()
+         .expect("one descriptor")
+         .expect("a readable descriptor");
+      assert!(
+         entry.metadata().expect("link metadata").modified().is_ok(),
+         "the socket link itself carries the descriptor's time"
+      );
+      assert!(
+         fs::metadata(entry.path()).is_err(),
+         "the link target does not exist, so following it must fail"
+      );
+
+      let _ = fs::remove_dir_all(&dir);
+   }
+
    /// Creates a descriptor directory holding `MAX_FDS + 10` entries where the only socket
    /// is the newest: the budget may trim the directory but must still inspect that socket.
    #[test]
@@ -2026,23 +2064,31 @@ mod tests {
       fs::create_dir_all(&dir).expect("create the descriptor directory");
 
       let inode = 987_654u32;
-      // A `/proc/<pid>/fd` socket link names a kernel inode that does not exist on disk.
-      // The test's link therefore needs a target that `metadata` can follow, and that
-      // target's mtime is the one `read_fd_dir` reads.
-      let target = format!("socket:[{inode}]");
-      fs::write(dir.join(&target), b"").expect("create the link target");
-      // Stamp it ahead of the stale descriptors created below, which carry "now".
-      fs::File::options()
-         .write(true)
-         .open(dir.join(&target))
-         .expect("open the link target")
-         .set_modified(SystemTime::now() + StdDuration::from_secs(3_600))
-         .expect("stamp the newest descriptor");
-
+      // The stale descriptors are created first, so the socket link below is the newest
+      // entry by creation order; temp-file mtimes have sub-second resolution.
       for index in 0..(MAX_FDS + 9) {
          fs::write(dir.join(format!("stale-{index}")), b"").expect("create a stale descriptor");
       }
-      std::os::unix::fs::symlink(&target, dir.join("fd-socket")).expect("create the socket link");
+      // A `/proc/<pid>/fd` socket link is a symlink to `socket:[<inode>]`; the ordering
+      // reads the link's own time, so the target need not exist.
+      std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("fd-socket"))
+         .expect("create the socket link");
+      // Timestamps are taken from the filesystem, so make the gap unambiguous rather than
+      // relying on two writes landing in the same clock tick.
+      let socket_link = dir.join("fd-socket");
+      let newest = fs::symlink_metadata(&socket_link)
+         .expect("read the socket link")
+         .modified()
+         .expect("the socket link has an mtime");
+      for index in 0..(MAX_FDS + 9) {
+         let stale = dir.join(format!("stale-{index}"));
+         fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open a stale descriptor")
+            .set_modified(newest - StdDuration::from_secs(3_600))
+            .expect("backdate a stale descriptor");
+      }
 
       let pid = std::process::id();
       let uid = own_uid();
