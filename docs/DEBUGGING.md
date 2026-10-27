@@ -159,22 +159,30 @@ absent from the tree was never created at all. Do not confuse the two `WM_STATE`
 the alert itself is `Iconic` when hidden, while the *main* window is `Normal` when it has
 been restored — which is exactly the third cause below.
 
-### "No alert while minimised": three causes, one discriminator
+### "No alert while minimised": three distinct causes, one discriminator
 
-When a prompt arrives while the main window is minimised, "no alert" had three distinct
-causes, and the map state is what told them apart:
+All three looked identical from the user's side — a prompt arrived, nothing appeared, and the
+requesting process hung until the main window was restored. What separated them was **whether a
+window existed at all, and whether it was mapped**.
 
-| Cause | Window tree | Map state | What it meant |
-|---|---|---|---|
-| Viewport created on demand, from the socket thread | no second NetShield window, ever | n/a | winit cannot create a window off the UI thread; the request was dropped |
-| Viewport existed but was never shown/raised | alert window present at 480×440 | `IsUnMapped` | the model queued the alert; nothing called `show`/`focus` |
-| Alert shown, and showing it restored the main window | alert window present and mapped | alert `IsViewable`, main `WM_STATE: Normal` | the alert took focus; the WM un-minimised its owner |
+| # | Cause | Window tree | Map state | What it meant |
+|---|---|---|---|---|
+| 1 | The alert viewport was registered lazily, only once a prompt existed | no second NetShield window, ever | n/a | `show_viewport_deferred` is a **no-op while the root viewport is iconified**: a viewport that does not already exist cannot be created in that state |
+| 2 | The viewport was pre-created, but the show command went through the alert's own `Context` | alert window present at 480×440, never mapped | `IsUnMapped` for the whole life of the prompt | that context is published from the viewport's paint callback, and egui never runs the callback for an unmapped viewport — a circular dependency, so nothing was ever sent |
+| 3 | Alert shown, but showing it restored or raised the main window | both windows mapped | alert `IsViewable`, main `WM_STATE: Normal` | the alert path was commanding the root viewport (`Minimized`, `Visible`, `Focus`), so the WM un-minimised the owner |
 
-The fix for the first two was to **pre-create** the alert viewport at startup (still
-hidden) and show it from the UI thread when a prompt arrives; the fix for the third was to
-raise the alert from its own viewport without touching the main window. That is why the
-regression test asserts *both* halves — an alert appeared **and** the main window stayed
-`Iconic`:
+Note what does **not** cause this: `App::update()` does run while the window is iconified — the app
+keeps polling `status`/`listrules` in that state, so "the event is never drained" is the wrong
+hypothesis, and waking the UI with `ctx.request_repaint()` from the socket thread fixes nothing on
+its own.
+
+The fix for 1 and 2 is to **pre-create** the alert viewport at startup (hidden) and address its
+commands **by id** — `ctx.send_viewport_cmd_to(alert_viewport_id(), ViewportCommand::Visible(true))`
+— from the root context; viewport commands do not need the target viewport's own context. The fix
+for 3 is to never send root-viewport commands while in floating mode.
+
+That is why the regression test asserts *both* halves — an alert appeared **and** the main window
+stayed `Iconic`:
 
 ```bash
 bash dev/check-alert-minimised.sh   # needs a real X display, not agent-sandbox
@@ -225,7 +233,7 @@ Two further traps:
 
   | Call | Rust | On a live socket fd |
   |---|---|---|
-  | `stat` | `fs::metadata` | follows `socket:[N]`; the **target's** time is `0` (epoch), no usable age |
+  | `stat` | `fs::metadata` | follows `socket:[N]`; the **target's** time is `0` (epoch) or the boot time, depending on the socket kind — never the descriptor's, so there is no usable age |
   | `lstat` | `fs::symlink_metadata`, `DirEntry::metadata` | does not follow; the **descriptor's** own time |
 
   Measured on this machine:
