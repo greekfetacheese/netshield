@@ -1,7 +1,8 @@
-//! The Settings page: operation mode plus the read-only daemon settings.
+//! The Settings page: the read-only daemon settings.
 //!
-//! Only the mode is mutable here. The timeout and socket are daemon-side settings, so
-//! the page shows them as text instead of pretending the GUI can change them.
+//! The operation mode lives in the top bar, always visible; this page only reports the
+//! current state. The timeout and socket are daemon-side settings too, so the page shows
+//! them as text instead of pretending the GUI can change them.
 
 use egui::{Color32, RichText, Ui};
 use netshield_core::config::Config;
@@ -13,28 +14,23 @@ const AMBER: Color32 = Color32::from_rgb(0xE0, 0xA8, 0x4A);
 /// Background of the muted amber block; dark enough to stay below the warning text.
 const AMBER_BG: Color32 = Color32::from_rgb(0x3A, 0x2E, 0x14);
 
-/// Draws the page and returns the mode the user switched to, if any.
+/// Draws the page.
 ///
-/// The caller owns the socket, so this only reports the intent; it keeps the widget free
-/// of I/O and testable.
-pub fn show(ui: &mut Ui, current: Mode) -> Option<Mode> {
+/// The mode switch is in the top bar, so this reports the current mode and the Silent-mode
+/// consequence instead of offering a control the shell already owns.
+pub fn show(ui: &mut Ui, current: Mode) {
    ui.heading("Settings");
    ui.add_space(4.0);
 
-   let mut selected = current;
    section(ui, "Operation mode");
-   ui.radio_value(
-      &mut selected,
-      Mode::Alert,
-      "Alert — ask me about every new connection",
-   );
-   ui.radio_value(
-      &mut selected,
-      Mode::Silent,
-      "Silent — allow new connections without asking",
-   );
+   ui.label(RichText::new("\"Ask before connecting\" — toggled in the top bar.").weak());
+   let state = match current {
+      Mode::Alert => "currently: alert",
+      Mode::Silent => "currently: silent",
+   };
+   ui.label(RichText::new(state).weak());
 
-   if selected == Mode::Silent {
+   if current == Mode::Silent {
       ui.add_space(6.0);
       egui::Frame::NONE
          .fill(AMBER_BG)
@@ -68,12 +64,6 @@ pub fn show(ui: &mut Ui, current: Mode) -> Option<Mode> {
    section(ui, "Control socket");
    ui.label(RichText::new(config.socket_path.display().to_string()).monospace());
    ui.label(RichText::new("The GUI connects to this socket as an unprivileged user.").weak());
-
-   if selected != current {
-      Some(selected)
-   } else {
-      None
-   }
 }
 
 /// A separated section heading; every section after the first gets a rule above it.

@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, status: Option<&StatusInfo>, now: u64) {
    ui.add_space(4.0);
 
    let Some(status) = status else {
-      ui.label(RichText::new("Waiting for the daemon…").weak());
+      ui.label(RichText::new("Waiting for the daemon...").weak());
       return;
    };
 
