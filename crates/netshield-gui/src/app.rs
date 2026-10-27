@@ -23,11 +23,26 @@ const LOG_CAPACITY: usize = 500;
 /// How often the GUI asks the daemon for a status snapshot.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
-/// How often the UI wakes so the socket queue is drained even when nothing is clicked.
+/// How often the mock demo ticks: its events are generated inside `update`, so it has no
+/// socket thread to wake it and must keep its own clock.
 const POLL_EVERY: Duration = Duration::from_millis(200);
+
+/// How often the main window repaints while a prompt is active or queued.
+///
+/// Belt and braces beside the socket thread's wake: the alert viewport repaints itself, but
+/// registering it happens on the main window's frame path, so a lost wake-up must not be
+/// able to strand a prompt until the user restores the window.
+const PROMPT_REPAINT_EVERY: Duration = Duration::from_millis(500);
 
 /// Red used by the offline banner; loud on purpose.
 const BANNER_RED: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x1F, 0x1F);
+
+/// The slot the socket thread reads to wake the UI.
+///
+/// Empty until the first pass, because `App::new` runs before eframe hands the app a
+/// `Context`. A minimised window gets no input and schedules no frames, so this wake is
+/// what drains the queue and registers the alert viewport while it is iconified.
+type UiWaker = Arc<Mutex<Option<egui::Context>>>;
 
 /// Top-level application state.
 pub struct App {
@@ -53,14 +68,21 @@ pub struct App {
    /// Answers prompts from inside the alert viewport, where the main window's frames --
    /// and therefore its own `IpcClient` sends -- do not run while it is minimised.
    decider: Decider,
-   /// Whether the deferred alert viewport has been registered; registered once per prompt
-   /// and reused until the prompt is answered.
-   alert_viewport: bool,
    /// Last prompt whose window was raised, in both display modes, so the raise commands
    /// are sent once per prompt rather than every frame.
    last_alert_id: Option<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
+   /// Shared with the socket thread, which wakes the UI after every event it queues. The
+   /// prompt hook also shows the alert through it: viewport commands are addressed by id,
+   /// so the socket thread needs no alert context of its own, and an unmapped window --
+   /// whose paint callback never runs -- cannot strand a prompt.
+   ui_waker: UiWaker,
+   /// Whether the alert viewport is currently shown. It lives on the app because each
+   /// `show_viewport_deferred` call installs a fresh closure, and it is driven from the
+   /// main window's frames rather than the alert's own paint callback, which does not run
+   /// while the window is unmapped.
+   alert_shown: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
    mock_stream: Mock,
    mode: Mode,
@@ -100,10 +122,46 @@ impl Page {
 impl App {
    /// Builds the app and, outside mock mode, starts talking to the daemon.
    pub fn new(cli: Cli) -> Self {
+      let ui_waker: UiWaker = Arc::new(Mutex::new(None));
+      let alert_model: Arc<Mutex<AlertModel>> = Arc::new(Mutex::new(AlertModel::new()));
+      // Starts `true` to match the builder's `with_visible(true)`: the first frame then
+      // hides an idle alert, and a prompt that arrived before that frame only re-shows it.
+      let alert_shown = true;
+      let model_slot = Arc::clone(&alert_model);
+      let ctx_slot = Arc::clone(&ui_waker);
+      let on_prompt = Arc::new(move |prompt: &PromptRequest| {
+         let timeout = Duration::from_secs(prompt.timeout_secs);
+         if let Ok(mut model) = model_slot.lock()
+            && model.prompt().map(|open| open.id) != Some(prompt.id)
+         {
+            model.present(prompt.clone(), timeout, Instant::now());
+         }
+         if let Some(ctx) = ctx_slot.lock().ok().and_then(|slot| slot.clone()) {
+            let id = alert_viewport_id();
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
+            if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+               ctx.send_viewport_cmd_to(
+                  id,
+                  egui::ViewportCommand::OuterPosition(
+                     centred_position(monitor, egui::vec2(alert::WIDTH, alert::HEIGHT)).into(),
+                  ),
+               );
+            }
+            ctx.request_repaint();
+         }
+      });
       let ipc = if cli.mock {
          None
       } else {
-         let client = IpcClient::spawn(cli.socket.clone());
+         // The thread wakes the UI through this slot; it stays empty until the first pass
+         // stores the context, and the queued handshake is drained by that same pass.
+         let wake_slot = Arc::clone(&ui_waker);
+         let waker = Arc::new(move || {
+            if let Some(ctx) = wake_slot.lock().ok().and_then(|slot| slot.clone()) {
+               ctx.request_repaint();
+            }
+         });
+         let client = IpcClient::spawn(cli.socket.clone(), waker, on_prompt);
          client.send(&Request::Subscribe);
          client.send(&Request::Status);
          client.send(&Request::ListRules);
@@ -124,11 +182,12 @@ impl App {
          pending: Vec::new(),
          alerts: HashMap::new(),
          prompt_deadlines: HashMap::new(),
-         alert_model: Arc::new(Mutex::new(AlertModel::new())),
+         alert_model,
          decider,
-         alert_viewport: false,
          last_alert_id: None,
          alert_hidden: false,
+         ui_waker,
+         alert_shown,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
          status: None,
@@ -140,7 +199,15 @@ impl App {
    }
 
    /// Drains the socket queue (or the mock stream) and schedules the next periodic refresh.
-   fn update(&mut self) {
+   ///
+   /// The first call publishes the context into the waker slot: it cannot be done in
+   /// `App::new`, which runs before eframe hands the app its `Context`.
+   fn update(&mut self, ctx: &egui::Context) {
+      if let Ok(mut slot) = self.ui_waker.lock()
+         && slot.is_none()
+      {
+         *slot = Some(ctx.clone());
+      }
       // Prompts are buffered rather than queued inside the drain: queueing needs `&mut
       // self`, and the drain holds an immutable borrow of the client.
       let mut arrived = Vec::new();
@@ -212,7 +279,9 @@ impl App {
       let timeout = Duration::from_secs(prompt.timeout_secs);
       self.prompt_deadlines.insert(prompt.id, Instant::now() + timeout);
       self.alerts.insert(prompt.id, AlertState::new());
-      self.model().present(prompt.clone(), timeout, Instant::now());
+      if self.model().prompt().map(|open| open.id) != Some(prompt.id) {
+         self.model().present(prompt.clone(), timeout, Instant::now());
+      }
       self.pending.push(prompt);
    }
 
@@ -340,34 +409,27 @@ impl App {
       }
    }
 
-   /// Registers the alert's deferred viewport while a prompt is open, and stops registering
-   /// it once the prompt is gone so egui drops the window.
+   /// Registers the alert's deferred viewport on every pass, prompt or not, and keeps its
+   /// visibility in step with the model.
    ///
    /// This runs from `App::logic`, which eframe still calls for a minimised root window. A
    /// deferred viewport owns its own paint loop, so this registration is what keeps the
-   /// alert alive -- and answering -- while the main window is iconified. Registration is
-   /// repeated every pass because egui drops any child viewport it was not shown again in
-   /// that pass; the same id and builder make that a no-op for the window itself.
+   /// alert alive -- and answering -- while the main window is iconified; registering it
+   /// only once a prompt exists is a no-op there, because a viewport that has never been
+   /// created cannot be shown by the socket thread. It is repeated every pass because egui
+   /// drops any child viewport it was not shown in that pass; the same id and builder make
+   /// that a no-op for the window itself.
+   ///
+   /// The show/hide commands are addressed by id from here rather than sent from the
+   /// paint callback: an unmapped window never runs its callback, so a hide or show that
+   /// depended on one would never fire. They are idempotent, so the prompt hook sending
+   /// `Visible(true)` as well is harmless.
    ///
    /// `--alert` mode is untouched: there the root window is already the alert.
    fn alert_window(&mut self, ctx: &egui::Context) {
       if self.alert {
          return;
       }
-      if self.model().prompt().is_none() {
-         if self.alert_viewport {
-            // The last prompt was answered: hide now, then stop registering so the window
-            // is dropped instead of being left on screen blank until the next prompt.
-            ctx.send_viewport_cmd_to(
-               alert_viewport_id(),
-               egui::ViewportCommand::Visible(false),
-            );
-            self.alert_viewport = false;
-         }
-         return;
-      }
-
-      self.alert_viewport = true;
       let model = Arc::clone(&self.alert_model);
       let decider = self.decider.clone();
       let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
@@ -378,14 +440,29 @@ impl App {
          .with_always_on_top()
          .with_visible(true)
          .with_active(true);
-      // The monitor size is not known before a viewport has reported one; the closure
-      // centres the alert itself once it appears.
       if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
          builder = builder.with_position(centred_position(monitor, size));
       }
       ctx.show_viewport_deferred(alert_viewport_id(), builder, move |ui, _class| {
-         paint_alert(ui, &model, &decider);
+         if model.lock().map(|m| m.prompt().is_some()).unwrap_or(false) {
+            paint_alert(ui, &model, &decider);
+         }
       });
+
+      let open = self.model().prompt().is_some();
+      if open && !self.alert_shown {
+         ctx.send_viewport_cmd_to(
+            alert_viewport_id(),
+            egui::ViewportCommand::Visible(true),
+         );
+         self.alert_shown = true;
+      } else if !open && self.alert_shown {
+         ctx.send_viewport_cmd_to(
+            alert_viewport_id(),
+            egui::ViewportCommand::Visible(false),
+         );
+         self.alert_shown = false;
+      }
    }
 
    /// The loud offline banner, shown above the page content.
@@ -476,13 +553,27 @@ impl App {
 }
 
 impl eframe::App for App {
-   /// Polls the daemon and, in `--alert` mode, drives the root window's visibility.
+   /// Drains the daemon queue and, in `--alert` mode, drives the root window's visibility.
    ///
    /// eframe keeps calling this for a hidden window but skips [`Self::ui`], so the polling
-   /// and the "a prompt arrived, show the window" command must live here.
+   /// and the "a prompt arrived, show the window" command must live here. The root window
+   /// is refreshed only through the socket thread's wake; only a pending prompt earns a
+   /// timed repaint, because a lost wake-up would otherwise strand it until the next input.
    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-      self.update();
-      ctx.request_repaint_after(POLL_EVERY);
+      self.update(ctx);
+      // `--mock` has no socket thread to wake it, so it keeps its own demo clock. A real
+      // daemon wakes the UI per event; only a pending prompt earns a timed repaint, so a
+      // lost wake-up cannot strand the alert until the user restores the window.
+      let interval = if self.mock {
+         Some(POLL_EVERY)
+      } else if !self.pending.is_empty() || self.model().prompt().is_some() {
+         Some(PROMPT_REPAINT_EVERY)
+      } else {
+         None
+      };
+      if let Some(interval) = interval {
+         ctx.request_repaint_after(interval);
+      }
       self.alert_viewport(ctx);
       self.alert_window(ctx);
    }
@@ -703,6 +794,25 @@ mod tests {
          "a new prompt raises itself once"
       );
       assert_eq!(model.raise_once(), None, "and never twice");
+   }
+
+   #[test]
+   fn queueing_an_already_presented_prompt_keeps_the_users_selection() {
+      let mut app = app();
+      // The socket thread's hook presents the prompt before the UI drains the queue; the
+      // drain must recognise it by id and not rebuild the selection state around it.
+      let timeout = Duration::from_secs(30);
+      app.model().present(prompt(1), timeout, Instant::now());
+      app.model().state_mut().duration = netshield_core::rule::Duration::Forever;
+
+      app.enqueue_prompt(prompt(1));
+
+      assert_eq!(app.pending.len(), 1);
+      assert_eq!(
+         app.model().state_mut().duration,
+         netshield_core::rule::Duration::Forever,
+         "presenting the same id twice must not reset the selection"
+      );
    }
 
    #[test]
