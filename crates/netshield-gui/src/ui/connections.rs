@@ -1,4 +1,5 @@
-//! The Connections page: one collapsible row per application, its connections underneath.
+//! The Connections page: one collapsible row per application, its connections underneath,
+//! and a detail pane for the selected row.
 //!
 //! The log is flattened into an owned [`Line`] vector and drawn with
 //! [`egui::ScrollArea::show_rows`], which paints only the visible window of a uniform row
@@ -7,9 +8,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
-use egui::{Color32, FontId, Rect, Response, RichText, Sense, Shape, Stroke, Ui, pos2};
+use egui::{Color32, FontId, Rect, Response, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
 use netshield_core::rule::{Rule, RuleId};
 
 use crate::connlog::{ConnectionLog, Row, clock};
@@ -24,27 +26,36 @@ const HEADER_HEIGHT: f32 = 18.0;
 /// Whitespace between two columns.
 const COLUMN_GAP: f32 = 12.0;
 
-/// How far connection rows and group content are indented past the chevron.
-const INDENT: f32 = 16.0;
+/// How far a connection line is indented past the list's left edge.
+const INDENT: f32 = 18.0;
+
+/// Where a group's name starts, past the painted chevron.
+const GROUP_NAME_X: f32 = 22.0;
+
+/// Width of the chevron's click target at the start of a group line.
+const CHEVRON_HIT: f32 = 22.0;
 
 /// Right-hand padding inside a row.
 const ROW_PAD: f32 = 8.0;
 
-const TIME_WIDTH: f32 = 62.0;
-const ADDRESS_WIDTH: f32 = 150.0;
-const PROTO_WIDTH: f32 = 44.0;
-const RESULT_WIDTH: f32 = 120.0;
-const RULE_WIDTH: f32 = 150.0;
+/// The Rule column: enough for `deny 140.82.121.6/32`.
+const RULE_WIDTH: f32 = 190.0;
 
-/// The destination column takes whatever is left, but never shrinks below this.
-const DESTINATION_MIN: f32 = 120.0;
+/// The Activity pill.
+const ACTIVITY_WIDTH: f32 = 64.0;
+const ACTIVITY_HEIGHT: f32 = 18.0;
 
-/// Activity window: 30 one-minute buckets, oldest first.
-const ACTIVITY_BUCKETS: usize = 30;
-const BUCKET_SECS: u64 = 60;
-const BAR_WIDTH: f32 = 2.0;
-const BAR_GAP: f32 = 2.0;
-const ACTIVITY_HEIGHT: f32 = 14.0;
+/// The Connection column never shrinks below this.
+const CONNECTION_MIN: f32 = 140.0;
+
+/// The width of the right-hand detail pane while a row is selected.
+const DETAIL_WIDTH: f32 = 260.0;
+
+/// How many connection lines one group shows before the `N more…` line.
+const MAX_CHILDREN: usize = 8;
+
+/// A timestamp this recent reads `now`; anything older gets a relative label.
+const NOW_SECS: u64 = 10;
 
 /// Verdict colour for an allowed connection.
 const ALLOWED: Color32 = Color32::from_rgb(0x6C, 0xC0, 0x7A);
@@ -52,10 +63,16 @@ const ALLOWED: Color32 = Color32::from_rgb(0x6C, 0xC0, 0x7A);
 /// Whole-row colour for a denied connection: muted red so a scan still reads as text.
 const DENIED: Color32 = Color32::from_rgb(0xC0, 0x6A, 0x6A);
 
+/// Text colour on the accent `now` pill.
+const NOW_INK: Color32 = Color32::from_rgb(0x0E, 0x1B, 0x10);
+
 /// Shown when the deciding rule is no longer in the daemon's list.
 ///
 /// U+2014 is present in both bundled text fonts (Ubuntu-Light and Hack), so it is safe.
 const DASH: &str = "—";
+
+/// The sentence the pane uses when no rule decided a denied connection.
+const PROMPT_RULE: &str = "no rule — decided by the prompt";
 
 /// Which applications are collapsed. Keyed by the row's `app` label.
 #[derive(Default)]
@@ -72,6 +89,18 @@ impl Collapsed {
    fn contains(&self, app: &str) -> bool {
       self.0.contains(app)
    }
+}
+
+/// What the detail pane shows. Owned by `App` beside [`Collapsed`] and [`LinesCache`].
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub enum Selection {
+   #[default]
+   None,
+   App(String),
+   Conn {
+      app: String,
+      at: u64,
+   },
 }
 
 /// Cached derived lines, rebuilt only when the log, the rules or the collapse set change.
@@ -103,39 +132,48 @@ impl LinesCache {
 /// index space rather than a tree of widgets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Line {
-   /// One application: its name, how many connections it has, when it was last active and its
-   /// per-minute activity.
+   /// One application: its name, connection count, newest rule and activity, and whether
+   /// any of its connections was denied.
    Group {
       app: String,
       count: usize,
       last_at: u64,
-      activity: Vec<u16>,
+      rule: String,
+      denied: bool,
+      exe: Option<String>,
    },
    /// One connection belonging to the group above it.
    Conn(Conn),
+   /// The overflow row under a group with more than [`MAX_CHILDREN`] connections.
+   More { remaining: usize },
 }
 
 /// One flattened connection row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conn {
-   pub time: String,
+   pub app: String,
+   pub at: u64,
    pub dest: String,
    pub addr: String,
    pub proto: String,
+   /// Whether `dest` came from a resolved domain rather than an address.
+   pub domain: bool,
    pub allowed: bool,
    pub via_prompt: bool,
    pub candidate: Option<String>,
    /// `allow example.com`, `deny anywhere`, … or `—` when the rule is gone.
    pub rule: String,
+   pub exe: Option<String>,
 }
 
-/// Draws the heading and the virtualised per-application list.
+/// Draws the heading, the detail pane and the virtualised per-application list.
 pub fn show(
    ui: &mut Ui,
    log: &ConnectionLog,
    rules: &[Rule],
    collapsed: &mut Collapsed,
    cache: &mut LinesCache,
+   selection: &mut Selection,
 ) {
    cache.refresh(log, rules, collapsed);
 
@@ -143,14 +181,21 @@ pub fn show(
    heading(ui, log, apps);
 
    if log.is_empty() {
+      *selection = Selection::None;
       ui.label(
          RichText::new("No connections yet — the daemon reports them as they happen.").weak(),
       );
       return;
    }
 
+   detail_pane(ui, &cache.lines, selection);
+
    let columns = Columns::new(ui.available_width());
    header_row(ui, &columns);
+   let now = unix_now();
+   // The activity pills read relative to the wall clock, so the page needs a frame even
+   // when no connection arrives; one a second is enough for a label in whole seconds.
+   ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
 
    // `show_rows` reads the spacing before the closure runs, so zero it out here: the rows
    // are exactly `LINE_HEIGHT` tall and must not be pushed apart by the default gap.
@@ -162,21 +207,18 @@ pub fn show(
       |ui, range| {
          for index in range {
             let line = &cache.lines[index];
-            let width = ui.available_width();
             let sense = match line {
-               Line::Group { .. } => Sense::click(),
-               Line::Conn(_) => Sense::hover(),
+               Line::More { .. } => Sense::hover(),
+               _ => Sense::click(),
             };
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, LINE_HEIGHT), sense);
+            let (rect, response) =
+               ui.allocate_exact_size(vec2(ui.available_width(), LINE_HEIGHT), sense);
             match line {
-               Line::Group {
-                  app,
-                  count,
-                  last_at,
-                  activity,
-               } => {
-                  if response.clicked() {
-                     collapsed.toggle(app);
+               Line::Group { app, .. } => {
+                  if response.clicked()
+                     && let Some(pointer) = response.interact_pointer_pos()
+                  {
+                     click_group(app, rect, pointer, collapsed, selection);
                      // The cache still holds the pre-click lines; one more frame turns the
                      // toggle into the rows it opens or hides.
                      ui.ctx().request_repaint();
@@ -184,14 +226,28 @@ pub fn show(
                   group_row(
                      ui,
                      &response,
-                     app,
-                     *count,
-                     *last_at,
-                     activity,
+                     &columns,
+                     line,
                      collapsed.contains(app),
+                     *selection == Selection::App(app.clone()),
+                     now,
                   );
                }
-               Line::Conn(conn) => conn_row(ui, rect, &columns, conn),
+               Line::Conn(conn) => {
+                  if response.clicked() {
+                     *selection = Selection::Conn {
+                        app: conn.app.clone(),
+                        at: conn.at,
+                     };
+                     ui.ctx().request_repaint();
+                  }
+                  let selected = matches!(
+                     selection,
+                     Selection::Conn { app, at } if app == &conn.app && *at == conn.at
+                  );
+                  conn_row(ui, rect, &columns, conn, selected, now);
+               }
+               Line::More { remaining } => more_row(ui, rect, &columns, *remaining),
             }
          }
       },
@@ -220,48 +276,23 @@ fn heading(ui: &mut Ui, log: &ConnectionLog, apps: usize) {
 
 /// Column widths and left edges, computed once per frame from the available width.
 struct Columns {
-   time: f32,
-   dest: f32,
-   addr: f32,
-   proto: f32,
-   result: f32,
+   connection: f32,
    rule: f32,
-   time_x: f32,
-   dest_x: f32,
-   addr_x: f32,
-   proto_x: f32,
-   result_x: f32,
    rule_x: f32,
+   activity_x: f32,
 }
 
 impl Columns {
    fn new(width: f32) -> Self {
-      let time = TIME_WIDTH;
-      let addr = ADDRESS_WIDTH;
-      let proto = PROTO_WIDTH;
-      let result = RESULT_WIDTH;
-      let rule = RULE_WIDTH;
-      let used = INDENT + time + addr + proto + result + rule + COLUMN_GAP * 5.0;
-      let dest = (width - used).max(DESTINATION_MIN);
-      let time_x = INDENT;
-      let dest_x = time_x + time + COLUMN_GAP;
-      let addr_x = dest_x + dest + COLUMN_GAP;
-      let proto_x = addr_x + addr + COLUMN_GAP;
-      let result_x = proto_x + proto + COLUMN_GAP;
-      let rule_x = result_x + result + COLUMN_GAP;
+      let activity_x = (width - ROW_PAD - ACTIVITY_WIDTH).max(0.0);
+      let rule_x = (activity_x - COLUMN_GAP - RULE_WIDTH).max(INDENT + CONNECTION_MIN);
+      let rule = (activity_x - COLUMN_GAP - rule_x).max(0.0);
+      let connection = (rule_x - COLUMN_GAP).max(0.0);
       Self {
-         time,
-         dest,
-         addr,
-         proto,
-         result,
+         connection,
          rule,
-         time_x,
-         dest_x,
-         addr_x,
-         proto_x,
-         result_x,
          rule_x,
+         activity_x,
       }
    }
 }
@@ -269,7 +300,7 @@ impl Columns {
 /// Paints one row's cells, clipped to their columns and centred vertically.
 ///
 /// Column offsets are relative to the row's left edge, so the header and the rows share
-/// one geometry even where the list is horizontally scrolled.
+/// one geometry.
 struct Cells<'a> {
    painter: &'a egui::Painter,
    rect: Rect,
@@ -289,42 +320,66 @@ impl Cells<'_> {
    }
 }
 
-/// The `Time Destination Address Proto Result Rule` labels above the list.
+/// The `Connection Rule Activity` labels above the list.
 fn header_row(ui: &mut Ui, columns: &Columns) {
-   let width = ui.available_width();
-   let (rect, _) = ui.allocate_exact_size(egui::vec2(width, HEADER_HEIGHT), Sense::hover());
+   let (rect, _) = ui.allocate_exact_size(
+      vec2(ui.available_width(), HEADER_HEIGHT),
+      Sense::hover(),
+   );
    let cells = Cells {
       painter: ui.painter(),
       rect,
    };
    let font = FontId::proportional(11.0);
    let color = ui.visuals().weak_text_color();
-   let headers = [
-      (columns.time_x, columns.time, "Time (UTC)"),
-      (columns.dest_x, columns.dest, "Destination"),
-      (columns.addr_x, columns.addr, "Address"),
-      (columns.proto_x, columns.proto, "Proto"),
-      (columns.result_x, columns.result, "Result"),
-      (columns.rule_x, columns.rule, "Rule"),
-   ];
-   for (x, width, text) in headers {
-      cells.text(x, width, text, &font, color, false);
-   }
+   cells.text(
+      0.0,
+      columns.connection,
+      "Connection",
+      &font,
+      color,
+      false,
+   );
+   cells.text(
+      columns.rule_x + 14.0,
+      columns.rule - 14.0,
+      "Rule",
+      &font,
+      color,
+      false,
+   );
+   let galley = cells.painter.layout_no_wrap("Activity".to_owned(), font, color);
+   let x = columns.activity_x + ACTIVITY_WIDTH - galley.size().x;
+   let y = rect.center().y - galley.size().y / 2.0;
+   cells.painter.galley(pos2(rect.left() + x, y), galley, color);
 }
 
-/// One application row: chevron, name, count, last-seen time and the activity sparkline.
+/// One application row: chevron, name, count, rule dot and text, activity pill.
 fn group_row(
    ui: &mut Ui,
    response: &Response,
-   app: &str,
-   count: usize,
-   last_at: u64,
-   activity: &[u16],
+   columns: &Columns,
+   line: &Line,
    collapsed: bool,
+   selected: bool,
+   now: u64,
 ) {
+   let Line::Group {
+      app,
+      count,
+      last_at,
+      rule,
+      denied,
+      ..
+   } = line
+   else {
+      return;
+   };
    let rect = response.rect;
    let visuals = ui.visuals();
-   let fill = if response.hovered() {
+   let fill = if selected {
+      visuals.selection.bg_fill
+   } else if response.hovered() {
       visuals.widgets.hovered.weak_bg_fill
    } else {
       visuals.faint_bg_color
@@ -335,7 +390,6 @@ fn group_row(
    let weak = visuals.weak_text_color();
    let strong = visuals.strong_text_color();
    let center_y = rect.center().y;
-   let right = rect.right() - ROW_PAD;
 
    // The disclosure triangle is painted, not glyph-rendered: the bundled font is not
    // guaranteed to carry a chevron.
@@ -355,144 +409,323 @@ fn group_row(
    };
    painter.add(Shape::convex_polygon(points, weak, Stroke::NONE));
 
-   let activity_span =
-      ACTIVITY_BUCKETS as f32 * BAR_WIDTH + (ACTIVITY_BUCKETS - 1) as f32 * BAR_GAP;
-   let spark_left = right - activity_span;
-   let max = activity.iter().copied().max().unwrap_or(0);
-   if max > 0 {
-      let bottom = center_y + ACTIVITY_HEIGHT / 2.0;
-      for (index, value) in activity.iter().enumerate() {
-         if *value == 0 {
-            continue;
-         }
-         let height = f32::from(*value) / f32::from(max) * ACTIVITY_HEIGHT;
-         let x = spark_left + index as f32 * (BAR_WIDTH + BAR_GAP);
-         painter.rect_filled(
-            Rect::from_min_max(
-               pos2(x, bottom - height),
-               pos2(x + BAR_WIDTH, bottom),
-            ),
-            0.0,
-            weak,
-         );
-      }
-   }
-
-   let small = FontId::monospace(12.0);
    let body = FontId::proportional(13.0);
+   let small = FontId::proportional(11.0);
 
-   let time = painter.layout_no_wrap(clock(last_at), small.clone(), weak);
-   let time_x = spark_left - COLUMN_GAP - time.size().x;
-   let time_height = time.size().y;
+   // The name is strong; the count trails it as a weak small label.
+   let mut name = LayoutJob {
+      wrap: TextWrapping::truncate_at_width((columns.connection - GROUP_NAME_X).max(0.0)),
+      ..LayoutJob::default()
+   };
+   name.append(app, 0.0, TextFormat::simple(body.clone(), strong));
+   let count_label = if *count == 1 {
+      "1 connection".to_owned()
+   } else {
+      count.to_string()
+   };
+   name.append(
+      &count_label,
+      8.0,
+      TextFormat::simple(small.clone(), weak),
+   );
+   let galley = painter.layout_job(name);
    painter.galley(
-      pos2(time_x, center_y - time_height / 2.0),
-      time,
-      weak,
+      pos2(
+         rect.left() + GROUP_NAME_X,
+         center_y - galley.size().y / 2.0,
+      ),
+      galley,
+      strong,
    );
 
-   let count = painter.layout_no_wrap(format!("{count} connections"), body.clone(), weak);
-   let count_x = time_x - COLUMN_GAP - count.size().x;
-   let count_height = count.size().y;
-   painter.galley(
-      pos2(count_x, center_y - count_height / 2.0),
-      count,
-      weak,
-   );
-
-   let name_x = rect.left() + INDENT;
-   let name_width = (count_x - COLUMN_GAP - name_x).max(40.0);
+   let dot = if *denied { DENIED } else { ALLOWED };
+   painter.circle_filled(pos2(columns.rule_x + 5.0, center_y), 3.5, dot);
    let cells = Cells { painter, rect };
-   cells.text(INDENT, name_width, app, &body, strong, false);
-}
-
-/// One connection row. A denied row keeps every cell in the muted red.
-fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn) {
-   let visuals = ui.visuals();
-   let base = if conn.allowed {
-      visuals.text_color()
-   } else {
-      DENIED
-   };
-   let weak = if conn.allowed {
-      visuals.weak_text_color()
-   } else {
-      DENIED
-   };
-   let verdict_colour = if conn.allowed { ALLOWED } else { DENIED };
-   let cells = Cells {
-      painter: ui.painter(),
-      rect,
-   };
-   let time_font = FontId::monospace(12.0);
-   let body_font = FontId::proportional(13.0);
-
    cells.text(
-      columns.time_x,
-      columns.time,
-      &conn.time,
-      &time_font,
-      base,
+      columns.rule_x + 14.0,
+      (columns.rule - 14.0).max(0.0),
+      rule,
+      &body,
+      visuals.text_color(),
       false,
    );
+
+   activity_pill(painter, columns, rect, *last_at, now, visuals);
+}
+
+/// One connection row. The destination reads in the normal text colour, the protocol part
+/// weak and the verdict strong in its verdict colour.
+fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: bool, now: u64) {
+   let visuals = ui.visuals();
+   if selected {
+      ui.painter().rect_filled(rect, 0.0, visuals.selection.bg_fill);
+   }
+   let base = visuals.text_color();
+   let weak = visuals.weak_text_color();
+   let verdict_colour = if conn.allowed { ALLOWED } else { DENIED };
+   let painter = ui.painter();
+   let body = FontId::proportional(13.0);
+
+   let mut job = LayoutJob {
+      wrap: TextWrapping::truncate_at_width((columns.connection - INDENT).max(0.0)),
+      ..LayoutJob::default()
+   };
    match &conn.candidate {
       // A candidate is a name the daemon guessed but did not resolve; the `?` keeps that
       // distinction visible while the row keeps the existing italic treatment.
-      Some(candidate) => cells.text(
-         columns.dest_x,
-         columns.dest,
+      Some(candidate) => job.append(
          &format!("{candidate} ?"),
-         &body_font,
-         weak,
-         true,
+         0.0,
+         TextFormat {
+            italics: true,
+            ..TextFormat::simple(body.clone(), weak)
+         },
       ),
-      None => cells.text(
-         columns.dest_x,
-         columns.dest,
-         &conn.dest,
-         &body_font,
-         base,
-         false,
+      // No resolved name: show the address with its port, as the reference does.
+      None => job.append(
+         if conn.domain { &conn.dest } else { &conn.addr },
+         0.0,
+         TextFormat::simple(body.clone(), base),
       ),
    }
-   cells.text(
-      columns.addr_x,
-      columns.addr,
-      &conn.addr,
-      &time_font,
-      base,
-      false,
+   let detail = if conn.domain {
+      format!(" · {} {}", conn.proto, port_of(&conn.addr))
+   } else {
+      format!(" · {}", conn.proto)
+   };
+   job.append(
+      &detail,
+      0.0,
+      TextFormat::simple(body.clone(), weak),
    );
-   cells.text(
-      columns.proto_x,
-      columns.proto,
-      &conn.proto,
-      &body_font,
-      base,
-      false,
-   );
-
    let verdict = if conn.allowed { "ALLOWED" } else { "DENIED" };
    let verdict = if conn.via_prompt {
       format!("{verdict} (prompt)")
    } else {
       verdict.to_owned()
    };
-   cells.text(
-      columns.result_x,
-      columns.result,
-      &verdict,
-      &body_font,
-      verdict_colour,
-      false,
+   job.append(
+      &format!(" · {verdict}"),
+      0.0,
+      TextFormat::simple(body, verdict_colour),
    );
-   cells.text(
-      columns.rule_x,
-      columns.rule,
-      &conn.rule,
-      &body_font,
+   let galley = painter.layout_job(job);
+   painter.galley(
+      pos2(
+         rect.left() + INDENT,
+         rect.center().y - galley.size().y / 2.0,
+      ),
+      galley,
       base,
+   );
+
+   activity_pill(painter, columns, rect, conn.at, now, visuals);
+}
+
+/// The `N more…` line: weak and indented like the connection lines it stands in for.
+fn more_row(ui: &mut Ui, rect: Rect, columns: &Columns, remaining: usize) {
+   let cells = Cells {
+      painter: ui.painter(),
+      rect,
+   };
+   cells.text(
+      INDENT,
+      (columns.connection - INDENT).max(0.0),
+      &format!("{remaining} more…"),
+      &FontId::proportional(13.0),
+      ui.visuals().weak_text_color(),
       false,
    );
+}
+
+/// A right-aligned relative-time pill in the Activity column.
+fn activity_pill(
+   painter: &egui::Painter,
+   columns: &Columns,
+   rect: Rect,
+   at: u64,
+   now: u64,
+   visuals: &egui::Visuals,
+) {
+   let label = relative(at, now);
+   let fresh = label == "now";
+   let pill = Rect::from_center_size(
+      pos2(
+         columns.activity_x + ACTIVITY_WIDTH / 2.0,
+         rect.center().y,
+      ),
+      vec2(ACTIVITY_WIDTH, ACTIVITY_HEIGHT),
+   );
+   let (fill, ink) = if fresh {
+      (ALLOWED, NOW_INK)
+   } else {
+      (visuals.faint_bg_color, visuals.weak_text_color())
+   };
+   painter.rect_filled(pill, ACTIVITY_HEIGHT / 2.0, fill);
+   let galley = painter.layout_no_wrap(label, FontId::proportional(11.0), ink);
+   painter.galley(pill.center() - galley.size() / 2.0, galley, ink);
+}
+
+/// `now` for a fresh event, then `9 s ago`, `1 min ago`, `2 h ago`.
+fn relative(at: u64, now: u64) -> String {
+   let age = now.saturating_sub(at);
+   if age < NOW_SECS {
+      "now".to_owned()
+   } else if age < 60 {
+      format!("{age} s ago")
+   } else if age < 3_600 {
+      format!("{} min ago", age / 60)
+   } else {
+      format!("{} h ago", age / 3_600)
+   }
+}
+
+/// The port out of an `ip:port` / `[v6]:port` address.
+fn port_of(addr: &str) -> &str {
+   addr.rsplit_once(':').map_or("", |(_, port)| port)
+}
+
+/// Seconds since the unix epoch, for the relative activity labels.
+fn unix_now() -> u64 {
+   SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Applies a click on a group line: the chevron toggles the group, the rest selects the
+/// application. They are deliberately separate, as in the reference.
+fn click_group(
+   app: &str,
+   rect: Rect,
+   pointer: egui::Pos2,
+   collapsed: &mut Collapsed,
+   selection: &mut Selection,
+) {
+   let chevron = Rect::from_min_max(
+      rect.left_top(),
+      pos2(rect.left() + CHEVRON_HIT, rect.bottom()),
+   );
+   if chevron.contains(pointer) {
+      collapsed.toggle(app);
+   } else {
+      *selection = Selection::App(app.to_owned());
+   }
+}
+
+/// What the right-hand pane shows, resolved from the current line list.
+struct Detail<'a> {
+   process: Option<&'a str>,
+   connections: usize,
+   last_seen: u64,
+   /// The selected connection's verdict; `None` when the selection is a whole app.
+   verdict: Option<bool>,
+   rule: &'a str,
+   via_prompt: bool,
+   denied: bool,
+}
+
+impl<'a> Detail<'a> {
+   fn resolve(lines: &'a [Line], selection: &Selection) -> Option<Self> {
+      match selection {
+         Selection::None => None,
+         Selection::App(app) => Self::app(lines, app),
+         Selection::Conn { app, at } => lines
+            .iter()
+            .find_map(|line| match line {
+               Line::Conn(conn) if &conn.app == app && conn.at == *at => Some(Self {
+                  process: conn.exe.as_deref(),
+                  connections: Self::app(lines, app).map_or(1, |detail| detail.connections),
+                  last_seen: conn.at,
+                  verdict: Some(conn.allowed),
+                  rule: &conn.rule,
+                  via_prompt: conn.via_prompt,
+                  denied: !conn.allowed,
+               }),
+               _ => None,
+            })
+            // The connection may be collapsed or past the child cap; the app's own details
+            // are still the honest answer, so the pane does not blink out of existence.
+            .or_else(|| Self::app(lines, app)),
+      }
+   }
+
+   /// The details of a whole application, as its group line knows them.
+   fn app(lines: &'a [Line], app: &str) -> Option<Self> {
+      lines.iter().find_map(|line| match line {
+         Line::Group {
+            app: name,
+            count,
+            last_at,
+            rule,
+            denied,
+            exe,
+         } if name == app => Some(Self {
+            process: exe.as_deref(),
+            connections: *count,
+            last_seen: *last_at,
+            verdict: None,
+            rule,
+            via_prompt: false,
+            denied: *denied,
+         }),
+         _ => None,
+      })
+   }
+}
+
+/// The right-hand `CONNECTION DETAILS` pane, shown while a row is selected.
+fn detail_pane(ui: &mut Ui, lines: &[Line], selection: &mut Selection) {
+   let Some(detail) = Detail::resolve(lines, selection) else {
+      *selection = Selection::None;
+      return;
+   };
+   egui::Panel::right("connection_details")
+      .exact_size(DETAIL_WIDTH)
+      .resizable(false)
+      .show(ui, |ui| {
+         ui.add_space(8.0);
+         ui.label(RichText::new("CONNECTION DETAILS").small().strong());
+         ui.add_space(8.0);
+         egui::Grid::new("connection_details_fields")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+               ui.label(RichText::new("Process:").weak());
+               ui.add(egui::Label::new(detail.process.unwrap_or("not identified")).truncate());
+               ui.end_row();
+
+               ui.label(RichText::new("Connections:").weak());
+               ui.label(detail.connections.to_string());
+               ui.end_row();
+
+               ui.label(RichText::new("Last seen:").weak());
+               ui.label(clock(detail.last_seen));
+               ui.end_row();
+
+               if let Some(allowed) = detail.verdict {
+                  ui.label(RichText::new("Verdict:").weak());
+                  let colour = if allowed { ALLOWED } else { DENIED };
+                  let verdict = if allowed { "allowed" } else { "denied" };
+                  ui.label(RichText::new(verdict).color(colour));
+                  ui.end_row();
+               }
+            });
+
+         ui.add_space(12.0);
+         ui.label(RichText::new("MATCHING RULE").small().strong());
+         ui.add_space(6.0);
+         ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
+            let dot = if detail.denied { DENIED } else { ALLOWED };
+            ui.painter().circle_filled(rect.center(), 3.5, dot);
+            let text = if detail.rule == DASH && detail.via_prompt {
+               PROMPT_RULE
+            } else {
+               detail.rule
+            };
+            ui.add(egui::Label::new(text).truncate());
+         });
+      });
 }
 
 /// Groups the log per app, newest first, and flattens the open groups into lines.
@@ -519,47 +752,47 @@ fn build_lines(log: &ConnectionLog, rules: &[Rule], collapsed: &Collapsed) -> Ve
 
    let mut lines = Vec::with_capacity(log.len() + groups.len());
    for (app, rows) in &groups {
-      let newest = rows.first().map_or(0, |row| row.at);
+      let newest = rows.first().copied();
       lines.push(Line::Group {
          app: (*app).to_owned(),
          count: rows.len(),
-         last_at: newest,
-         activity: activity(rows, newest),
+         last_at: newest.map_or(0, |row| row.at),
+         rule: newest.map_or_else(
+            || DASH.to_owned(),
+            |row| rule_label(row.rule_id.as_ref(), rules),
+         ),
+         denied: rows.iter().any(|row| !row.allowed),
+         exe: newest.and_then(|row| row.exe.clone()),
       });
       if collapsed.contains(app) {
          continue;
       }
-      for row in rows {
+      for row in rows.iter().take(MAX_CHILDREN) {
          lines.push(Line::Conn(conn(row, rules)));
+      }
+      if rows.len() > MAX_CHILDREN {
+         lines.push(Line::More {
+            remaining: rows.len() - MAX_CHILDREN,
+         });
       }
    }
    lines
 }
 
-/// Counts an app's events into 30 one-minute buckets ending at its newest event.
-fn activity(rows: &[&Row], newest: u64) -> Vec<u16> {
-   let mut buckets = vec![0u16; ACTIVITY_BUCKETS];
-   for row in rows {
-      let bucket = (newest.saturating_sub(row.at) / BUCKET_SECS) as usize;
-      if bucket < ACTIVITY_BUCKETS {
-         let slot = ACTIVITY_BUCKETS - 1 - bucket;
-         buckets[slot] = buckets[slot].saturating_add(1);
-      }
-   }
-   buckets
-}
-
 /// Flattens one log row, resolving its rule id against the current rule list.
 fn conn(row: &Row, rules: &[Rule]) -> Conn {
    Conn {
-      time: row.time.clone(),
+      app: row.app.clone(),
+      at: row.at,
       dest: row.dest.clone(),
       addr: row.addr.clone(),
       proto: row.proto.clone(),
+      domain: row.dest.parse::<std::net::IpAddr>().is_err(),
       allowed: row.allowed,
       via_prompt: row.via_prompt,
       candidate: row.candidate.clone(),
       rule: rule_label(row.rule_id.as_ref(), rules),
+      exe: row.exe.clone(),
    }
 }
 
@@ -708,39 +941,127 @@ mod tests {
    }
 
    #[test]
-   fn activity_buckets_per_minute_ending_at_the_newest_event() {
-      let base = 60_000;
-      let log = log(&[
-         (base, "firefox", "a.example"),
-         (base + 10, "firefox", "b.example"),
-         (base + 59, "firefox", "c.example"),
-         (base + 60, "firefox", "d.example"),
-         (base + 300, "firefox", "e.example"),
-      ]);
-      let lines = build_lines(&log, &[], &Collapsed::default());
-      let Line::Group { activity, .. } = &lines[0] else {
+   fn relative_time_is_a_short_age() {
+      let now = 1_000_000;
+      assert_eq!(relative(now, now), "now");
+      assert_eq!(relative(now - 9, now), "now");
+      assert_eq!(relative(now - 59, now), "59 s ago");
+      assert_eq!(relative(now - 60, now), "1 min ago");
+      assert_eq!(relative(now - 59 * 60, now), "59 min ago");
+      assert_eq!(relative(now - 2 * 3_600, now), "2 h ago");
+   }
+
+   #[test]
+   fn the_group_rule_is_the_newest_connections_rule() {
+      let allow = rule(DestMatcher::Any, Action::Allow);
+      let deny = rule(
+         DestMatcher::Domain {
+            host: "example.com".to_owned(),
+            subdomains: false,
+         },
+         Action::Deny,
+      );
+      let rules = vec![allow, deny];
+
+      let mut older = event(10, "firefox", "example.com");
+      older.allowed = false;
+      older.matched_rule = Some(rules[1].id.clone());
+      let mut newer = event(20, "firefox", "other.example");
+      newer.matched_rule = Some(rules[0].id.clone());
+      let mut history = ConnectionLog::new(8);
+      history.push(&older);
+      history.push(&newer);
+
+      let lines = build_lines(&history, &rules, &Collapsed::default());
+      let Line::Group { rule, denied, .. } = &lines[0] else {
          panic!("expected a group first");
       };
+      assert_eq!(
+         rule, "allow anywhere",
+         "the newest row picks the rule"
+      );
+      assert!(
+         *denied,
+         "the older denied row still turns the dot red"
+      );
 
-      assert_eq!(activity.len(), ACTIVITY_BUCKETS);
-      let bucket = |minutes_ago: usize| activity[ACTIVITY_BUCKETS - 1 - minutes_ago];
+      let clean = build_lines(
+         &log(&[(30, "curl", "b.example")]),
+         &rules,
+         &Collapsed::default(),
+      );
+      let Line::Group { denied, .. } = &clean[0] else {
+         panic!("expected a group first");
+      };
+      assert!(
+         !*denied,
+         "an all-allowed group keeps its dot green"
+      );
+   }
+
+   #[test]
+   fn a_group_shows_eight_connections_then_the_remainder() {
+      let eight: Vec<(u64, &str, &str)> = (0..8).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(&log(&eight), &[], &Collapsed::default());
       assert_eq!(
-         bucket(0),
-         1,
-         "the newest event is in the last bucket"
+         lines.len(),
+         9,
+         "eight connection lines, no overflow"
+      );
+      assert!(matches!(lines[8], Line::Conn(_)));
+
+      let nine: Vec<(u64, &str, &str)> = (0..9).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(&log(&nine), &[], &Collapsed::default());
+      assert_eq!(
+         lines.len(),
+         10,
+         "eight connection lines plus one overflow"
+      );
+      assert!(matches!(lines[9], Line::More { remaining: 1 }));
+
+      let ten: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(&log(&ten), &[], &Collapsed::default());
+      assert!(
+         matches!(lines[9], Line::More { remaining: 2 }),
+         "the remainder is the count past the cap"
+      );
+   }
+
+   #[test]
+   fn clicking_a_group_selects_it_and_only_the_chevron_collapses() {
+      let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
+      let mut collapsed = Collapsed::default();
+      let mut selection = Selection::default();
+
+      click_group(
+         "firefox",
+         rect,
+         pos2(120.0, 12.0),
+         &mut collapsed,
+         &mut selection,
+      );
+      assert_eq!(selection, Selection::App("firefox".to_owned()));
+      assert!(
+         !collapsed.contains("firefox"),
+         "clicking the name must not collapse the group"
+      );
+
+      click_group(
+         "firefox",
+         rect,
+         pos2(6.0, 12.0),
+         &mut collapsed,
+         &mut selection,
+      );
+      assert!(
+         collapsed.contains("firefox"),
+         "the chevron toggles the group"
       );
       assert_eq!(
-         bucket(4),
-         3,
-         "the three events within one minute share a bucket"
+         selection,
+         Selection::App("firefox".to_owned()),
+         "the chevron leaves the selection alone"
       );
-      assert_eq!(
-         bucket(5),
-         1,
-         "the oldest event is five buckets back"
-      );
-      let total: u32 = activity.iter().map(|count| u32::from(*count)).sum();
-      assert_eq!(total, 5, "every event lands in a bucket");
    }
 
    #[test]
@@ -769,7 +1090,7 @@ mod tests {
       );
       assert_eq!(rule_label(None, &rules), DASH);
 
-      // And through the flattened row, which is what the table actually paints.
+      // And through the flattened row, which is what the detail pane reads.
       let mut matched = event(0, "firefox", "a.example");
       matched.matched_rule = Some(rules[0].id.clone());
       let mut log = ConnectionLog::new(8);

@@ -24,6 +24,8 @@ pub struct Row {
    pub time: String,
    /// App name, else the exe basename, else `unknown`.
    pub app: String,
+   /// The process path the daemon reported, kept for the Connections detail pane.
+   pub exe: Option<String>,
    /// Domain when known, else the remote address.
    pub dest: String,
    /// `<ip>:<port>`, with brackets around an IPv6 address.
@@ -48,6 +50,7 @@ impl Row {
          at: event.at,
          time: clock(event.at),
          app: app_label(view),
+         exe: view.exe.clone(),
          dest: domain.map_or_else(|| view.remote_ip.to_string(), str::to_owned),
          addr: SocketAddr::new(view.remote_ip, view.remote_port).to_string(),
          proto: view.proto.as_str().to_owned(),
@@ -219,6 +222,19 @@ mod tests {
    fn ipv6_addresses_are_bracketed() {
       let row = Row::from_event(&event(0, view(IpAddr::V6(Ipv6Addr::LOCALHOST))));
       assert_eq!(row.addr, "[::1]:443");
+   }
+
+   #[test]
+   fn the_process_path_is_kept_for_the_detail_pane() {
+      let row = Row::from_event(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      assert_eq!(
+         row.exe.as_deref(),
+         Some("/usr/lib/firefox/firefox")
+      );
+
+      let mut connection = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
+      connection.exe = None;
+      assert_eq!(Row::from_event(&event(0, connection)).exe, None);
    }
 
    #[test]

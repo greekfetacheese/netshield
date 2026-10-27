@@ -105,6 +105,8 @@ pub struct App {
    connections_collapsed: ui::connections::Collapsed,
    /// Derived Connections lines, reused across frames until the log or rules change.
    connections_cache: ui::connections::LinesCache,
+   /// The row whose details the Connections page shows in its right-hand pane.
+   connections_selection: ui::connections::Selection,
    /// Set when a mutation went out; the next update rewrites the rule list instead of
    /// waiting up to `REFRESH_EVERY` for the periodic tick.
    refresh_rules: bool,
@@ -212,6 +214,7 @@ impl App {
          confirm: ui::rules::Confirm::default(),
          connections_collapsed: ui::connections::Collapsed::default(),
          connections_cache: ui::connections::LinesCache::default(),
+         connections_selection: ui::connections::Selection::default(),
          refresh_rules: false,
       }
    }
@@ -607,6 +610,7 @@ impl App {
             &self.rules,
             &mut self.connections_collapsed,
             &mut self.connections_cache,
+            &mut self.connections_selection,
          ),
          Page::Rules => {
             let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
