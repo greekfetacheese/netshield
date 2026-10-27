@@ -142,11 +142,17 @@ impl ConnectionView {
 }
 
 /// The destination scope a decision may create.
+///
+/// `Address` carries no host because it scopes to the exact remote address of the flow
+/// being answered: the daemon has the connection, and an unattributed flow usually has no
+/// learned name to carry. It is what keeps a narrow answer available when the broad
+/// `AnyConnection` scope must not be offered.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ScopeChoice {
    AnyConnection,
    Domain { host: String, subdomains: bool },
+   Address,
 }
 
 /// A question the daemon puts to the user.
@@ -175,10 +181,7 @@ pub struct DecideRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum Request {
-   Hello {
-      version: u32,
-      client: ClientKind,
-   },
+   Hello { version: u32, client: ClientKind },
    Subscribe,
    Decide(DecideRequest),
    ListRules,
@@ -426,6 +429,20 @@ mod tests {
          let decoded = decode_line::<Response>(&bytes).expect("decodable response");
          assert_eq!(decoded, response);
       }
+   }
+
+   #[test]
+   fn scope_choice_address_round_trips() {
+      let scope = ScopeChoice::Address;
+      let bytes = encode_line(&scope).expect("serialisable scope");
+      assert_eq!(
+         decode_line::<ScopeChoice>(&bytes).expect("decodable scope"),
+         scope
+      );
+      assert_eq!(
+         serde_json::to_value(&scope).expect("serialisable scope"),
+         serde_json::json!({ "kind": "address" })
+      );
    }
 
    #[test]

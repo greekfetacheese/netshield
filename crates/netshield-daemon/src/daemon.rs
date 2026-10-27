@@ -37,7 +37,7 @@ use netshield_core::ipc::{
 };
 use netshield_core::packet::{L4Payload, ParsedPacket, parse};
 use netshield_core::rule::{Action, AppMatcher, Duration as RuleDuration, Rule, RuleId};
-use netshield_core::{DestMatcher, ScopeRequest, rule_from_scope};
+use netshield_core::{DestMatcher, IpNet, ScopeRequest, rule_from_scope};
 
 use crate::firewall::{self, FirewallError};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
@@ -920,6 +920,19 @@ fn rule_for(connection: &Connection, decide: &DecideRequest, now: u64) -> Rule {
          host: host.to_ascii_lowercase(),
          subdomains: *subdomains,
       },
+      ScopeChoice::Address => match single_host_net(connection.remote.addr) {
+         Some(net) => DestMatcher::Ip(net),
+         None => {
+            // Unreachable: the prefix is the family's own width. The alert only offers
+            // `AnyConnection` for an attributed app, so widening here cannot turn an
+            // unattributed answer into a rule for every unattributed flow.
+            warn!(
+               "could not build a single-host network for {}; scoping to any destination",
+               connection.remote.addr
+            );
+            DestMatcher::Any
+         }
+      },
    };
    let scope = ScopeRequest {
       action: decide.action,
@@ -927,6 +940,18 @@ fn rule_for(connection: &Connection, decide: &DecideRequest, now: u64) -> Rule {
       dest,
    };
    rule_from_scope(RuleId::new_unique(), app, &scope, now)
+}
+
+/// The network containing exactly `addr`: prefix 32 for IPv4, 128 for IPv6.
+///
+/// `None` means the prefix was wider than the address family, which cannot happen for the
+/// width chosen from the address itself; the caller handles it instead of unwrapping.
+fn single_host_net(addr: IpAddr) -> Option<IpNet> {
+   let prefix = match addr {
+      IpAddr::V4(_) => 32,
+      IpAddr::V6(_) => 128,
+   };
+   IpNet::new(addr, prefix).ok()
 }
 
 /// Spawns the DNS reader: parse every answer into the cache, always accept.
@@ -1237,6 +1262,11 @@ pub fn check(config: Config, rules_path: &Path) -> Result<(), DaemonError> {
 
 #[cfg(test)]
 mod tests {
+   use std::net::Ipv4Addr;
+
+   use netshield_core::connection::Family;
+   use netshield_core::rule::Duration as RuleDuration;
+
    use super::*;
 
    #[test]
@@ -1289,6 +1319,59 @@ mod tests {
          limiter.record(addr, start + DNS_MISS_LOG_GAP),
          "a miss after the gap is emitted again"
       );
+   }
+
+   /// A rule for `ScopeChoice::Address` covers the flow's exact remote address, on both
+   /// families, and never a neighbouring one: this is the narrow scope that replaces the
+   /// broad, unattributable one.
+   #[test]
+   fn address_scope_covers_only_the_flows_remote_address() {
+      for (remote, neighbour) in [
+         ("198.51.100.20", "198.51.100.21"),
+         ("2001:db8::1", "2001:db8::2"),
+      ] {
+         let remote: IpAddr = remote.parse().expect("a remote address");
+         let neighbour: IpAddr = neighbour.parse().expect("a neighbouring address");
+         let connection = Connection {
+            family: match remote {
+               IpAddr::V4(_) => Family::V4,
+               IpAddr::V6(_) => Family::V6,
+            },
+            proto: L4Proto::Tcp,
+            local: Endpoint {
+               addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+               port: 51_234,
+            },
+            remote: Endpoint {
+               addr: remote,
+               port: 443,
+            },
+            process: Attribution::Unknown,
+            domain: None,
+         };
+         let decide = DecideRequest {
+            prompt_id: 7,
+            action: Action::Allow,
+            duration: RuleDuration::Session,
+            scope: ScopeChoice::Address,
+         };
+
+         let rule = rule_for(&connection, &decide, 100);
+         let DestMatcher::Ip(net) = &rule.dest else {
+            panic!(
+               "address scope must write an IP matcher, got {:?}",
+               rule.dest
+            );
+         };
+         assert!(
+            net.contains(remote),
+            "{net:?} must cover the flow's remote address {remote}"
+         );
+         assert!(
+            !net.contains(neighbour),
+            "{net:?} must not cover the neighbouring address {neighbour}"
+         );
+      }
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
