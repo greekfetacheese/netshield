@@ -73,17 +73,16 @@ pub struct App {
    last_alert_id: Option<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
-   /// Shared with the socket thread, which wakes the UI after every event it queues.
+   /// Shared with the socket thread, which wakes the UI after every event it queues. The
+   /// prompt hook also shows the alert through it: viewport commands are addressed by id,
+   /// so the socket thread needs no alert context of its own, and an unmapped window --
+   /// whose paint callback never runs -- cannot strand a prompt.
    ui_waker: UiWaker,
-   /// The alert viewport's own context, published from inside its paint callback so the
-   /// socket thread can show and repaint the alert without the main window's frames.
-   alert_ctx: UiWaker,
-   /// Whether the alert viewport is currently shown, shared across registrations: each
-   /// `show_viewport_deferred` call installs a fresh closure, so the transition has to live
-   /// on the app. It starts `true` because the builder creates the window visible, which is
-   /// what gets the callback a first frame and publishes its context; that first idle paint
-   /// is what hides it.
-   alert_shown: Arc<std::sync::atomic::AtomicBool>,
+   /// Whether the alert viewport is currently shown. It lives on the app because each
+   /// `show_viewport_deferred` call installs a fresh closure, and it is driven from the
+   /// main window's frames rather than the alert's own paint callback, which does not run
+   /// while the window is unmapped.
+   alert_shown: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
    mock_stream: Mock,
    mode: Mode,
@@ -125,10 +124,11 @@ impl App {
    pub fn new(cli: Cli) -> Self {
       let ui_waker: UiWaker = Arc::new(Mutex::new(None));
       let alert_model: Arc<Mutex<AlertModel>> = Arc::new(Mutex::new(AlertModel::new()));
-      let alert_ctx: UiWaker = Arc::new(Mutex::new(None));
-      let alert_shown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+      // Starts `true` to match the builder's `with_visible(true)`: the first frame then
+      // hides an idle alert, and a prompt that arrived before that frame only re-shows it.
+      let alert_shown = true;
       let model_slot = Arc::clone(&alert_model);
-      let ctx_slot = Arc::clone(&alert_ctx);
+      let ctx_slot = Arc::clone(&ui_waker);
       let on_prompt = Arc::new(move |prompt: &PromptRequest| {
          let timeout = Duration::from_secs(prompt.timeout_secs);
          if let Ok(mut model) = model_slot.lock()
@@ -137,11 +137,15 @@ impl App {
             model.present(prompt.clone(), timeout, Instant::now());
          }
          if let Some(ctx) = ctx_slot.lock().ok().and_then(|slot| slot.clone()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            let id = alert_viewport_id();
+            ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
             if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
-               ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
-                  centred_position(monitor, egui::vec2(alert::WIDTH, alert::HEIGHT)).into(),
-               ));
+               ctx.send_viewport_cmd_to(
+                  id,
+                  egui::ViewportCommand::OuterPosition(
+                     centred_position(monitor, egui::vec2(alert::WIDTH, alert::HEIGHT)).into(),
+                  ),
+               );
             }
             ctx.request_repaint();
          }
@@ -183,7 +187,6 @@ impl App {
          last_alert_id: None,
          alert_hidden: false,
          ui_waker,
-         alert_ctx,
          alert_shown,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
@@ -406,7 +409,8 @@ impl App {
       }
    }
 
-   /// Registers the alert's deferred viewport on every pass, prompt or not.
+   /// Registers the alert's deferred viewport on every pass, prompt or not, and keeps its
+   /// visibility in step with the model.
    ///
    /// This runs from `App::logic`, which eframe still calls for a minimised root window. A
    /// deferred viewport owns its own paint loop, so this registration is what keeps the
@@ -414,8 +418,12 @@ impl App {
    /// only once a prompt exists is a no-op there, because a viewport that has never been
    /// created cannot be shown by the socket thread. It is repeated every pass because egui
    /// drops any child viewport it was not shown in that pass; the same id and builder make
-   /// that a no-op for the window itself. The callback hides the window while the model has
-   /// no prompt.
+   /// that a no-op for the window itself.
+   ///
+   /// The show/hide commands are addressed by id from here rather than sent from the
+   /// paint callback: an unmapped window never runs its callback, so a hide or show that
+   /// depended on one would never fire. They are idempotent, so the prompt hook sending
+   /// `Visible(true)` as well is harmless.
    ///
    /// `--alert` mode is untouched: there the root window is already the alert.
    fn alert_window(&mut self, ctx: &egui::Context) {
@@ -424,8 +432,6 @@ impl App {
       }
       let model = Arc::clone(&self.alert_model);
       let decider = self.decider.clone();
-      let ctx_slot = Arc::clone(&self.alert_ctx);
-      let visible = Arc::clone(&self.alert_shown);
       let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
       let mut builder = egui::ViewportBuilder::default()
          .with_title("NetShield")
@@ -438,30 +444,25 @@ impl App {
          builder = builder.with_position(centred_position(monitor, size));
       }
       ctx.show_viewport_deferred(alert_viewport_id(), builder, move |ui, _class| {
-         let first = {
-            let mut slot = ctx_slot.lock().ok();
-            match slot.as_deref_mut() {
-               Some(open) if open.is_none() => {
-                  *open = Some(ui.ctx().clone());
-                  true
-               }
-               _ => false,
-            }
-         };
-         let _ = first;
-         let open = model.lock().map(|m| m.prompt().is_some()).unwrap_or(false);
-         let was = visible.swap(open, std::sync::atomic::Ordering::Relaxed);
-         if open != was {
-            ui.ctx().send_viewport_cmd(if open {
-               egui::ViewportCommand::Visible(true)
-            } else {
-               egui::ViewportCommand::Visible(false)
-            });
-         }
-         if open {
+         if model.lock().map(|m| m.prompt().is_some()).unwrap_or(false) {
             paint_alert(ui, &model, &decider);
          }
       });
+
+      let open = self.model().prompt().is_some();
+      if open && !self.alert_shown {
+         ctx.send_viewport_cmd_to(
+            alert_viewport_id(),
+            egui::ViewportCommand::Visible(true),
+         );
+         self.alert_shown = true;
+      } else if !open && self.alert_shown {
+         ctx.send_viewport_cmd_to(
+            alert_viewport_id(),
+            egui::ViewportCommand::Visible(false),
+         );
+         self.alert_shown = false;
+      }
    }
 
    /// The loud offline banner, shown above the page content.
