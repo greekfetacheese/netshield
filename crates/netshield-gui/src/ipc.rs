@@ -297,6 +297,13 @@ fn dispatch(
    match decode_line::<Response>(body) {
       Ok(response) => {
          if let Response::Prompt(prompt) = &response {
+            log::info!(
+               "prompt {} received for {} -> {} ({})",
+               prompt.id,
+               prompt.connection.app_name,
+               prompt.connection.domain.as_deref().unwrap_or("?"),
+               prompt.connection.remote_ip
+            );
             on_prompt(prompt);
          }
          let event = IpcEvent::Message(Box::new(response));

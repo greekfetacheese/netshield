@@ -4,6 +4,7 @@ mod alert;
 mod app;
 mod connlog;
 mod ipc;
+mod logging;
 mod mock;
 mod theme;
 mod ui;
@@ -94,6 +95,9 @@ impl Cli {
 }
 
 fn main() -> eframe::Result {
+   // Before the parser, so a bad option is recorded too, and before eframe, whose failure
+   // is otherwise invisible under XDG autostart: there is no terminal to print it to.
+   let log_path = logging::init();
    let cli = match Cli::parse(std::env::args().skip(1)) {
       Ok(Parsed::Run(cli)) => cli,
       Ok(Parsed::Info(text)) => {
@@ -106,6 +110,15 @@ fn main() -> eframe::Result {
          std::process::exit(2);
       }
    };
+
+   log::info!(
+      "netshield-gui {} starting (socket {:?})",
+      env!("CARGO_PKG_VERSION"),
+      cli.socket
+   );
+   if let Some(path) = &log_path {
+      log::info!("logging to {}", path.display());
+   }
 
    // In `--alert` mode the root window is the prompt itself, so it opens at the panel's
    // fixed size and cannot be resized out of the layout. Normal mode keeps the shell.
@@ -130,14 +143,20 @@ fn main() -> eframe::Result {
       viewport,
       ..Default::default()
    };
-   eframe::run_native(
+   let result = eframe::run_native(
       "NetShield",
       options,
       Box::new(move |cc| {
          theme::install(&cc.egui_ctx);
          Ok(Box::new(app::App::new(cli)))
       }),
-   )
+   );
+   // Under XDG autostart the window server failing to open is the whole story and there
+   // is no terminal to print it to, so it is the one error worth recording here.
+   if let Err(err) = &result {
+      log::error!("cannot start the window: {err}");
+   }
+   result
 }
 
 #[cfg(test)]

@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use netshield_core::ipc::{DecideRequest, Mode, PromptRequest, Request, Response, StatusInfo};
+use netshield_core::ipc::{
+   DecideRequest, Mode, PromptRequest, Request, Response, ScopeChoice, StatusInfo,
+};
 use netshield_core::rule::Rule;
 
 use crate::alert::{self, AlertModel, AlertState, Decision};
@@ -51,6 +53,11 @@ pub struct App {
    ipc: Option<IpcClient>,
    socket: PathBuf,
    connected: bool,
+   /// Whether the current connection state has been logged. The socket thread reports
+   /// `Connected(false)` on every failed dial while it retries, and `connected` starts
+   /// `false`, so comparing states alone would leave the first failure unrecorded -- the
+   /// exact line that proves an autostarted GUI looked at the socket at all.
+   connection_logged: bool,
    log: ConnectionLog,
    mock: bool,
    /// `--alert`: the root window is the alert instead of the main navigation shell.
@@ -83,6 +90,9 @@ pub struct App {
    /// main window's frames rather than the alert's own paint callback, which does not run
    /// while the window is unmapped.
    alert_shown: bool,
+   /// Whether the deferred viewport's registration has been logged already. It is
+   /// re-registered every pass by design, so logging each one would bury the transitions.
+   alert_registered: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
    mock_stream: Mock,
    mode: Mode,
@@ -176,6 +186,7 @@ impl App {
          ipc,
          socket: cli.socket,
          connected: false,
+         connection_logged: false,
          log: ConnectionLog::new(LOG_CAPACITY),
          mock: cli.mock,
          alert: cli.alert,
@@ -188,6 +199,7 @@ impl App {
          alert_hidden: false,
          ui_waker,
          alert_shown,
+         alert_registered: false,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
          status: None,
@@ -212,10 +224,13 @@ impl App {
       // self`, and the drain holds an immutable borrow of the client.
       let mut arrived = Vec::new();
       let mut closed = Vec::new();
+      // Buffered for the same reason as the prompts: the transition setter needs `&mut
+      // self`, and the drain holds a borrow of the client.
+      let mut transitions = Vec::new();
       if let Some(client) = &self.ipc {
          while let Some(event) = client.poll() {
             match event {
-               ipc::IpcEvent::Connected(state) => self.connected = state,
+               ipc::IpcEvent::Connected(state) => transitions.push(state),
                ipc::IpcEvent::Message(response) => match *response {
                   Response::Connection(event) => self.log.push(&event),
                   Response::Status(status) => {
@@ -250,6 +265,9 @@ impl App {
          }
       }
 
+      for state in transitions {
+         self.set_connected(state);
+      }
       for prompt in arrived {
          self.enqueue_prompt(prompt);
       }
@@ -268,6 +286,19 @@ impl App {
       self.next_refresh = now + REFRESH_EVERY;
    }
 
+   /// Records a connection transition and logs the first state, whichever it is.
+   ///
+   /// The first `false` is a transition worth a line even though `connected` already
+   /// starts `false`; the retry loop repeats it every second, and only a change after the
+   /// first report is news.
+   fn set_connected(&mut self, connected: bool) {
+      if !self.connection_logged || connected != self.connected {
+         log::info!("daemon connected: {connected}");
+         self.connection_logged = true;
+      }
+      self.connected = connected;
+   }
+
    /// Queues one prompt, ignoring an id that is already queued.
    ///
    /// The prompt is also presented to the alert model, which starts its countdown. The
@@ -276,6 +307,11 @@ impl App {
       if self.pending.iter().any(|queued| queued.id == prompt.id) {
          return;
       }
+      log::info!(
+         "prompt {} presented for {}",
+         prompt.id,
+         prompt.connection.app_name
+      );
       let timeout = Duration::from_secs(prompt.timeout_secs);
       self.prompt_deadlines.insert(prompt.id, Instant::now() + timeout);
       self.alerts.insert(prompt.id, AlertState::new());
@@ -287,12 +323,17 @@ impl App {
 
    /// Drops one prompt and its selection state; an unknown id is a no-op.
    fn remove_prompt(&mut self, id: u64) {
+      let had = self.pending.iter().any(|queued| queued.id == id);
       self.pending.retain(|queued| queued.id != id);
       self.alerts.remove(&id);
       self.prompt_deadlines.remove(&id);
       let mut model = self.model();
       if model.prompt().is_some_and(|prompt| prompt.id == id) {
          model.clear();
+      }
+      drop(model);
+      if had {
+         log::info!("prompt {id} closed");
       }
    }
 
@@ -322,8 +363,15 @@ impl App {
             "mock: decided prompt {prompt_id} as {:?}",
             request.action
          );
-      } else if let Some(client) = &self.ipc {
-         client.send(&Request::Decide(request));
+      } else if let Some(client) = &self.ipc
+         && client.send(&Request::Decide(request.clone()))
+      {
+         log::info!(
+            "decision sent for prompt {prompt_id}: {:?}, {:?}, {}",
+            request.action,
+            request.duration,
+            scope_kind(&request.scope)
+         );
       }
       self.remove_prompt(prompt_id);
       ctx.request_repaint();
@@ -352,6 +400,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.alert_hidden = true;
             self.last_alert_id = None;
+            log::debug!("alert root window hidden");
          }
          return;
       };
@@ -387,6 +436,11 @@ impl App {
          );
       }
 
+      // A floating alert raises itself from its own paint callback (see `paint_alert`), so
+      // only the `--alert` root is shown from here.
+      if self.alert {
+         log::debug!("alert root window shown for prompt {}", first.id);
+      }
       self.last_alert_id = Some(first.id);
       self.alert_hidden = false;
    }
@@ -448,6 +502,12 @@ impl App {
             paint_alert(ui, &model, &decider);
          }
       });
+      // The registration above is repeated every pass by design, so only the first one is
+      // worth a record; a missing one here is exactly the "no alert while minimised" bug.
+      if !self.alert_registered {
+         log::debug!("alert viewport registered");
+         self.alert_registered = true;
+      }
 
       let open = self.model().prompt().is_some();
       if open && !self.alert_shown {
@@ -456,12 +516,14 @@ impl App {
             egui::ViewportCommand::Visible(true),
          );
          self.alert_shown = true;
+         log::debug!("alert viewport shown");
       } else if !open && self.alert_shown {
          ctx.send_viewport_cmd_to(
             alert_viewport_id(),
             egui::ViewportCommand::Visible(false),
          );
          self.alert_shown = false;
+         log::debug!("alert viewport hidden");
       }
    }
 
@@ -628,6 +690,10 @@ fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider:
    let mut model = model.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
    if model.raise_once().is_some() {
+      log::debug!(
+         "alert viewport raised for prompt {}",
+         model.prompt().map_or(0, |prompt| prompt.id)
+      );
       ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
       ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
          egui::WindowLevel::AlwaysOnTop,
@@ -684,6 +750,15 @@ fn unix_now() -> u64 {
    SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Names a decision's scope in the log, so it can be read without decoding a frame.
+fn scope_kind(scope: &ScopeChoice) -> &'static str {
+   match scope {
+      ScopeChoice::AnyConnection => "any connection",
+      ScopeChoice::Domain { .. } => "domain",
+      ScopeChoice::Address => "address",
+   }
 }
 
 #[cfg(test)]
@@ -771,6 +846,21 @@ mod tests {
    fn a_monitor_smaller_than_the_alert_clamps_to_the_corner() {
       let position = centred_position(egui::vec2(300.0, 200.0), egui::vec2(420.0, 260.0));
       assert_eq!(position, [0.0, 0.0]);
+   }
+
+   #[test]
+   fn the_first_offline_report_is_logged_and_retries_are_not() {
+      let mut app = app();
+      assert!(!app.connection_logged);
+      app.set_connected(false);
+      assert!(
+         app.connection_logged,
+         "the first failed dial must be recorded even though the state did not change"
+      );
+      app.set_connected(true);
+      assert!(app.connected);
+      app.set_connected(false);
+      assert!(!app.connected);
    }
 
    #[test]
