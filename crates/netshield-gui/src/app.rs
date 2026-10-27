@@ -53,6 +53,9 @@ pub struct App {
    /// own viewport. Kept on `App` rather than in the closure because the immediate-viewport
    /// closure can run more than once per prompt.
    raised_alerts: HashSet<u64>,
+   /// Prompts whose alert had to be centred from inside its own viewport because the monitor
+   /// size was not known when it was created; keeps the fallback to one command per prompt.
+   centred_alerts: HashSet<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
@@ -117,6 +120,7 @@ impl App {
          prompt_deadlines: HashMap::new(),
          last_alert_id: None,
          raised_alerts: HashSet::new(),
+         centred_alerts: HashSet::new(),
          alert_hidden: false,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
@@ -207,6 +211,7 @@ impl App {
       self.alerts.remove(&id);
       self.prompt_deadlines.remove(&id);
       self.raised_alerts.remove(&id);
+      self.centred_alerts.remove(&id);
    }
 
    /// Reports whether this prompt's alert still needs raising, recording it as raised.
@@ -255,11 +260,11 @@ impl App {
    /// sent once per prompt, never every frame, because a repeated `Focus` steals the
    /// keyboard continuously while a prompt is open.
    ///
-   /// Follows Zeus' `GUI::bring_to_front`: unhide and unminimise the root window, then ask
-   /// the window manager for critical attention. In floating-alert mode the alert has its
-   /// own viewport, which does not exist yet at this point in the frame; that one is
-   /// levelled from inside its own closure instead, and activates itself when created (see
-   /// `floating_alert`), so nothing is sent to it here. Answering a prompt is unchanged; this
+   /// Follows Zeus' `GUI::bring_to_front` for the `--alert` root only: unhide and unminimise
+   /// it, then ask the window manager for critical attention. A floating alert has its own
+   /// viewport, which does not exist yet at this point in the frame; it is activated,
+   /// levelled and centred from inside its own closure instead (see [`Self::floating_alert`]),
+   /// and the main window is left completely alone. Answering a prompt is unchanged; this
    /// only raises it.
    fn alert_viewport(&mut self, ctx: &egui::Context) {
       let Some(first) = self.pending.first() else {
@@ -285,24 +290,19 @@ impl App {
          )));
       }
 
+      // Only the `--alert` root is commanded here, because there it *is* the alert. A
+      // floating prompt never commands the root at all: the main window keeps whatever
+      // size, place and minimised state the user left it in, and the alert raises itself
+      // from inside its own viewport (see `floating_alert`).
       let root = egui::ViewportId::ROOT;
-      ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Minimized(false));
-      ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Visible(true));
       if self.alert {
-         // The root window *is* the alert here, so it is the one that must take focus.
+         ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Minimized(false));
+         ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Visible(true));
          ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Focus);
-      }
-      // In floating mode the alert owns its own viewport and is the only window the user
-      // types into; focusing the root there is what kept the alert behind the main window,
-      // because the root's request is the one that lands. The alert is activated when its
-      // viewport is created instead. Un-minimising the root is still needed so the alert is
-      // not owned by a minimised parent. Do not re-add a root `Focus` as a fallback.
-      ctx.send_viewport_cmd_to(
-         root,
-         egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
-      );
-
-      if self.alert {
+         ctx.send_viewport_cmd_to(
+            root,
+            egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
+         );
          ctx.send_viewport_cmd_to(
             root,
             egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
@@ -338,7 +338,11 @@ impl App {
       };
       let remaining = self.remaining_secs(prompt.id);
       let mut state = self.alerts.remove(&prompt.id).unwrap_or_default();
-      let builder = egui::ViewportBuilder::default()
+      let alert_size = egui::vec2(alert::WIDTH, alert::HEIGHT);
+      // A monitor size is only known once a viewport has reported one; on the prompt's first
+      // frame it is usually already there because the main window supplies it.
+      let monitor_size = ctx.input(|i| i.viewport().monitor_size);
+      let mut builder = egui::ViewportBuilder::default()
          .with_title("NetShield")
          .with_inner_size([alert::WIDTH, alert::HEIGHT])
          .with_resizable(false)
@@ -347,6 +351,9 @@ impl App {
          // immediate viewport is ignored by the window manager, so ask for it here instead.
          .with_active(true)
          .with_visible(true);
+      if let Some(monitor) = monitor_size {
+         builder = builder.with_position(centred_position(monitor, alert_size));
+      }
 
       let decision =
          ctx.show_viewport_immediate(alert_viewport_id(prompt.id), builder, |ctx, _| {
@@ -361,6 +368,16 @@ impl App {
                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                   egui::UserAttentionType::Critical,
                ));
+            }
+            // The builder's position needs the monitor size, which is missing on the very
+            // first frame; centre the alert here once that size appears instead.
+            if !self.centred_alerts.contains(&prompt.id)
+               && let Some(monitor) = ctx.input(|i| i.viewport().monitor_size)
+            {
+               ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                  centred_position(monitor, alert_size).into(),
+               ));
+               self.centred_alerts.insert(prompt.id);
             }
             let mut decision = None;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -510,6 +527,18 @@ fn alert_viewport_id(prompt_id: u64) -> egui::ViewportId {
    egui::ViewportId::from_hash_of(("alert", prompt_id))
 }
 
+/// Top-left position that centres a `size` window on a `monitor`.
+///
+/// egui 0.37 has no `ViewportCommand::Center`, so the alert computes it from the monitor
+/// size. Clamped at `0.0`: a monitor smaller than the alert pins it to the top-left corner
+/// instead of putting its title bar off-screen at a negative position.
+fn centred_position(monitor: egui::Vec2, size: egui::Vec2) -> [f32; 2] {
+   [
+      ((monitor.x - size.x) / 2.0).max(0.0),
+      ((monitor.y - size.y) / 2.0).max(0.0),
+   ]
+}
+
 /// Seconds since the unix epoch; the UI clock, never used for enforcement.
 fn unix_now() -> u64 {
    SystemTime::now()
@@ -586,6 +615,30 @@ mod tests {
       app.enqueue_prompt(prompt(1));
       app.remove_prompt(99);
       assert_eq!(app.pending.len(), 1);
+   }
+
+   #[test]
+   fn an_alert_is_centred_on_the_monitor() {
+      let position = centred_position(
+         egui::vec2(1920.0, 1080.0),
+         egui::vec2(420.0, 260.0),
+      );
+      assert_eq!(position, [750.0, 410.0]);
+   }
+
+   #[test]
+   fn a_monitor_smaller_than_the_alert_clamps_to_the_corner() {
+      let position = centred_position(egui::vec2(300.0, 200.0), egui::vec2(420.0, 260.0));
+      assert_eq!(position, [0.0, 0.0]);
+   }
+
+   #[test]
+   fn answering_drops_the_centring_bookkeeping() {
+      let mut app = app();
+      app.enqueue_prompt(prompt(1));
+      assert!(app.centred_alerts.insert(1));
+      app.remove_prompt(1);
+      assert!(!app.centred_alerts.contains(&1));
    }
 
    #[test]
