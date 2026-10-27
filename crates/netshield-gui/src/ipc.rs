@@ -14,7 +14,8 @@ use std::thread;
 use std::time::Duration;
 
 use netshield_core::ipc::{
-   ClientKind, MAX_FRAME_LEN, PROTOCOL_VERSION, Request, Response, decode_line, encode_line,
+   ClientKind, MAX_FRAME_LEN, PROTOCOL_VERSION, PromptRequest, Request, Response, decode_line,
+   encode_line,
 };
 
 /// How long a read may block before queued requests are forwarded again.
@@ -31,6 +32,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// the UI toolkit, and lets a test observe the wake with a counter.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
+/// Called from the socket thread as soon as a prompt is decoded, before the UI is woken.
+pub type PromptHook = Arc<dyn Fn(&PromptRequest) + Send + Sync>;
+
 /// What the connection thread tells the UI.
 #[derive(Debug)]
 pub enum IpcEvent {
@@ -44,6 +48,7 @@ pub enum IpcEvent {
 pub struct IpcClient {
    out: Sender<String>,
    events: Receiver<IpcEvent>,
+   on_prompt: PromptHook,
 }
 
 /// A send handle for code that runs outside the main window's frames (the alert viewport's own
@@ -80,17 +85,19 @@ impl IpcClient {
    ///
    /// Every queued event is followed by a `waker` call, because a hidden or minimised
    /// root window schedules no frame on its own and would otherwise not drain the queue.
-   pub fn spawn(socket_path: PathBuf, waker: Waker) -> Self {
+   pub fn spawn(socket_path: PathBuf, waker: Waker, on_prompt: PromptHook) -> Self {
       let (out, out_rx) = mpsc::channel();
       let (events, events_rx) = mpsc::channel();
       let thread_events = events.clone();
       let thread_waker = Arc::clone(&waker);
+      let thread_prompt = Arc::clone(&on_prompt);
       let spawned = thread::Builder::new().name("netshield-ipc".to_owned()).spawn(move || {
          run(
             &socket_path,
             &out_rx,
             &thread_events,
             &thread_waker,
+            &thread_prompt,
          )
       });
       if let Err(err) = spawned {
@@ -101,6 +108,7 @@ impl IpcClient {
       Self {
          out,
          events: events_rx,
+         on_prompt,
       }
    }
 
@@ -154,7 +162,13 @@ fn send_event(events: &Sender<IpcEvent>, waker: &Waker, event: IpcEvent) -> bool
 }
 
 /// Owns the socket: dial, handshake, serve one connection, then retry forever.
-fn run(path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>, waker: &Waker) {
+fn run(
+   path: &Path,
+   out: &Receiver<String>,
+   events: &Sender<IpcEvent>,
+   waker: &Waker,
+   on_prompt: &PromptHook,
+) {
    // A missing daemon is normal, so the path is named on the first failure only.
    let mut reported_path = false;
    loop {
@@ -163,7 +177,7 @@ fn run(path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>, waker: &W
             if !send_event(events, waker, IpcEvent::Connected(true)) {
                return;
             }
-            if converse(stream, out, events, waker) == Flow::Stop {
+            if converse(stream, out, events, waker, on_prompt) == Flow::Stop {
                return;
             }
          }
@@ -192,6 +206,7 @@ fn converse(
    out: &Receiver<String>,
    events: &Sender<IpcEvent>,
    waker: &Waker,
+   on_prompt: &PromptHook,
 ) -> Flow {
    let mut writer = match stream.try_clone() {
       Ok(writer) => writer,
@@ -243,7 +258,7 @@ fn converse(
          return Flow::Reconnect;
       }
       if buf.last() == Some(&b'\n') {
-         let flow = dispatch(&buf, events, waker);
+         let flow = dispatch(&buf, events, waker, on_prompt);
          buf.clear();
          if flow != Flow::Continue {
             return flow;
@@ -269,13 +284,21 @@ fn forward(out: &Receiver<String>, writer: &mut UnixStream) -> Flow {
 }
 
 /// Decodes one frame and hands it to the UI; a malformed frame is dropped, not fatal.
-fn dispatch(frame: &[u8], events: &Sender<IpcEvent>, waker: &Waker) -> Flow {
+fn dispatch(
+   frame: &[u8],
+   events: &Sender<IpcEvent>,
+   waker: &Waker,
+   on_prompt: &PromptHook,
+) -> Flow {
    let body = frame.strip_suffix(b"\n").unwrap_or(frame);
    if body.iter().all(u8::is_ascii_whitespace) {
       return Flow::Continue;
    }
    match decode_line::<Response>(body) {
       Ok(response) => {
+         if let Response::Prompt(prompt) = &response {
+            on_prompt(prompt);
+         }
          let event = IpcEvent::Message(Box::new(response));
          if send_event(events, waker, event) {
             Flow::Continue
@@ -293,11 +316,13 @@ fn dispatch(frame: &[u8], events: &Sender<IpcEvent>, waker: &Waker) -> Flow {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use netshield_core::ipc::Mode;
+   use netshield_core::connection::{Family, L4Proto};
+   use netshield_core::ipc::{ConnectionView, Mode};
    use std::fs;
+   use std::net::{IpAddr, Ipv4Addr};
    use std::os::unix::net::UnixListener;
-   use std::sync::Arc;
    use std::sync::atomic::{AtomicUsize, Ordering};
+   use std::sync::{Arc, Mutex};
    use std::time::Instant;
 
    const WAIT: Duration = Duration::from_secs(5);
@@ -320,6 +345,28 @@ mod tests {
          "netshield-gui-ipc-{}-{serial}-{label}.sock",
          std::process::id()
       ))
+   }
+
+   fn prompt(id: u64) -> Response {
+      Response::Prompt(PromptRequest {
+         id,
+         connection: ConnectionView {
+            app_name: "firefox".to_owned(),
+            exe: None,
+            pid: Some(4242),
+            uid: Some(1000),
+            family: Family::V4,
+            proto: L4Proto::Tcp,
+            remote_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            remote_port: 443,
+            local_port: 51_000,
+            domain: None,
+            domain_candidates: Vec::new(),
+         },
+         timeout_secs: 30,
+         domain_scope_available: false,
+         pending: 0,
+      })
    }
 
    fn hello() -> Response {
@@ -388,7 +435,7 @@ mod tests {
       let path = socket_path("handshake");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker);
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
       let (_reader, mut writer) = accept_hello(&listener);
 
       let hello = hello();
@@ -407,7 +454,7 @@ mod tests {
       let path = socket_path("forward");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker);
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
       let (mut reader, _writer) = accept_hello(&listener);
 
       assert!(client.send(&Request::Status));
@@ -425,7 +472,7 @@ mod tests {
    fn retries_until_the_daemon_appears() {
       let path = socket_path("retry");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker);
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
 
       wait_connected(&client, false);
 
@@ -441,7 +488,7 @@ mod tests {
       let path = socket_path("bad-frame");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker);
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
       let (_reader, mut writer) = accept_hello(&listener);
 
       writer.write_all(b"not json\n").expect("write the garbage");
@@ -460,7 +507,7 @@ mod tests {
       let path = socket_path("wake");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker);
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -488,6 +535,47 @@ mod tests {
       assert!(
          woken.load(Ordering::SeqCst) > settled,
          "a prompt must wake the ui"
+      );
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn the_prompt_hook_runs_before_the_wake_that_publishes_the_prompt() {
+      let path = socket_path("hook");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, woken) = counted();
+      // The hook snapshots the wake count as it fires: equal to the count from before the
+      // prompt means the alert model is fed before any frame can drain the queue.
+      let seen = Arc::new(Mutex::new(Vec::new()));
+      let at_hook = Arc::new(AtomicUsize::new(0));
+      let recorded = Arc::clone(&seen);
+      let when = Arc::clone(&at_hook);
+      let count = Arc::clone(&woken);
+      let hook: PromptHook = Arc::new(move |prompt: &PromptRequest| {
+         when.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
+         recorded.lock().expect("lock the hook").push(prompt.id);
+      });
+      let client = IpcClient::spawn(path.clone(), waker, hook);
+      let (_reader, mut writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+      let wakes = woken.load(Ordering::SeqCst);
+
+      let frame = prompt(1);
+      writer
+         .write_all(&encode_line(&frame).expect("encode the prompt"))
+         .expect("write the prompt");
+
+      assert_eq!(next_message(&client), frame);
+      assert_eq!(*seen.lock().expect("lock the hook"), vec![1]);
+      assert_eq!(
+         at_hook.load(Ordering::SeqCst),
+         wakes,
+         "the hook must run before the wake that publishes the prompt"
+      );
+      assert!(
+         woken.load(Ordering::SeqCst) > wakes,
+         "the prompt still wakes the main window"
       );
 
       fs::remove_file(&path).expect("remove the socket");
