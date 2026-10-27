@@ -74,6 +74,23 @@ const ALLOW_FILL: Color32 = Color32::from_rgb(0x2E, 0x8B, 0x45);
 /// Both action buttons use white text on a saturated fill.
 const BUTTON_TEXT: Color32 = Color32::WHITE;
 
+/// Which destination scope the alert offers for one prompt.
+///
+/// `Any` is a rule for the app, not for the flow: the daemon turns it into
+/// `DestMatcher::Any`. It is only offered for an attributed app, because for an
+/// unattributed one it would allow every unattributed flow. `Address` is the fallback
+/// that always works: it names the exact remote address of the flow being answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+   /// Any destination for this app; the default for an identified app.
+   #[default]
+   Any,
+   /// The hostname the daemon learned for this address.
+   Domain,
+   /// The exact remote address of this flow.
+   Address,
+}
+
 /// One answer to a prompt, ready to be turned into a [`DecideRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
@@ -84,13 +101,16 @@ pub struct Decision {
 
 /// Selection state for one alert.
 ///
-/// `duration` starts at `Session` ("until restart") and `scope_domain` starts `false`, so
-/// the default is the broad decision: an app-wide rule that does not survive a restart,
-/// which the user can narrow or make permanent. `Forever` stays selectable but is never
-/// the default: an accidental click must not outlive the daemon.
+/// `duration` starts at `Session` ("until restart"). `scope` starts at `Any`, which is the
+/// broad, app-wide decision for an attributed app; [`AlertState::effective_scope`] resolves
+/// it per prompt, so an unattributed flow defaults to the narrowest destination scope that
+/// is available instead. `Forever` stays selectable but is never the default: an accidental
+/// click must not outlive the daemon.
+#[derive(Debug)]
 pub struct AlertState {
    pub duration: Duration,
-   pub scope_domain: bool,
+   /// The user's selection; [`AlertState::effective_scope`] says whether it is available.
+   pub scope: Scope,
    pub subdomains: bool,
 }
 
@@ -99,27 +119,52 @@ impl AlertState {
    pub fn new() -> Self {
       Self {
          duration: Duration::Session,
-         scope_domain: false,
+         scope: Scope::Any,
          subdomains: false,
+      }
+   }
+
+   /// The selection that is actually available for `prompt`.
+   ///
+   /// `Scope::Any` is not available when the app was not attributed, and a domain scope is
+   /// only expressible when the daemon learned a hostname and offered it. Resolving here
+   /// rather than in the constructor keeps the default correct even though the host constructs
+   /// the state before it sees the prompt.
+   fn effective_scope(&self, prompt: &PromptRequest) -> Scope {
+      match self.scope {
+         Scope::Any if !broad_scope_available(prompt) => match offered_domain(prompt) {
+            Some(_) => Scope::Domain,
+            None => Scope::Address,
+         },
+         Scope::Domain if offered_domain(prompt).is_none() => {
+            if broad_scope_available(prompt) {
+               Scope::Any
+            } else {
+               Scope::Address
+            }
+         }
+         scope => scope,
       }
    }
 
    /// Builds the request body for `action`.
    ///
    /// A domain scope is only expressible when the daemon learned a hostname *and* offered
-   /// it. Otherwise the answer is `AnyConnection`: a scope the user cannot express must
-   /// never be silently invented.
+   /// it; otherwise the answer falls back to the scope [`AlertState::effective_scope`]
+   /// resolved, never to a scope the user could not select.
    pub fn decision(&self, prompt: &PromptRequest, action: Action) -> DecideRequest {
-      let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
-      let scope = if self.scope_domain && prompt.domain_scope_available {
-         host.map_or(ScopeChoice::AnyConnection, |host| {
-            ScopeChoice::Domain {
+      let scope = match self.effective_scope(prompt) {
+         Scope::Any => ScopeChoice::AnyConnection,
+         Scope::Domain => match offered_domain(prompt) {
+            Some(host) => ScopeChoice::Domain {
                host: host.to_owned(),
                subdomains: self.subdomains,
-            }
-         })
-      } else {
-         ScopeChoice::AnyConnection
+            },
+            // Resolving never yields `Domain` without an offered host; choose the
+            // always-available narrow scope rather than unwrap in the alert.
+            None => ScopeChoice::Address,
+         },
+         Scope::Address => ScopeChoice::Address,
       };
 
       DecideRequest {
@@ -137,12 +182,105 @@ impl Default for AlertState {
    }
 }
 
+/// The alert's whole state, with no egui windowing in it: the host owns a viewport, this owns
+/// what that viewport shows and what the answer is.
+///
+/// No host constructs it yet -- the deferred-viewport wiring is a separate change -- so the
+/// binary would otherwise warn on every field and method. Only the tests use it today.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct AlertModel {
+   prompt: Option<PromptRequest>,
+   state: AlertState,
+   deadline: Option<std::time::Instant>,
+   raised: std::collections::HashSet<u64>,
+   outgoing: Vec<DecideRequest>,
+}
+
+#[allow(dead_code)]
+impl AlertModel {
+   /// An idle model: no prompt, no countdown and nothing to send.
+   pub fn new() -> Self {
+      Self::default()
+   }
+
+   /// Shows `prompt`, resets the selection to the defaults, and starts its countdown.
+   ///
+   /// The daemon only activates one prompt at a time and queues the rest, so a prompt
+   /// presented while another is active replaces it rather than waiting its turn.
+   pub fn present(
+      &mut self,
+      prompt: PromptRequest,
+      timeout: std::time::Duration,
+      now: std::time::Instant,
+   ) {
+      self.state = AlertState::new();
+      self.deadline = Some(now + timeout);
+      self.prompt = Some(prompt);
+   }
+
+   /// The active prompt, if any.
+   pub fn prompt(&self) -> Option<&PromptRequest> {
+      self.prompt.as_ref()
+   }
+
+   /// The live selection, for `alert::ui`.
+   pub fn state_mut(&mut self) -> &mut AlertState {
+      &mut self.state
+   }
+
+   /// Seconds left, for `alert::ui`'s `remaining`; `None` when no prompt is active.
+   ///
+   /// Saturates at `0.0`, never negative, so the countdown text and bar see one shape.
+   pub fn remaining_secs(&self, now: std::time::Instant) -> Option<f32> {
+      self.prompt.as_ref()?;
+      let deadline = self.deadline?;
+      Some(deadline.saturating_duration_since(now).as_secs_f32())
+   }
+
+   /// Whether the countdown has reached its deadline.
+   pub fn is_expired(&self, now: std::time::Instant) -> bool {
+      self.prompt.is_some() && self.deadline.is_some_and(|deadline| now >= deadline)
+   }
+
+   /// Returns the prompt id the first time it is called for that prompt, then `None`.
+   /// This is the once-per-prompt guard for raising the window: never focus on every frame.
+   pub fn raise_once(&mut self) -> Option<u64> {
+      let id = self.prompt.as_ref()?.id;
+      self.raised.insert(id).then_some(id)
+   }
+
+   /// Builds the `DecideRequest` from the current selection and queues it in `outgoing`.
+   ///
+   /// The request comes from [`AlertState::decision`], so it is exactly the rule the
+   /// preview line describes. After queueing, the prompt stops being active.
+   pub fn submit(&mut self, decision: Decision) {
+      let Some(prompt) = self.prompt.as_ref() else {
+         return;
+      };
+      let request = self.state.decision(prompt, decision.action);
+      self.outgoing.push(request);
+      self.clear();
+   }
+
+   /// Hands the queued requests to the host, leaving the buffer empty.
+   pub fn take_outgoing(&mut self) -> Vec<DecideRequest> {
+      std::mem::take(&mut self.outgoing)
+   }
+
+   /// Drops the active prompt (after an answer or an expiry) and the countdown.
+   pub fn clear(&mut self) {
+      self.prompt = None;
+      self.deadline = None;
+   }
+}
+
 /// The rule the current selections would write, as one line:
 /// `allow firefox → anywhere · until restart`.
 ///
 /// It renders exactly what [`AlertState::decision`] will send, never what the radios look
-/// like: a domain scope the daemon did not offer reads as `anywhere`, because that is the
-/// scope the decision actually produces. Pure, so the wording is testable without a window.
+/// like: a scope that is not available for this prompt reads as the scope the decision
+/// actually produces. Pure, so the wording is testable without a window.
 pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) -> String {
    let verb = match action {
       Action::Allow => "allow",
@@ -162,17 +300,47 @@ pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) 
 }
 
 /// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
+///
+/// The address scope renders as the bare address, matching what `DestMatcher::Ip` holds:
+/// there is no name to prefix and no subdomain question, so `only` would add nothing.
 fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
-   let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
-   let Some(host) = host.filter(|_| state.scope_domain && prompt.domain_scope_available) else {
-      return "anywhere".to_owned();
-   };
-   let host = elide(host, PREVIEW_HOST_CHARS);
-   if state.subdomains {
-      format!("only *.{host}")
-   } else {
-      format!("only {host}")
+   match state.effective_scope(prompt) {
+      Scope::Any => "anywhere".to_owned(),
+      Scope::Address => prompt.connection.remote_ip.to_string(),
+      Scope::Domain => match offered_domain(prompt) {
+         Some(host) => {
+            let host = elide(host, PREVIEW_HOST_CHARS);
+            if state.subdomains {
+               format!("only *.{host}")
+            } else {
+               format!("only {host}")
+            }
+         }
+         // `effective_scope` never returns `Domain` without an offered host; state the
+         // address scope it resolves to rather than inventing a name.
+         None => prompt.connection.remote_ip.to_string(),
+      },
    }
+}
+
+/// The hostname the prompt learned and the daemon offered as a domain scope.
+fn offered_domain(prompt: &PromptRequest) -> Option<&str> {
+   prompt
+      .connection
+      .domain
+      .as_deref()
+      .filter(|host| !host.is_empty())
+      .filter(|_| prompt.domain_scope_available)
+}
+
+/// Whether the app-wide scope may be offered for this prompt.
+///
+/// It must not be: the rule it writes is `AppMatcher::Unknown` + `DestMatcher::Any`, which
+/// allows every unattributed flow rather than "that app". An unattributed connection is
+/// recognised by the absent owner ids; the daemon builds the view with both empty for
+/// `Attribution::Unknown`, and an attributed process always has a pid.
+fn broad_scope_available(prompt: &PromptRequest) -> bool {
+   prompt.connection.pid.is_some()
 }
 
 /// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
@@ -270,6 +438,7 @@ pub fn layout_height_estimate() -> f32 {
       + RADIO_ROW
       + SECTION_GAP
       + SMALL_ROW
+      + RADIO_ROW
       + RADIO_ROW
       + RADIO_ROW
       + SECTION_GAP
@@ -375,42 +544,65 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
 /// duration option. That first label is deliberately app-wide: the daemon turns
 /// `ScopeChoice::AnyConnection` into `DestMatcher::Any`, i.e. *any destination for this
 /// app*, so calling it "This connection" would promise a narrower rule than it writes.
-/// The domain label shares the radio's line so the choice reads as one sentence. The
-/// subdomain checkbox is indented to the radio's *text*, not its circle, and stays
-/// disabled until the domain scope is both offered and selected.
+/// For an unattributed flow it is disabled and carries a muted reason: with
+/// `AppMatcher::Unknown` that rule would allow *every* unattributed flow, not this app.
+/// `Only this address` is then the narrow scope that always works. The domain label shares
+/// the radio's line so the choice reads as one sentence. The subdomain checkbox is
+/// indented to the radio's *text*, not its circle, and stays disabled until the domain
+/// scope is both offered and selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
    ui.label(RichText::new("Scope").small().weak());
-   ui.radio_value(
-      &mut state.scope_domain,
-      false,
-      "Any connection by this app",
-   );
+   let selected = state.effective_scope(prompt);
 
-   let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
    ui.horizontal(|ui| {
-      let enabled = prompt.domain_scope_available && host.is_some();
-      let domain = ui.add_enabled(
-         enabled,
+      let broad = ui.add_enabled(
+         broad_scope_available(prompt),
          egui::RadioButton::new(
-            state.scope_domain,
-            host.map_or_else(
-               || "Only this domain".to_owned(),
-               |host| format!("Only {}", elide(host, PREVIEW_HOST_CHARS)),
-            ),
+            selected == Scope::Any,
+            "Any connection by this app",
          ),
       );
-      if domain.clicked() {
-         state.scope_domain = true;
+      if broad.clicked() {
+         state.scope = Scope::Any;
+      }
+      if !broad_scope_available(prompt) {
+         ui.label(RichText::new("app not identified").small().weak());
       }
    });
 
-   let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+   if let Some(host) = offered_domain(prompt) {
+      ui.horizontal(|ui| {
+         let domain = ui.add(egui::RadioButton::new(
+            selected == Scope::Domain,
+            format!("Only {}", elide(host, PREVIEW_HOST_CHARS)),
+         ));
+         if domain.clicked() {
+            state.scope = Scope::Domain;
+         }
+      });
+
+      let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+      ui.horizontal(|ui| {
+         ui.add_space(indent);
+         ui.add_enabled(
+            selected == Scope::Domain,
+            egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
+         );
+      });
+   }
+
    ui.horizontal(|ui| {
-      ui.add_space(indent);
-      ui.add_enabled(
-         state.scope_domain && prompt.domain_scope_available,
-         egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
+      let label = format!(
+         "Only this address ({})",
+         prompt.connection.remote_ip
       );
+      let address = ui.add(egui::RadioButton::new(
+         selected == Scope::Address,
+         label,
+      ));
+      if address.clicked() {
+         state.scope = Scope::Address;
+      }
    });
 
    // The line below the radios states the rule the current selections would write, so the
@@ -500,6 +692,15 @@ mod tests {
       }
    }
 
+   /// The same prompt, but with no owner: the daemon's `Attribution::Unknown` view.
+   fn unknown_prompt(domain: Option<&str>, available: bool) -> PromptRequest {
+      let mut request = prompt(domain, available);
+      request.connection.app_name = "unknown".to_owned();
+      request.connection.pid = None;
+      request.connection.uid = None;
+      request
+   }
+
    #[test]
    fn default_decision_is_session_and_any_connection() {
       let state = AlertState::new();
@@ -512,6 +713,127 @@ mod tests {
    }
 
    #[test]
+   fn known_app_keeps_the_broad_default_and_all_three_scopes() {
+      let request = prompt(Some("www.google.com"), true);
+      let mut state = AlertState::new();
+      assert_eq!(state.effective_scope(&request), Scope::Any);
+
+      // The broad scope is still selectable after narrowing.
+      state.scope = Scope::Address;
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Address
+      );
+      state.scope = Scope::Any;
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::AnyConnection
+      );
+      assert_eq!(
+         rule_preview(&request, &state, Action::Allow),
+         "allow firefox → anywhere · until restart"
+      );
+      assert_eq!(
+         rule_preview(&request, &state, Action::Deny),
+         "deny firefox → anywhere · until restart"
+      );
+   }
+
+   #[test]
+   fn unknown_app_disables_the_broad_scope_and_defaults_to_the_learned_domain() {
+      let request = unknown_prompt(Some("www.google.com"), true);
+      assert!(
+         !broad_scope_available(&request),
+         "the broad scope must be unavailable"
+      );
+
+      let state = AlertState::new();
+      assert_eq!(
+         state.effective_scope(&request),
+         Scope::Domain,
+         "an unknown app with a hostname defaults to the domain scope"
+      );
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Domain {
+            host: "www.google.com".to_owned(),
+            subdomains: false,
+         }
+      );
+   }
+
+   #[test]
+   fn unknown_app_without_a_hostname_defaults_to_the_address() {
+      let request = unknown_prompt(None, false);
+      let state = AlertState::new();
+      assert_eq!(
+         state.effective_scope(&request),
+         Scope::Address,
+         "without a hostname the narrow default is the exact address"
+      );
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Address
+      );
+   }
+
+   #[test]
+   fn unknown_app_never_falls_back_to_the_broad_scope() {
+      // Even if something selected `Any`, the resolved answer stays narrow, so an
+      // unattributed flow can never produce `AppMatcher::Unknown` + `DestMatcher::Any`.
+      for request in [
+         unknown_prompt(Some("www.google.com"), true),
+         unknown_prompt(None, false),
+         unknown_prompt(Some("www.google.com"), false),
+      ] {
+         let state = AlertState::new();
+         assert_ne!(
+            state.decision(&request, Action::Allow).scope,
+            ScopeChoice::AnyConnection
+         );
+         assert!(
+            !rule_preview(&request, &state, Action::Allow).contains("anywhere"),
+            "the preview must not claim the broad scope"
+         );
+      }
+   }
+
+   #[test]
+   fn unknown_app_preview_names_the_address_and_elides_none_of_it() {
+      let request = unknown_prompt(Some("www.google.com"), true);
+      let state = AlertState::new();
+      assert_eq!(
+         rule_preview(&request, &state, Action::Allow),
+         "allow unknown → only www.google.com · until restart"
+      );
+
+      let mut address = AlertState::new();
+      address.scope = Scope::Address;
+      assert_eq!(
+         rule_preview(&request, &address, Action::Allow),
+         "allow unknown → 142.250.185.78 · until restart"
+      );
+
+      let request = unknown_prompt(None, false);
+      assert_eq!(
+         rule_preview(&request, &AlertState::new(), Action::Allow),
+         "allow unknown → 142.250.185.78 · until restart"
+      );
+   }
+
+   /// The required example: an IPv6 address renders as the destination it scopes to.
+   #[test]
+   fn address_preview_renders_an_ipv6_destination() {
+      let mut request = unknown_prompt(None, false);
+      request.connection.remote_ip = "2001:4860:482c:400::".parse().expect("an IPv6 address");
+      request.connection.family = Family::V6;
+      assert_eq!(
+         rule_preview(&request, &AlertState::new(), Action::Allow),
+         "allow unknown → 2001:4860:482c:400:: · until restart"
+      );
+   }
+
+   #[test]
    fn rule_preview_matches_the_decision_it_previews() {
       let any = rule_preview(
          &prompt(Some("www.google.com"), true),
@@ -521,7 +843,7 @@ mod tests {
       assert_eq!(any, "allow firefox → anywhere · until restart");
 
       let mut once = AlertState::new();
-      once.scope_domain = true;
+      once.scope = Scope::Domain;
       once.duration = Duration::Once;
       assert_eq!(
          rule_preview(
@@ -533,7 +855,7 @@ mod tests {
       );
 
       let mut forever = AlertState::new();
-      forever.scope_domain = true;
+      forever.scope = Scope::Domain;
       forever.duration = Duration::Forever;
       forever.subdomains = true;
       assert_eq!(
@@ -549,7 +871,7 @@ mod tests {
    #[test]
    fn rule_preview_never_claims_an_unavailable_domain_scope() {
       let mut state = AlertState::new();
-      state.scope_domain = true;
+      state.scope = Scope::Domain;
       assert_eq!(
          rule_preview(
             &prompt(Some("www.google.com"), false),
@@ -568,7 +890,7 @@ mod tests {
       );
       request.connection.app_name = "an-extremely-long-process-name-that-cannot-fit".to_owned();
       let mut state = AlertState::new();
-      state.scope_domain = true;
+      state.scope = Scope::Domain;
       let line = rule_preview(&request, &state, Action::Allow);
       assert!(
          line.chars().count() <= RULE_PREVIEW_CHARS,
@@ -583,7 +905,7 @@ mod tests {
    #[test]
    fn domain_scope_uses_the_learned_host() {
       let mut state = AlertState::new();
-      state.scope_domain = true;
+      state.scope = Scope::Domain;
       let decision = state.decision(
          &prompt(Some("www.google.com"), true),
          Action::Allow,
@@ -600,7 +922,7 @@ mod tests {
    #[test]
    fn domain_scope_never_invents_a_scope() {
       let mut state = AlertState::new();
-      state.scope_domain = true;
+      state.scope = Scope::Domain;
 
       let unavailable = state.decision(
          &prompt(Some("www.google.com"), false),
@@ -615,7 +937,7 @@ mod tests {
    #[test]
    fn subdomains_round_trip() {
       let mut state = AlertState::new();
-      state.scope_domain = true;
+      state.scope = Scope::Domain;
       state.subdomains = true;
       assert_eq!(
          state
@@ -779,5 +1101,164 @@ mod tests {
       assert_eq!(progress_fraction(15.0, 30), 0.5);
       assert_eq!(progress_fraction(60.0, 30), 1.0);
       assert_eq!(progress_fraction(1.0, 0), 0.0);
+   }
+
+   /// A fixed clock, so every model test is independent of wall time.
+   fn clock() -> std::time::Instant {
+      std::time::Instant::now()
+   }
+
+   #[test]
+   fn present_starts_a_countdown_that_saturates_at_the_deadline() {
+      let mut model = AlertModel::new();
+      let start = clock();
+      assert_eq!(
+         model.remaining_secs(start),
+         None,
+         "an idle model has no countdown"
+      );
+
+      let timeout = std::time::Duration::from_secs(30);
+      model.present(
+         prompt(Some("www.google.com"), true),
+         timeout,
+         start,
+      );
+
+      assert_eq!(model.remaining_secs(start), Some(30.0));
+      assert_eq!(
+         model.remaining_secs(start + std::time::Duration::from_secs(10)),
+         Some(20.0)
+      );
+      assert!(!model.is_expired(start + std::time::Duration::from_secs(29)));
+      assert_eq!(
+         model.remaining_secs(start + timeout),
+         Some(0.0),
+         "remaining must saturate at the deadline"
+      );
+      assert_eq!(
+         model.remaining_secs(start + std::time::Duration::from_secs(90)),
+         Some(0.0),
+         "remaining must never go negative"
+      );
+
+      assert!(!model.is_expired(start + timeout - std::time::Duration::from_nanos(1)));
+      assert!(model.is_expired(start + timeout));
+
+      // A prompt presented while one is active replaces it and resets the selection.
+      model.state_mut().duration = Duration::Forever;
+      model.state_mut().scope = Scope::Domain;
+      let mut next = prompt(Some("github.com"), true);
+      next.id = 9;
+      model.present(
+         next.clone(),
+         std::time::Duration::from_secs(10),
+         start,
+      );
+      assert_eq!(model.prompt(), Some(&next));
+      assert_eq!(model.state_mut().duration, Duration::Session);
+      assert_eq!(model.state_mut().scope, Scope::Any);
+      assert_eq!(model.remaining_secs(start), Some(10.0));
+   }
+
+   #[test]
+   fn raise_once_fires_once_per_prompt_and_again_for_a_new_id() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      assert_eq!(
+         model.raise_once(),
+         None,
+         "nothing to raise while idle"
+      );
+
+      model.present(
+         prompt(Some("www.google.com"), true),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      assert_eq!(model.raise_once(), Some(7));
+      assert_eq!(model.raise_once(), None);
+
+      let mut next = prompt(Some("github.com"), true);
+      next.id = 9;
+      model.present(next, std::time::Duration::from_secs(30), now);
+      assert_eq!(model.raise_once(), Some(9));
+      assert_eq!(model.raise_once(), None);
+   }
+
+   #[test]
+   fn submit_queues_the_states_decision_and_clears_the_prompt() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      let request = prompt(Some("www.google.com"), true);
+      model.present(
+         request.clone(),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      model.state_mut().duration = Duration::Forever;
+      model.state_mut().scope = Scope::Domain;
+
+      let expected = model.state_mut().decision(&request, Action::Allow);
+      model.submit(Decision {
+         action: Action::Allow,
+         duration: Duration::Forever,
+         scope: ScopeChoice::AnyConnection,
+      });
+
+      assert_eq!(model.take_outgoing(), vec![expected.clone()]);
+      assert_eq!(expected.prompt_id, 7);
+      assert_eq!(expected.action, Action::Allow);
+      assert_eq!(expected.duration, Duration::Forever);
+      assert_eq!(
+         expected.scope,
+         ScopeChoice::Domain {
+            host: "www.google.com".to_owned(),
+            subdomains: false,
+         }
+      );
+      assert!(model.prompt().is_none());
+      assert_eq!(model.remaining_secs(now), None);
+   }
+
+   #[test]
+   fn clear_without_submit_pushes_nothing() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      model.present(
+         prompt(Some("www.google.com"), true),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      model.clear();
+
+      assert!(model.prompt().is_none());
+      assert!(!model.is_expired(now + std::time::Duration::from_secs(120)));
+      assert!(model.take_outgoing().is_empty());
+   }
+
+   #[test]
+   fn take_outgoing_empties_the_buffer() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      for id in [7u64, 9] {
+         let mut request = prompt(Some("www.google.com"), true);
+         request.id = id;
+         model.present(request, std::time::Duration::from_secs(30), now);
+         model.submit(Decision {
+            action: Action::Deny,
+            duration: Duration::Session,
+            scope: ScopeChoice::AnyConnection,
+         });
+      }
+
+      let drained = model.take_outgoing();
+      assert_eq!(drained.len(), 2);
+      assert_eq!(drained[0].prompt_id, 7);
+      assert_eq!(drained[1].prompt_id, 9);
+      assert!(
+         model.take_outgoing().is_empty(),
+         "the buffer must be empty after a take"
+      );
    }
 }

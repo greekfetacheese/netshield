@@ -37,6 +37,34 @@ pub struct IpcClient {
    events: Receiver<IpcEvent>,
 }
 
+/// A send handle for code that runs outside the main window's frames (the alert viewport's own
+/// callback, which keeps painting while the main window is minimised).
+#[derive(Clone)]
+pub struct Decider {
+   out: Sender<String>,
+}
+
+impl Decider {
+   /// A handle whose requests go nowhere, for `--mock` where no daemon is contacted.
+   ///
+   /// The receiver is drained on a thread of its own so `send` keeps succeeding: a prompt
+   /// answer in `--mock` is discarded by design, not because the daemon thread died.
+   pub fn silent() -> Self {
+      let (out, receiver) = mpsc::channel();
+      thread::spawn(move || while receiver.recv().is_ok() {});
+      Self { out }
+   }
+
+   /// Encodes and queues a request. Returns false if the thread is gone.
+   pub fn send(&self, request: &Request) -> bool {
+      let Some(line) = frame(request) else {
+         log::debug!("cannot encode an ipc request");
+         return false;
+      };
+      self.out.send(line).is_ok()
+   }
+}
+
 impl IpcClient {
    /// Spawns the connection thread. Never blocks and never fails: connection errors
    /// surface as [`IpcEvent::Connected(false)`] and the thread keeps retrying.
@@ -69,6 +97,13 @@ impl IpcClient {
    /// Non-blocking drain for the UI: returns None when there is nothing new.
    pub fn poll(&self) -> Option<IpcEvent> {
       self.events.try_recv().ok()
+   }
+
+   /// A cloneable send handle for callbacks that outlive one `App::update` call.
+   pub fn decider(&self) -> Decider {
+      Decider {
+         out: self.out.clone(),
+      }
    }
 }
 

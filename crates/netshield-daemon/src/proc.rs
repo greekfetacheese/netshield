@@ -254,26 +254,22 @@ impl Attributor {
             );
          }
       };
+      // An exact row with inode 0 is a closed connection's leftover: the 4-tuple is still
+      // there but nothing holds the socket, so no descriptor scan can ever find an owner.
+      // It is not the same failure as "the table has no row for this flow".
       let candidates = inode_candidates(&text, family, local, remote, proto);
       if candidates.is_empty() {
-         return self.unknown(
-            &context,
-            "no matching socket row in the table",
-            now,
-         );
+         let (reason, count) = candidate_failure_reason(&text, family, local, remote);
+         let context = FailureContext {
+            candidates: count,
+            ..context
+         };
+         return self.unknown(&context, reason, now);
       }
       let context = FailureContext {
          candidates: Some(candidates.len()),
          ..context
       };
-      if candidates.len() == 1 && candidates[0] == 0 {
-         // TIME_WAIT and friends keep a table row but no live socket to own it.
-         return self.unknown(
-            &context,
-            "the matching socket row has inode 0",
-            now,
-         );
-      }
 
       let owner = candidate_owner(&candidates, uid, |inode| {
          match self.cached_owner(inode, uid) {
@@ -508,6 +504,18 @@ impl Attributor {
    /// already been counted and logged by [`Attributor::budget_exhausted`].
    fn scan_for_inode(&mut self, inode: u32, uid: Option<u32>) -> Option<(u32, u32)> {
       let pids = numeric_pids()?;
+      self.scan_pids_for_inode(pids, inode, uid, socket_inodes)
+   }
+
+   /// The body of [`Attributor::scan_for_inode`], over an explicit pid list and descriptor
+   /// reader so the cache/refresh behaviour can be exercised without a live `/proc`.
+   fn scan_pids_for_inode(
+      &mut self,
+      pids: Vec<u32>,
+      inode: u32,
+      uid: Option<u32>,
+      mut read_inodes: impl FnMut(u32) -> Result<Vec<u32>, ScanError>,
+   ) -> Option<(u32, u32)> {
       if pids.len() > MAX_PIDS {
          self.budget_exhausted(&format!(
             "pid scan would examine {} processes (budget {MAX_PIDS})",
@@ -517,12 +525,15 @@ impl Attributor {
       }
 
       for pid in pids {
-         if let Some((found, owner)) = self.cached_fd_lookup(pid, inode, uid) {
-            if found {
-               return Some((pid, owner));
-            }
-            continue;
+         if let Some((found, owner)) = self.cached_fd_lookup(pid, inode, uid)
+            && found
+         {
+            return Some((pid, owner));
          }
+         // A cached negative is a hint, not proof: the process may have opened the
+         // socket after the snapshot was taken (the resolver does exactly that per
+         // query). Fall through and re-read its descriptors once; the refresh below
+         // replaces the entry, so this pid is scanned at most once per lookup.
 
          let owner_uid = match read_pid_uid(pid) {
             Some(owner_uid) => owner_uid,
@@ -533,7 +544,7 @@ impl Attributor {
             continue;
          }
 
-         let inodes = match socket_inodes(pid) {
+         let inodes = match read_inodes(pid) {
             Ok(inodes) => inodes,
             Err(ScanError::Budget) => {
                self.budget_exhausted(&format!(
@@ -736,6 +747,11 @@ fn socket_rows(
 /// either unspecified or the packet's local address. All such rows are returned because
 /// the uid cross-check and the fd scan are what pick the owner; the packet tuple alone
 /// cannot. An exact row always wins and is returned alone.
+///
+/// An inode of 0 is never a candidate in either path: the row outlived its socket
+/// (TIME_WAIT), so no process can hold it and returning it would send the scan chasing an
+/// inode no descriptor can contain. The diagnostic distinguishes "no row" from "a row with
+/// no live socket" through [`candidate_failure_reason`].
 fn inode_candidates(
    text: &str,
    family: Family,
@@ -743,9 +759,14 @@ fn inode_candidates(
    remote: (IpAddr, u16),
    proto: L4Proto,
 ) -> Vec<u64> {
-   let mut rows = socket_rows(text, family);
-   let exact = rows.find(|(row_local, row_remote, _)| *row_local == local && *row_remote == remote);
-   if let Some((_, _, inode)) = exact {
+   let exact = exact_row_inode(text, family, local, remote);
+   if let Some(inode) = exact {
+      if inode == 0 {
+         // TIME_WAIT and friends keep the flow's 4-tuple but no live socket, so the row
+         // can never be held by any process. Returning it would send the scan looking
+         // for an inode no descriptor can contain.
+         return Vec::new();
+      }
       return vec![inode];
    }
    if proto != L4Proto::Udp {
@@ -773,6 +794,42 @@ fn inode_candidates(
       }
    }
    candidates
+}
+
+/// Names why [`inode_candidates`] returned nothing, with the candidate count to log.
+///
+/// "No row at all" and "a row whose socket is already closed" both leave the candidate
+/// list empty, but they have different causes and fixes, so the diagnostic must not
+/// collapse them into one message.
+fn candidate_failure_reason(
+   text: &str,
+   family: Family,
+   local: (IpAddr, u16),
+   remote: (IpAddr, u16),
+) -> (&'static str, Option<usize>) {
+   match exact_row_inode(text, family, local, remote) {
+      Some(0) => (
+         "the exact row has inode 0: no live socket, the connection was already \
+          closed when it was queued",
+         Some(0),
+      ),
+      _ => ("no matching socket row in the table", None),
+   }
+}
+
+/// Returns the inode of the row whose local and remote endpoints equal the flow's.
+///
+/// This is the exact match TCP depends on and UDP prefers. A row with inode 0 is still a
+/// match: the caller needs to tell "no row" from "a row whose socket is already closed".
+fn exact_row_inode(
+   text: &str,
+   family: Family,
+   local: (IpAddr, u16),
+   remote: (IpAddr, u16),
+) -> Option<u64> {
+   socket_rows(text, family)
+      .find(|(row_local, row_remote, _)| *row_local == local && *row_remote == remote)
+      .map(|(_, _, inode)| inode)
 }
 
 /// The outcome of trying inode candidates against `/proc/<pid>/fd`.
@@ -983,6 +1040,13 @@ mod tests {
    const TCP6_FIXTURE: &str = "\
   sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 00000000000000000000000001000000:0277 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 65534        0 11054 1 0000000000000000 100 0 0 10 0
+";
+
+   /// A `/proc/net/tcp` row left by a closed connection: the 4-tuple is still recorded,
+   /// but the row has no live socket and reports `inode 0` (state `06`, TIME_WAIT).
+   const TCP_CLOSED_FIXTURE: &str = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0401A8C0:D67E 0679528C:01BB 06 00000000:00000000 00:00000000 00000000  1000        0 0 1 0000000000000000 100 0 0 10 -1
 ";
 
    fn v4(address: [u8; 4], port: u16) -> (IpAddr, u16) {
@@ -1229,6 +1293,65 @@ mod tests {
          ),
          Vec::<u64>::new()
       );
+   }
+
+   #[test]
+   fn exact_row_with_inode_zero_is_not_a_candidate_for_any_protocol() {
+      let local = v4([192, 168, 1, 4], 54910);
+      let remote = v4([140, 82, 121, 6], 443);
+      // The row matches the flow exactly, but its socket is gone: it must not become a
+      // candidate, because no process can hold an inode-0 descriptor.
+      assert_eq!(
+         inode_candidates(
+            TCP_CLOSED_FIXTURE,
+            Family::V4,
+            local,
+            remote,
+            L4Proto::Tcp
+         ),
+         Vec::<u64>::new()
+      );
+      assert_eq!(
+         inode_candidates(
+            TCP_CLOSED_FIXTURE,
+            Family::V4,
+            local,
+            remote,
+            L4Proto::Udp
+         ),
+         Vec::<u64>::new()
+      );
+   }
+
+   #[test]
+   fn closed_connection_reports_no_live_socket_not_a_scan_miss() {
+      let local = v4([192, 168, 1, 4], 54910);
+      let remote = v4([140, 82, 121, 6], 443);
+      let (reason, count) = candidate_failure_reason(TCP_CLOSED_FIXTURE, Family::V4, local, remote);
+      assert_eq!(
+         count,
+         Some(0),
+         "the exact row exists, with no live socket"
+      );
+      assert!(
+         reason.contains("no live socket"),
+         "the closed row must be named as such: {reason}"
+      );
+      assert!(
+         !reason.contains("/proc fd link"),
+         "a closed socket is not a scan miss: {reason}"
+      );
+
+      // A flow with no row at all is the other distinct outcome, and the candidate count
+      // stays unknown because nothing was found to count.
+      let (reason, count) = candidate_failure_reason(
+         TCP_CLOSED_FIXTURE,
+         Family::V4,
+         v4([192, 168, 1, 4], 40_000),
+         remote,
+      );
+      assert_eq!(count, None);
+      assert_eq!(reason, "no matching socket row in the table");
    }
 
    #[test]
@@ -1592,6 +1715,70 @@ mod tests {
          ),
          Some((777, 1000)),
          "the success must overwrite the negative entry"
+      );
+   }
+
+   #[test]
+   fn stale_negative_fd_snapshot_still_finds_a_newly_opened_socket() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let inode = 987_654u32;
+      let mut attributor = Attributor::new();
+      // Seed the cache with the snapshot that predates the socket: same pid, no inode X.
+      attributor.pid_fds.insert(
+         pid,
+         FdCacheEntry {
+            inodes: vec![123],
+            uid,
+            at: Instant::now(),
+         },
+      );
+
+      let mut reads = 0u32;
+      let owner = attributor.scan_pids_for_inode(vec![pid], inode, Some(uid), |scanned| {
+         assert_eq!(
+            scanned, pid,
+            "the injected read is for our own pid"
+         );
+         reads += 1;
+         Ok(vec![123, inode])
+      });
+      assert_eq!(
+         owner,
+         Some((pid, uid)),
+         "a negative fd snapshot must be refreshed, not trusted"
+      );
+      assert_eq!(reads, 1, "one pid, one refresh per lookup");
+
+      // The refreshed snapshot is now the fast path: a positive answer must not re-read.
+      let mut reads = 0u32;
+      let cached = attributor.scan_pids_for_inode(vec![pid], inode, Some(uid), |scanned| {
+         assert_eq!(scanned, pid);
+         reads += 1;
+         Ok(vec![inode])
+      });
+      assert_eq!(cached, Some((pid, uid)));
+      assert_eq!(
+         reads, 0,
+         "a cached positive must not re-read /proc"
+      );
+   }
+
+   #[test]
+   fn a_missed_pid_is_refreshed_only_once_per_lookup() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut reads = 0u32;
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(vec![pid], 4242, Some(uid), |scanned| {
+         assert_eq!(scanned, pid);
+         reads += 1;
+         Ok(vec![123])
+      });
+      assert_eq!(owner, None);
+      assert_eq!(
+         reads, 1,
+         "one pid is read at most once per lookup"
       );
    }
 
