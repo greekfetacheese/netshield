@@ -19,6 +19,12 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 /// Environment variable naming the level.
 const LEVEL_ENV: &str = "NETSHIELD_LOG";
 
+/// Environment variable that lifts the target filter for dependency debugging.
+const TARGETS_ENV: &str = "NETSHIELD_LOG_TARGETS";
+
+/// The [`TARGETS_ENV`] value that lets every crate's records through.
+const ALL_TARGETS: &str = "all";
+
 /// Environment variable naming the log file.
 const LOG_FILE_ENV: &str = "NETSHIELD_LOG_FILE";
 
@@ -31,7 +37,7 @@ const LOG_NAME: &str = "gui.log";
 /// The suffix a rotated log gets.
 const ROTATED_SUFFIX: &str = ".1";
 
-/// A log larger than this is rotated once, at startup.
+/// A log larger than this is rotated, at startup and whenever a write would cross it.
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
 /// The installed logger; a second [`init`] reuses it instead of installing twice.
@@ -39,11 +45,46 @@ static LOGGER: OnceLock<FileLogger> = OnceLock::new();
 
 /// The one open log file, behind the mutex every record takes.
 struct FileLogger {
-   /// `None` is impossible today, but keeping the file optional makes the "already
-   /// failed" state explicit instead of writing to a descriptor we know is broken.
-   file: Mutex<Option<File>>,
+   /// The open file, its byte count since open and the path it was opened from; `None` is
+   /// impossible today, but keeping the file optional makes the "already failed" state
+   /// explicit instead of writing to a descriptor we know is broken.
+   file: Mutex<Option<OpenLog>>,
+   /// The settings `log` and `enabled` consult, parsed once at [`init`].
+   settings: Settings,
    /// Whether the first failed write has already been reported to stderr.
    reported_write_error: AtomicBool,
+}
+
+/// The open log and the state a mid-run rotation needs.
+struct OpenLog {
+   /// The file records are appended to.
+   file: File,
+   /// Bytes written since the file was opened or last rotated.
+   written: u64,
+   /// Where the file lives, so it can be renamed and reopened in place.
+   path: PathBuf,
+}
+
+/// The configured level and whether the target filter is lifted.
+///
+/// Kept as plain data so the emission predicate can be tested without touching the
+/// environment or the global logger, which can only be installed once per process.
+#[derive(Clone, Copy, Debug)]
+struct Settings {
+   /// The level `NETSHIELD_LOG` asked for.
+   level: LevelFilter,
+   /// Whether `NETSHIELD_LOG_TARGETS=all` lets every target through.
+   all_targets: bool,
+}
+
+impl Settings {
+   /// Reads the environment once, at [`init`].
+   fn from_env() -> Self {
+      Self {
+         level: level_from(std::env::var(LEVEL_ENV).ok().as_deref()),
+         all_targets: all_targets_from(std::env::var(TARGETS_ENV).ok().as_deref()),
+      }
+   }
 }
 
 /// Installs the file logger and the panic hook. Returns the log file path it opened.
@@ -53,7 +94,7 @@ struct FileLogger {
 /// directory behaves exactly as it did before this module existed.
 pub fn init() -> Option<PathBuf> {
    install_panic_hook();
-   let level = level_from(std::env::var(LEVEL_ENV).ok().as_deref());
+   let settings = Settings::from_env();
    let path = resolve_path(
       std::env::var_os(LOG_FILE_ENV).map(PathBuf::from).as_deref(),
       std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).as_deref(),
@@ -74,11 +115,16 @@ pub fn init() -> Option<PathBuf> {
       }
    };
    let logger = LOGGER.get_or_init(|| FileLogger {
-      file: Mutex::new(Some(file)),
+      file: Mutex::new(Some(OpenLog {
+         file,
+         written: 0,
+         path: path.clone(),
+      })),
+      settings,
       reported_write_error: AtomicBool::new(false),
    });
    if log::set_logger(logger).is_ok() {
-      log::set_max_level(level);
+      log::set_max_level(settings.level);
    }
    Some(path)
 }
@@ -97,6 +143,31 @@ fn level_from(value: Option<&str>) -> LevelFilter {
       "trace" => LevelFilter::Trace,
       _ => LevelFilter::Info,
    }
+}
+
+/// Parses `NETSHIELD_LOG_TARGETS`; only the exact word `all` lifts the target filter.
+fn all_targets_from(value: Option<&str>) -> bool {
+   value.is_some_and(|raw| raw.trim().eq_ignore_ascii_case(ALL_TARGETS))
+}
+
+/// Whether this target belongs to one of our crates rather than to a dependency.
+fn is_own_target(target: &str) -> bool {
+   target == "netshield" || target.starts_with("netshield_")
+}
+
+/// Whether a record is emitted, given the settings.
+///
+/// A dependency's `Debug`/`Trace`/`Info` records are the wgpu and naga noise that made
+/// `NETSHIELD_LOG=debug` useless: 402 KB of adapter dumps buried the handful of
+/// `netshield_gui` lines. Their warnings and errors are still worth keeping, because they
+/// explain why a frame or a device failed. `NETSHIELD_LOG_TARGETS=all` lifts the filter
+/// for the rare case of debugging a dependency.
+fn emits(target: &str, level: Level, settings: &Settings) -> bool {
+   let level = level.to_level_filter();
+   if level > settings.level {
+      return false;
+   }
+   settings.all_targets || is_own_target(target) || level <= LevelFilter::Warn
 }
 
 /// Resolves the log path from values, not the environment, so it is testable.
@@ -217,11 +288,10 @@ impl FileLogger {
    /// Appends one line and flushes it, so a crash right after a record still has it.
    fn write_line(&self, line: &str) {
       let mut guard = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      let Some(file) = guard.as_mut() else {
+      let Some(log) = guard.as_mut() else {
          return;
       };
-      let written = file.write_all(line.as_bytes()).and_then(|()| file.flush());
-      if let Err(err) = written
+      if let Err(err) = log.write(line, MAX_LOG_BYTES)
          && !self.reported_write_error.swap(true, Ordering::Relaxed)
       {
          // Reporting through a raw stderr handle, never through `log`, so a broken log
@@ -231,12 +301,53 @@ impl FileLogger {
    }
 }
 
+impl OpenLog {
+   /// Writes one line, rotating first when it would take the file past `limit`.
+   fn write(&mut self, line: &str, limit: u64) -> std::io::Result<()> {
+      let bytes = line.len() as u64;
+      if self.written.saturating_add(bytes) > limit {
+         self.rotate();
+      }
+      self.file.write_all(line.as_bytes())?;
+      self.file.flush()?;
+      self.written = self.written.saturating_add(bytes);
+      Ok(())
+   }
+
+   /// Renames the open file to `<path>.1` and reopens `path` in append mode.
+   ///
+   /// A failed rotation is reported once and leaves the existing handle in place: writing
+   /// on is still better than the no-observability state this module exists to end, and a
+   /// logger must never take the GUI down.
+   fn rotate(&mut self) {
+      let rotated = rotated_path(&self.path);
+      let reopened = std::fs::rename(&self.path, &rotated)
+         .and_then(|()| OpenOptions::new().create(true).append(true).open(&self.path));
+      match reopened {
+         Ok(file) => {
+            self.file = file;
+            self.written = 0;
+         }
+         Err(err) => eprintln!(
+            "netshield-gui: cannot rotate the log file {}: {err}",
+            self.path.display()
+         ),
+      }
+   }
+}
+
 impl Log for FileLogger {
    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-      metadata.level() <= log::max_level()
+      emits(
+         metadata.target(),
+         metadata.level(),
+         &self.settings,
+      )
    }
 
    fn log(&self, record: &Record<'_>) {
+      // `log` can be reached without `enabled` through `log::logger().log(record)`, so the
+      // same predicate decides here; a filtered record must not even be formatted.
       if !self.enabled(record.metadata()) {
          return;
       }
@@ -259,9 +370,9 @@ impl Log for FileLogger {
 
    fn flush(&self) {
       if let Ok(mut guard) = self.file.lock()
-         && let Some(file) = guard.as_mut()
+         && let Some(log) = guard.as_mut()
       {
-         let _ = file.flush();
+         let _ = log.file.flush();
       }
    }
 }
@@ -308,6 +419,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 
 #[cfg(test)]
 mod tests {
+   use std::sync::atomic::AtomicUsize;
    use std::time::Duration;
 
    use super::*;
@@ -464,5 +576,97 @@ mod tests {
       assert!(line.starts_with("1970-01-01T00:00:00Z WARN  netshield_gui::ipc: "));
       let line = format_record(Level::Error, "netshield_gui::ipc", "short", at(0));
       assert!(line.starts_with("1970-01-01T00:00:00Z ERROR netshield_gui::ipc: "));
+   }
+
+   /// Debug settings with the dependency filter in its default state.
+   fn debug_settings() -> Settings {
+      Settings {
+         level: LevelFilter::Debug,
+         all_targets: false,
+      }
+   }
+
+   #[test]
+   fn our_own_debug_records_are_emitted() {
+      assert!(emits(
+         "netshield_gui::app",
+         Level::Debug,
+         &debug_settings()
+      ));
+   }
+
+   #[test]
+   fn a_dependencys_debug_records_are_dropped() {
+      assert!(!emits(
+         "wgpu_core::instance",
+         Level::Debug,
+         &debug_settings()
+      ));
+   }
+
+   #[test]
+   fn a_dependencys_warnings_are_still_emitted() {
+      assert!(emits(
+         "wgpu_core::instance",
+         Level::Warn,
+         &debug_settings()
+      ));
+      assert!(emits(
+         "wgpu_core::instance",
+         Level::Error,
+         &debug_settings()
+      ));
+   }
+
+   #[test]
+   fn all_targets_lifts_the_dependency_filter() {
+      let settings = Settings {
+         level: LevelFilter::Debug,
+         all_targets: all_targets_from(Some("all")),
+      };
+      assert!(emits(
+         "wgpu_core::instance",
+         Level::Debug,
+         &settings
+      ));
+      assert!(!all_targets_from(None));
+      assert!(!all_targets_from(Some("wgpu")));
+   }
+
+   /// A log path no parallel test can collide on; each test removes its files.
+   fn temp_path(label: &str) -> PathBuf {
+      static COUNTER: AtomicUsize = AtomicUsize::new(0);
+      let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+      std::env::temp_dir().join(format!(
+         "netshield-gui-logging-{}-{serial}-{label}.log",
+         std::process::id()
+      ))
+   }
+
+   #[test]
+   fn a_write_past_the_threshold_rotates_the_open_file() {
+      let path = temp_path("rotate-during-write");
+      let mut log = OpenLog {
+         file: open_log_file(&path).expect("the temp log opens"),
+         written: 0,
+         path: path.clone(),
+      };
+      // A tiny injected threshold, so the test never writes a real mebibyte.
+      log.write("first\n", 16).expect("the first line is written");
+      let len = std::fs::metadata(&path).expect("the log exists").len();
+      assert_eq!(len, 6);
+      log.write("second line\n", 16).expect("the second line is written");
+      // 6 + 12 would cross 16: the old file became `.1` and a fresh one holds the line.
+      assert_eq!(
+         std::fs::read_to_string(rotated_path(&path)).expect("the rotated log is readable"),
+         "first\n"
+      );
+      assert_eq!(
+         std::fs::read_to_string(&path).expect("the reopened log is readable"),
+         "second line\n"
+      );
+      assert_eq!(log.written, 12);
+      let _ = std::fs::remove_file(&path);
+      let _ = std::fs::remove_file(rotated_path(&path));
    }
 }
