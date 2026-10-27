@@ -258,8 +258,8 @@ impl App {
    /// Follows Zeus' `GUI::bring_to_front`: unhide and unminimise the root window, then ask
    /// the window manager for critical attention. In floating-alert mode the alert has its
    /// own viewport, which does not exist yet at this point in the frame; that one is
-   /// levelled and focused from inside its own closure instead (see `floating_alert`), so
-   /// nothing is sent to it here. Answering a prompt is unchanged; this
+   /// levelled from inside its own closure instead, and activates itself when created (see
+   /// `floating_alert`), so nothing is sent to it here. Answering a prompt is unchanged; this
    /// only raises it.
    fn alert_viewport(&mut self, ctx: &egui::Context) {
       let Some(first) = self.pending.first() else {
@@ -294,10 +294,9 @@ impl App {
       }
       // In floating mode the alert owns its own viewport and is the only window the user
       // types into; focusing the root there is what kept the alert behind the main window,
-      // because the root's request is the one that lands. The alert's own `Focus` decides
-      // the active window instead. Un-minimising the root is still needed so the alert is
-      // not owned by a minimised parent. Do not re-add a root `Focus` as a fallback: send
-      // `Focus` to the alert viewport and leave the root untouched.
+      // because the root's request is the one that lands. The alert is activated when its
+      // viewport is created instead. Un-minimising the root is still needed so the alert is
+      // not owned by a minimised parent. Do not re-add a root `Focus` as a fallback.
       ctx.send_viewport_cmd_to(
          root,
          egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
@@ -344,14 +343,18 @@ impl App {
          .with_inner_size([alert::WIDTH, alert::HEIGHT])
          .with_resizable(false)
          .with_always_on_top()
+         // Activation is a creation-time request: `ViewportCommand::Focus` sent to an
+         // immediate viewport is ignored by the window manager, so ask for it here instead.
+         .with_active(true)
          .with_visible(true);
 
       let decision =
          ctx.show_viewport_immediate(alert_viewport_id(prompt.id), builder, |ctx, _| {
             // This `ctx` is the alert viewport's own context, the only one valid here: the
             // viewport does not exist before this call. Raise it on its first frame only.
+            // Activation is not commanded here: `ViewportCommand::Focus` is ignored for an
+            // immediate viewport, so the builder's `with_active(true)` requests it at creation.
             if self.raise_alert_once(prompt.id) {
-               ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                   egui::WindowLevel::AlwaysOnTop,
                ));
