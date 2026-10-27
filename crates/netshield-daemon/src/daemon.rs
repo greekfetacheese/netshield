@@ -42,9 +42,10 @@ use netshield_core::{DestMatcher, IpNet, ScopeRequest, rule_from_scope};
 use crate::firewall::{self, FirewallError};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
+use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{PendingPrompts, PromptRecord};
 use crate::policy::{Decision, Policy};
-use crate::proc::Attributor;
+use crate::proc::{Attributor, ProcessCache};
 use crate::store::{RuleStore, StoreError};
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
@@ -55,6 +56,16 @@ const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
 
 /// Upper bound on the addresses the DNS miss limiter remembers.
 const DNS_MISS_LIMIT: usize = 1024;
+
+/// How long the proc connector receive may block before the shutdown flag is checked.
+///
+/// Matches the packet loop's receive bound: a kernel without `CONFIG_PROC_EVENTS` must not
+/// leave a thread that blocks forever on a descriptor the daemon cannot use.
+const PROC_CONNECTOR_RECV_TIMEOUT: Duration = RECV_TIMEOUT;
+
+/// Minimum gap between proc connector failure warnings, so a broken feed cannot flood the
+/// journal while attribution quietly falls back to `/proc`.
+const PROC_CONNECTOR_WARN_GAP: Duration = Duration::from_secs(60);
 
 /// Why the daemon or `--check` could not run.
 #[derive(Debug)]
@@ -197,6 +208,7 @@ impl Daemon {
       ipc: IpcHandle,
       queue: NfQueue,
       dns_cache: Arc<Mutex<DnsCache>>,
+      process_cache: Arc<Mutex<ProcessCache>>,
       table_verified: bool,
    ) -> Self {
       let policy = Policy::new(ruleset_from_store(&store), config.default_action);
@@ -207,7 +219,7 @@ impl Daemon {
          policy,
          pending: PendingPrompts::new(),
          dns_cache,
-         attributor: Attributor::new(),
+         attributor: Attributor::with_process_cache(process_cache),
          ipc,
          queue,
          mode: Mode::Alert,
@@ -436,7 +448,18 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       return Err(err);
    }
 
-   let mut daemon = Daemon::start(config, store, ipc, queue, cache, table_verified);
+   let process_cache = Arc::new(Mutex::new(ProcessCache::new()));
+   spawn_proc_connector(Arc::clone(&process_cache));
+
+   let mut daemon = Daemon::start(
+      config,
+      store,
+      ipc,
+      queue,
+      cache,
+      process_cache,
+      table_verified,
+   );
    daemon.publish_rules();
    daemon.publish_status();
    info!(
@@ -1171,6 +1194,73 @@ fn single_host_net(addr: IpAddr) -> Option<IpNet> {
       IpAddr::V6(_) => 128,
    };
    IpNet::new(addr, prefix).ok()
+}
+
+/// Spawns the proc connector reader: seed the identity cache, then apply every event.
+///
+/// A kernel without `CONFIG_PROC_EVENTS` cannot be distinguished from a transient socket
+/// error, so a failure is logged at `warn` and retried no more often than once a minute;
+/// attribution keeps working through `/proc`, only without the race fix. This thread is
+/// never fatal to the daemon: it is an optimisation of identity lookup, not the enforcement
+/// path.
+fn spawn_proc_connector(cache: Arc<Mutex<ProcessCache>>) {
+   let _ = thread::Builder::new().name("netshield-procmon".to_owned()).spawn(move || {
+      // Seeding before LISTEN closes the window: a process that exec'd before the
+      // connector was open is still in `/proc` now, and one that exits after the seed
+      // is reported by the connector.
+      if let Ok(mut cache) = cache.lock() {
+         cache.seed();
+      }
+
+      let mut connector = match ProcConnector::open() {
+         Ok(connector) => connector,
+         Err(err) => {
+            warn!(
+               "proc connector unavailable: {err}; process identity falls back to /proc and \
+                may miss processes that exit mid-scan"
+            );
+            return;
+         }
+      };
+      if let Err(err) = connector.set_recv_timeout(PROC_CONNECTOR_RECV_TIMEOUT) {
+         warn!("proc connector receive timeout could not be set: {err}");
+      }
+
+      let mut events = Vec::new();
+      let mut last_warn: Option<Instant> = None;
+      loop {
+         if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+         }
+         match connector.recv(&mut events) {
+            Ok(_) => {
+               if let Ok(mut cache) = cache.lock() {
+                  for event in events.drain(..) {
+                     match event {
+                        ProcEvent::Exec { pid } => cache.record(pid),
+                        ProcEvent::Exit { pid } => cache.forget(pid),
+                     }
+                  }
+               } else {
+                  events.clear();
+               }
+            }
+            Err(err) if would_block(&err) => {}
+            Err(err) => {
+               // Rate-limited: a missing kernel feature answers every receive with the
+               // same error, and one line a minute still names the cause.
+               let now = Instant::now();
+               if last_warn.is_none_or(|last| now.duration_since(last) >= PROC_CONNECTOR_WARN_GAP) {
+                  warn!(
+                     "proc connector receive failed: {err}; identities may fall back to \
+                         /proc until it recovers"
+                  );
+                  last_warn = Some(now);
+               }
+            }
+         }
+      }
+   });
 }
 
 /// Spawns the DNS reader: parse every answer into the cache, always accept.
