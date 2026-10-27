@@ -187,9 +187,22 @@ if [ "$demo" -eq 1 ]; then
     sleep 0.5
     echo go > "$trigger"
     wait "$client"
+    # The decide client returning only means the daemon received the answer; the decision
+    # is applied (and logged) a moment later.  Grepping immediately raced the shutdown and
+    # printed only the raise line, so poll for the decision before reporting or stopping.
+    decided=""
+    for _ in $(seq 1 25); do
+        decided="$(grep -E 'prompt [0-9]+ for .*: (allow|deny),' "$daemon_log" 2>/dev/null || true)"
+        [ -n "$decided" ] && break
+        sleep 0.2
+    done
     echo
-    echo "decision lines from $daemon_log:"
-    grep 'prompt .* for ' "$daemon_log" || echo "  (none: no flow was queued)"
+    echo "prompt lines from $daemon_log (raise line, then decision line):"
+    grep 'prompt .* for ' "$daemon_log" || echo "  (none: no prompt was raised)"
+    if [ -z "$decided" ]; then
+        echo "  (no decision line after 5 s)"
+        exit 1
+    fi
     exit 0
 fi
 

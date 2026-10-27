@@ -253,8 +253,13 @@ Allow around x≈340:
 
 ```bash
 gcc -O2 -o target/dev/click_at dev/click_at.c -lX11 -lXtst
+# on a machine with only the libXtst runtime and no -dev symlink:
+gcc -O2 -o target/dev/click_at dev/click_at.c -lX11 -Wl,-l:libXtst.so.6
 target/dev/click_at 0x2400003 340 401
 ```
+
+Use the second form when the first fails with `ld: cannot find -lXtst`: it links the
+runtime `libXtst.so.6` directly, which is all some machines install.
 
 Three things make this work or not:
 
