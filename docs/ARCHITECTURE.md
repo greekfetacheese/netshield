@@ -279,14 +279,16 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 - `/etc/netshield/rules.json` — `Forever` rules, same atomic-write path, hot-reloaded.
 - `/run/netshield/control.sock` — `0660`, owned by `allowed_uid` and that user's primary
   group when `allowed_uid` is set (chown after bind; the `SO_PEERCRED` check is still
-  enforced), `root:root` otherwise.
+  enforced), `root:root` otherwise. `/run/netshield` itself is mode `0711`: traversal
+  without listing for any local user, which the GUI needs to reach the socket.
 - `/etc/systemd/system/netshield.service` — `Type=simple` with `Restart=on-failure`,
-  `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`, `NoNewPrivileges=yes`,
-  `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`. `NET_ADMIN` programs
-  nftables and owns the NFQUEUE sockets; `SYS_PTRACE` and `DAC_READ_SEARCH` are required
-  to read `/proc/<pid>/exe` and `/proc/<pid>/fd` for processes of other users (the
-  resolver runs as its own uid), without which attribution degrades to `Unknown` and
-  every DNS lookup would prompt.
+  `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_DAC_READ_SEARCH`, `CAP_CHOWN`,
+  `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`.
+  `NET_ADMIN` programs nftables and owns the NFQUEUE sockets; `SYS_PTRACE` and
+  `DAC_READ_SEARCH` are required to read `/proc/<pid>/exe` and `/proc/<pid>/fd` for
+  processes of other users (the resolver runs as its own uid), without which attribution
+  degrades to `Unknown` and every DNS lookup would prompt; `CHOWN` is required to chown
+  the control socket to the GUI user.
 - `install.sh` — installs prebuilt binaries (`--bin-dir`), writes the systemd unit and
   the XDG autostart entry with the invoking user's UID recorded as `allowed_uid`, enables
   the service, and refuses to run while another application firewall (OpenSnitch) is

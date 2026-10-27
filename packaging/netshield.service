@@ -10,7 +10,6 @@ ConditionPathExists=/etc/netshield/config.json
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/netshieldd
-ExecStopPost=-nft delete table inet netshield
 Restart=on-failure
 RestartSec=2s
 UMask=0077
@@ -19,12 +18,18 @@ UMask=0077
 # It needs SYS_PTRACE and DAC_READ_SEARCH to read /proc/<pid>/exe and /proc/<pid>/fd for
 # processes of other users (the resolver runs as its own uid): without them attribution
 # silently degrades to Unknown and every DNS lookup would prompt.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+# It needs CHOWN because it hands the control socket to the GUI user (chown to
+# allowed_uid) after bind: without it the chown fails with EPERM, the socket stays
+# root:root and the unprivileged GUI cannot connect.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
 NoNewPrivileges=yes
 
+# 0711 gives every local user traversal into the directory without listing it; the
+# socket itself stays 0660 and is guarded by the SO_PEERCRED uid check, so this does
+# not widen access to the control channel.
 RuntimeDirectory=netshield
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0711
 StateDirectory=netshield
 StateDirectoryMode=0700
 ReadWritePaths=/etc/netshield
