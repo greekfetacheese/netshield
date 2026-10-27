@@ -168,6 +168,11 @@ impl PendingPrompts {
       self.resolve(id, now)
    }
 
+   /// The id of the active head, or `None` when no prompt is open.
+   pub fn head_id(&self) -> Option<u64> {
+      self.queue.front().copied()
+   }
+
    /// The prompt with `id`, if it is still open.
    pub fn get(&self, id: u64) -> Option<&PromptRecord> {
       self.by_id.get(&id)
@@ -564,6 +569,30 @@ mod tests {
          None,
          "a resolved flow no longer accepts packets"
       );
+   }
+
+   #[test]
+   fn head_id_is_the_arrival_front_and_none_when_empty() {
+      let mut pending = PendingPrompts::new();
+      assert_eq!(
+         pending.head_id(),
+         None,
+         "an empty queue has no head"
+      );
+
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+      assert_eq!(pending.head_id(), Some(first));
+      pending.resolve(first, start);
+      assert_eq!(
+         pending.head_id(),
+         Some(second),
+         "the prompt behind the head becomes the head"
+      );
+      pending.resolve(second, start);
+      assert_eq!(pending.head_id(), Some(third));
+      pending.resolve(third, start);
+      assert_eq!(pending.head_id(), None, "the queue drained");
    }
 
    #[test]
