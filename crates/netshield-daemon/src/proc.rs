@@ -13,11 +13,13 @@
 //! `Unknown` matcher and a guessed owner could inherit another application's allow.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::time::{Duration as StdDuration, Instant};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use log::{debug, warn};
 use netshield_core::{Attribution, Family, L4Proto, ProcessInfo};
@@ -86,6 +88,79 @@ type FlowKey = (L4Proto, (IpAddr, u16), (IpAddr, u16));
 /// The flow class whose consecutive misses are tracked for the operator warning.
 type MissKey = (Option<u32>, L4Proto, u16);
 
+/// The identity of one process, learned while its `/proc` entry was still readable.
+///
+/// `exe` is `Option` because a process can be recorded from metadata alone (the connector
+/// announced it, but its `exe` link was already gone) — the uid and start time are still
+/// worth keeping, while a guessed `exe` would be a wrong rule key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedIdentity {
+   pub exe: Option<PathBuf>,
+   pub comm: String,
+   pub uid: u32,
+   pub starttime: u64,
+}
+
+/// Identities learned from the proc connector, so a process that exits mid-scan still resolves.
+#[derive(Debug, Default)]
+pub struct ProcessCache {
+   identities: HashMap<u32, CachedIdentity>,
+}
+
+impl ProcessCache {
+   /// Creates an empty cache.
+   pub fn new() -> Self {
+      Self::default()
+   }
+
+   /// Seeds from a full `/proc` sweep; failures are skipped, never fatal.
+   pub fn seed(&mut self) {
+      let Some(pids) = numeric_pids() else {
+         return;
+      };
+      for pid in pids {
+         self.record(pid);
+      }
+   }
+
+   /// Reads `/proc/<pid>/…` now and inserts the identity when it is still there.
+   ///
+   /// A pid whose `exe` cannot be read is still recorded with `exe: None`, so its uid and
+   /// start time remain available. A pid whose uid or start time cannot be read is skipped
+   /// instead: the struct has no "unknown" for those fields, and a default would be a
+   /// guessed identity that could satisfy the wrong uid check.
+   pub fn record(&mut self, pid: u32) {
+      if let Some(identity) = identity_at(pid, Path::new(PROC)) {
+         self.insert(pid, identity);
+      }
+   }
+
+   /// Drops a pid's identity when the connector reports its exit.
+   pub fn forget(&mut self, pid: u32) {
+      self.identities.remove(&pid);
+   }
+
+   /// Returns the cached identity for a pid.
+   pub fn get(&self, pid: u32) -> Option<&CachedIdentity> {
+      self.identities.get(&pid)
+   }
+
+   /// Returns the number of cached identities.
+   pub fn len(&self) -> usize {
+      self.identities.len()
+   }
+
+   /// Whether the cache holds no identities.
+   pub fn is_empty(&self) -> bool {
+      self.identities.is_empty()
+   }
+
+   /// Inserts one identity, replacing any earlier record for the pid.
+   fn insert(&mut self, pid: u32, identity: CachedIdentity) {
+      self.identities.insert(pid, identity);
+   }
+}
+
 /// The `/proc` walker and its caches.
 ///
 /// The caches are keyed by flow, inode and pid because the expensive half is the directory
@@ -94,6 +169,10 @@ type MissKey = (Option<u32>, L4Proto, u16);
 /// directories ten times.
 #[derive(Debug)]
 pub struct Attributor {
+   /// Identities the proc connector learned before a process exited. Only identity is
+   /// cached; ownership still comes from the descriptor scan, so a hit here can never
+   /// invent an owner for an inode.
+   process_cache: Arc<Mutex<ProcessCache>>,
    inode_to_pid: HashMap<u32, InodeCacheEntry>,
    pid_fds: HashMap<u32, FdCacheEntry>,
    flow_owners: HashMap<FlowKey, FlowCacheEntry>,
@@ -146,9 +225,15 @@ struct FailureContext<'a> {
 }
 
 impl Attributor {
-   /// Creates an empty attributor with no cached answers.
+   /// Creates an attributor over its own empty process cache.
    pub fn new() -> Self {
+      Self::with_process_cache(Arc::new(Mutex::new(ProcessCache::new())))
+   }
+
+   /// Creates an attributor that shares the identity cache the connector thread fills.
+   pub fn with_process_cache(process_cache: Arc<Mutex<ProcessCache>>) -> Self {
       Self {
+         process_cache,
          inode_to_pid: HashMap::new(),
          pid_fds: HashMap::new(),
          flow_owners: HashMap::new(),
@@ -175,7 +260,7 @@ impl Attributor {
       let now = Instant::now();
       let flow = (proto, local, remote);
       if let Some((pid, owner_uid)) = self.cached_flow(flow, uid, now) {
-         return match read_process(pid, owner_uid) {
+         return match self.process_identity(pid, owner_uid) {
             Some(process) => {
                self.stats.hits += 1;
                Attribution::Process(process)
@@ -317,7 +402,7 @@ impl Attributor {
          }
       };
 
-      let Some(process) = read_process(pid, process_uid) else {
+      let Some(process) = self.process_identity(pid, process_uid) else {
          return self.unknown(
             &context,
             &format!("cannot read /proc/{pid} identity for inode {inode}"),
@@ -343,6 +428,67 @@ impl Attributor {
       );
       self.stats.hits += 1;
       Attribution::Process(process)
+   }
+
+   /// Resolves a pid's identity, preferring the connector cache.
+   ///
+   /// The cache exists precisely because `/proc/<pid>/exe` may be gone by the time a scan
+   /// resolves an inode; a miss falls back to `/proc` and stores what it read. `uid` is the
+   /// owner the descriptor scan established, never a cache lookup.
+   fn process_identity(&mut self, pid: u32, uid: u32) -> Option<ProcessInfo> {
+      if let Some(cached) = self.cached_identity(pid) {
+         if cached.uid == uid {
+            // `cmdline` is not an identity field, so it is not cached; read it when the
+            // process is still around and leave it empty when the cache is all that is
+            // left, which is exactly the vanished-process case.
+            let cmdline = fs::read(format!("{PROC}/{pid}/cmdline"))
+               .ok()
+               .and_then(|bytes| join_cmdline(&bytes));
+            return Some(ProcessInfo {
+               pid,
+               uid: cached.uid,
+               exe: cached.exe.clone(),
+               comm: Some(cached.comm.clone()).filter(|comm| !comm.is_empty()),
+               cmdline,
+            });
+         }
+         // The pid was recycled into another user: the cached identity is not evidence
+         // about this socket. Drop it and fall back to `/proc`, never reconcile the two.
+         if let Ok(mut cache) = self.process_cache.lock() {
+            cache.forget(pid);
+         }
+      }
+      let process = read_process(pid, uid)?;
+      self.remember_identity(pid, &process);
+      Some(process)
+   }
+
+   /// Copies a cache hit so the lock is not held while the caller renders it.
+   fn cached_identity(&self, pid: u32) -> Option<CachedIdentity> {
+      let cache = self.process_cache.lock().ok()?;
+      cache.get(pid).cloned()
+   }
+
+   /// Stores an identity read from `/proc`, without overwriting a fuller cached one.
+   fn remember_identity(&self, pid: u32, process: &ProcessInfo) {
+      let Ok(mut cache) = self.process_cache.lock() else {
+         return;
+      };
+      if cache.get(pid).is_some() {
+         return;
+      }
+      let Some(starttime) = read_starttime_at(&Path::new(PROC).join(pid.to_string())) else {
+         return;
+      };
+      cache.insert(
+         pid,
+         CachedIdentity {
+            exe: process.exe.clone(),
+            comm: process.comm.clone().unwrap_or_default(),
+            uid: process.uid,
+            starttime,
+         },
+      );
    }
 
    /// Returns the per-lookup counters.
@@ -544,17 +690,21 @@ impl Attributor {
             continue;
          }
 
-         let inodes = match read_inodes(pid) {
-            Ok(inodes) => inodes,
-            Err(ScanError::Budget) => {
-               self.budget_exhausted(&format!(
-                  "descriptor scan of pid {pid} exceeded {MAX_FDS} entries"
-               ));
-               return None;
-            }
+         let (inodes, over_budget) = match read_inodes(pid) {
+            Ok(inodes) => (inodes, false),
+            // The fresh entries were still inspected, so a socket among them is a real
+            // hit; the warning below records that the rest of the directory went unseen.
+            Err(ScanError::Budget(inodes)) => (inodes, true),
             Err(ScanError::Unreadable) => continue,
          };
+         if over_budget {
+            self.budget_exhausted(&format!(
+               "descriptor scan of pid {pid} exceeded {MAX_FDS} entries"
+            ));
+         }
          let found = inodes.contains(&inode);
+         // A trimmed snapshot is cached too: a positive is a real descriptor at that pid,
+         // and a negative stays only a hint that the next lookup refreshes.
          self.pid_fds.insert(
             pid,
             FdCacheEntry {
@@ -565,6 +715,11 @@ impl Attributor {
          );
          if found {
             return Some((pid, owner_uid));
+         }
+         if over_budget {
+            // The cut-off dropped descriptors this pid holds, so no other process can be
+            // ruled in or out: the answer is unknown, not a miss from a complete scan.
+            return None;
          }
       }
       None
@@ -649,12 +804,14 @@ impl Default for Attributor {
    }
 }
 
-/// Why a pid's descriptor directory could not be scanned.
+/// Why a pid's descriptor directory could not be fully scanned.
 enum ScanError {
    /// The process vanished or its fds are not readable by this daemon.
    Unreadable,
-   /// The directory held more entries than one lookup may examine.
-   Budget,
+   /// The directory held more entries than one lookup may examine. The payload is what the
+   /// newest [`MAX_FDS`] entries yielded: the scan must still attribute the fresh socket it
+   /// was allowed to inspect, while the caller counts and warns about the truncation.
+   Budget(Vec<u32>),
 }
 
 /// Returns the socket table for a protocol and family, or `None` when there is none.
@@ -895,21 +1052,38 @@ fn candidate_owner(
 }
 
 /// Opens `/proc/<pid>/fd` and collects the socket inodes it holds.
+///
+/// Descriptors are ordered newest-first before any link is read, mirroring OpenSnitch's
+/// `sortFdsByTime`: a firewall looks for a socket created moments ago, so the newest
+/// [`MAX_FDS`] entries are the ones worth spending the budget on. A directory holding more
+/// than that is still trimmed, but its freshest entries are read; the caller is told with
+/// [`ScanError::Budget`] and receives those inodes rather than an empty list.
 fn socket_inodes(pid: u32) -> Result<Vec<u32>, ScanError> {
-   let directory = fs::read_dir(format!("{PROC}/{pid}/fd")).map_err(|_| ScanError::Unreadable)?;
-   let mut inodes = Vec::new();
+   read_fd_dir(Path::new(PROC).join(pid.to_string()).join("fd"))
+}
+
+/// Scans one descriptor directory, newest entry first, trimming the list to [`MAX_FDS`].
+///
+/// Split from [`socket_inodes`] so the ordering and the budget can be exercised on a
+/// directory the test controls instead of a live `/proc`.
+fn read_fd_dir(path: PathBuf) -> Result<Vec<u32>, ScanError> {
+   let directory = fs::read_dir(&path).map_err(|_| ScanError::Unreadable)?;
+   let mut entries = Vec::new();
    let mut seen = 0usize;
    for entry in directory {
       let Ok(entry) = entry else {
          continue;
       };
       seen += 1;
-      if seen > MAX_FDS {
-         return Err(ScanError::Budget);
-      }
-      let Ok(target) = fs::read_link(entry.path()) else {
+      entries.push((entry.file_name(), entry_mtime(&entry)));
+   }
+   let over_budget = seen > MAX_FDS;
+   let mut inodes = Vec::new();
+   for name in sort_fds_newest_first(entries, MAX_FDS) {
+      let target = match fs::read_link(path.join(name)) {
+         Ok(target) => target,
          // A descriptor closed between readdir and readlink.
-         continue;
+         Err(_) => continue,
       };
       if let Some(target) = target.to_str()
          && let Some(inode) = socket_link_inode(target)
@@ -917,7 +1091,34 @@ fn socket_inodes(pid: u32) -> Result<Vec<u32>, ScanError> {
          inodes.push(inode);
       }
    }
+   if over_budget {
+      return Err(ScanError::Budget(inodes));
+   }
    Ok(inodes)
+}
+
+/// Returns a directory entry's own modification time, without following a symlink.
+///
+/// A `/proc` descriptor is a link: `socket:[<inode>]`, `/dev/null`, a pipe. Its link
+/// metadata is the descriptor's age, which is what this ordering is about, and
+/// `fs::metadata` would follow the link instead. For a socket that gives the socket inode's
+/// time (`0`) and for a regular file the target's age, so following the link would sort
+/// precisely the descriptors this scan is looking for into the untimed bucket.
+fn entry_mtime(entry: &fs::DirEntry) -> Option<SystemTime> {
+   entry.metadata().ok()?.modified().ok()
+}
+
+/// Sorts `(name, mtime)` descriptor entries newest-first, as OpenSnitch does; entries
+/// without a time go last. Returns the file names to inspect, trimmed to `limit`.
+fn sort_fds_newest_first(
+   entries: Vec<(OsString, Option<SystemTime>)>,
+   limit: usize,
+) -> Vec<OsString> {
+   sort_newest_first(entries)
+      .into_iter()
+      .take(limit)
+      .map(|(name, _)| name)
+      .collect()
 }
 
 /// Parses a `/proc/<pid>/fd` link target of the form `socket:[<inode>]`.
@@ -931,11 +1132,20 @@ fn socket_link_inode(target: &str) -> Option<u32> {
 /// The directory, not `status`, is authoritative here: it is the kernel's inode owner and
 /// takes one `stat` instead of a parse that could disagree with the fd scan.
 fn read_pid_uid(pid: u32) -> Option<u32> {
-   let path = PathBuf::from(format!("{PROC}/{pid}"));
-   fs::metadata(path).ok().map(|meta| meta.uid())
+   read_pid_uid_at(&PathBuf::from(format!("{PROC}/{pid}")))
 }
 
-/// Lists the numeric entries of `/proc`.
+/// Reads a process directory's owner uid from its metadata.
+fn read_pid_uid_at(dir: &Path) -> Option<u32> {
+   fs::metadata(dir).ok().map(|meta| meta.uid())
+}
+
+/// Lists the numeric entries of `/proc`, newest process first.
+///
+/// The scan order matters: the socket being attributed was created moments ago, so the
+/// process that started last is the likeliest owner. A pid whose directory time cannot be
+/// read is still scanned, only last, so a racing exit or an unreadable entry never hides a
+/// younger process.
 fn numeric_pids() -> Option<Vec<u32>> {
    let entries = fs::read_dir(PROC).ok()?;
    let mut pids = Vec::new();
@@ -943,11 +1153,92 @@ fn numeric_pids() -> Option<Vec<u32>> {
       let Ok(name) = entry.file_name().into_string() else {
          continue;
       };
-      if let Ok(pid) = name.parse::<u32>() {
-         pids.push(pid);
-      }
+      let Ok(pid) = name.parse::<u32>() else {
+         continue;
+      };
+      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
+      pids.push((pid, mtime));
    }
-   Some(pids)
+   Some(sort_pids_newest_first(pids))
+}
+
+/// Sorts `(pid, mtime)` pairs newest-first; entries without a time go last, ties keep input
+/// order.
+fn sort_pids_newest_first(entries: Vec<(u32, Option<SystemTime>)>) -> Vec<u32> {
+   sort_newest_first(entries).into_iter().map(|(pid, _)| pid).collect()
+}
+
+/// Sorts `(item, mtime)` entries newest-first, with untimed entries last and ties stable.
+///
+/// `sort_by` is a stable sort, so equal times and two missing times keep the readdir order;
+/// that keeps the scan deterministic for the tests and for a reproduced failure.
+fn sort_newest_first<T>(mut entries: Vec<(T, Option<SystemTime>)>) -> Vec<(T, Option<SystemTime>)> {
+   entries.sort_by(|(_, a), (_, b)| match (a, b) {
+      (Some(a), Some(b)) => b.cmp(a),
+      (Some(_), None) => std::cmp::Ordering::Less,
+      (None, Some(_)) => std::cmp::Ordering::Greater,
+      (None, None) => std::cmp::Ordering::Equal,
+   });
+   entries
+}
+
+/// Reads one process's identity under `root` (the real `/proc` or a test fixture).
+///
+/// Returns `None` when neither the uid nor the start time can be read: the struct has no
+/// "unknown" for those fields, and a default would be a guessed identity that could satisfy
+/// the wrong uid check. A readable uid and start time are enough to record the pid even
+/// without an `exe`, which is exactly the racing-exit case this cache exists for.
+fn identity_at(pid: u32, root: &Path) -> Option<CachedIdentity> {
+   let dir = root.join(pid.to_string());
+   let uid = read_status_uid_at(&dir).or_else(|| read_pid_uid_at(&dir))?;
+   let starttime = read_starttime_at(&dir)?;
+   // A pid without an `exe` is still recorded: the uid and start time are known, and
+   // leaving `exe` empty is what keeps the cache from inventing a rule key.
+   Some(CachedIdentity {
+      exe: fs::read_link(dir.join("exe")).ok(),
+      comm: read_comm_at(&dir).unwrap_or_default(),
+      uid,
+      starttime,
+   })
+}
+
+/// Reads a process directory's `comm`, trimmed, when it is non-empty.
+fn read_comm_at(dir: &Path) -> Option<String> {
+   fs::read_to_string(dir.join("comm"))
+      .ok()
+      .map(|text| text.trim().to_owned())
+      .filter(|text| !text.is_empty())
+}
+
+/// Reads the `Uid:` line of a process directory's `status`.
+fn read_status_uid_at(dir: &Path) -> Option<u32> {
+   let text = fs::read_to_string(dir.join("status")).ok()?;
+   status_uid(&text)
+}
+
+/// Parses the first field of the `Uid:` line (the real uid) from `/proc/<pid>/status`.
+fn status_uid(text: &str) -> Option<u32> {
+   text
+      .lines()
+      .find_map(|line| line.strip_prefix("Uid:"))
+      .and_then(|rest| rest.split_whitespace().next())
+      .and_then(|uid| uid.parse().ok())
+}
+
+/// Reads field 22 (`starttime`) of a process directory's `stat`.
+fn read_starttime_at(dir: &Path) -> Option<u64> {
+   let text = fs::read_to_string(dir.join("stat")).ok()?;
+   stat_starttime(&text)
+}
+
+/// Parses field 22 of one `/proc/<pid>/stat` line.
+///
+/// The second field, `comm`, is parenthesised and may itself contain spaces, digits and
+/// parentheses, so the fields after it start at the last `)`; splitting from there keeps a
+/// process named `) 1 2 (` from shifting every later field.
+fn stat_starttime(text: &str) -> Option<u64> {
+   let rest = &text[text.rfind(')')? + 1..];
+   rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 /// Reads the process identity, or `None` when it can no longer be read.
@@ -956,10 +1247,7 @@ fn numeric_pids() -> Option<Vec<u32>> {
 /// is `Unknown` rather than a `ProcessInfo` with a guessed identity.
 fn read_process(pid: u32, uid: u32) -> Option<ProcessInfo> {
    let exe = fs::read_link(format!("{PROC}/{pid}/exe")).ok()?;
-   let comm = fs::read_to_string(format!("{PROC}/{pid}/comm"))
-      .ok()
-      .map(|text| text.trim().to_owned())
-      .filter(|text| !text.is_empty());
+   let comm = read_comm_at(Path::new(PROC).join(pid.to_string()).as_path());
    let cmdline = fs::read(format!("{PROC}/{pid}/cmdline"))
       .ok()
       .and_then(|bytes| join_cmdline(&bytes));
@@ -1875,6 +2163,308 @@ mod tests {
          message.len() < 160,
          "too long ({}): {message}",
          message.len()
+      );
+   }
+
+   /// A fixed instant for ordering tests; values are offsets from it.
+   fn at(offset: u64) -> SystemTime {
+      SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_000 + offset)
+   }
+
+   #[test]
+   fn sort_pids_newest_first_orders_newest_first_with_stable_ties() {
+      // Pids 10 and 11 share a timestamp: a stable sort keeps their readdir order.
+      let entries = vec![
+         (10, Some(at(1))),
+         (20, Some(at(9))),
+         (11, Some(at(1))),
+         (30, Some(at(5))),
+      ];
+      assert_eq!(
+         sort_pids_newest_first(entries),
+         vec![20, 30, 10, 11]
+      );
+   }
+
+   #[test]
+   fn sort_pids_newest_first_puts_untimed_entries_last() {
+      let entries = vec![(1, None), (2, Some(at(1))), (3, None), (4, Some(at(2)))];
+      assert_eq!(
+         sort_pids_newest_first(entries),
+         vec![4, 2, 1, 3],
+         "a pid with no readable time stays scannable, only last"
+      );
+   }
+
+   #[test]
+   fn sort_fds_newest_first_orders_newest_first_with_stable_ties() {
+      let entries = vec![
+         (OsString::from("a"), Some(at(1))),
+         (OsString::from("b"), Some(at(9))),
+         (OsString::from("c"), Some(at(1))),
+      ];
+      assert_eq!(
+         sort_fds_newest_first(entries, MAX_FDS),
+         vec![
+            OsString::from("b"),
+            OsString::from("a"),
+            OsString::from("c")
+         ]
+      );
+   }
+
+   #[test]
+   fn sort_fds_newest_first_puts_untimed_entries_last_and_keeps_the_newest() {
+      let entries = vec![
+         (OsString::from("stale"), Some(at(1))),
+         (OsString::from("untimed"), None),
+         (OsString::from("newest"), Some(at(9))),
+         (OsString::from("middle"), Some(at(5))),
+      ];
+      // The cut-off must drop the oldest and the untimed descriptors, never the newest.
+      assert_eq!(
+         sort_fds_newest_first(entries, 2),
+         vec![OsString::from("newest"), OsString::from("middle")]
+      );
+   }
+
+   /// The descriptor ordering must read the link's own time. A socket link's target does
+   /// not exist on disk, so following it yields no time at all and every socket would be
+   /// sorted last — the inverse of what the scan needs.
+   #[test]
+   fn descriptor_mtime_is_the_link_time_not_the_target_time() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let dir = std::env::temp_dir().join(format!("netshield-fd-mtime-{nanos}"));
+      fs::create_dir_all(&dir).expect("create the descriptor directory");
+      std::os::unix::fs::symlink("socket:[4242]", dir.join("fd-socket"))
+         .expect("create the socket link");
+
+      let entry = fs::read_dir(&dir)
+         .expect("read the descriptor directory")
+         .next()
+         .expect("one descriptor")
+         .expect("a readable descriptor");
+      assert!(
+         entry.metadata().expect("link metadata").modified().is_ok(),
+         "the socket link itself carries the descriptor's time"
+      );
+      assert!(
+         fs::metadata(entry.path()).is_err(),
+         "the link target does not exist, so following it must fail"
+      );
+
+      let _ = fs::remove_dir_all(&dir);
+   }
+
+   /// Creates a descriptor directory holding `MAX_FDS + 10` entries where the only socket
+   /// is the newest: the budget may trim the directory but must still inspect that socket.
+   #[test]
+   fn descriptor_budget_keeps_the_newest_entries_and_still_finds_the_socket() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let dir = std::env::temp_dir().join(format!("netshield-fd-budget-{nanos}"));
+      fs::create_dir_all(&dir).expect("create the descriptor directory");
+
+      let inode = 987_654u32;
+      // The stale descriptors are created first, so the socket link below is the newest
+      // entry by creation order; temp-file mtimes have sub-second resolution.
+      for index in 0..(MAX_FDS + 9) {
+         fs::write(dir.join(format!("stale-{index}")), b"").expect("create a stale descriptor");
+      }
+      // A `/proc/<pid>/fd` socket link is a symlink to `socket:[<inode>]`; the ordering
+      // reads the link's own time, so the target need not exist.
+      std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("fd-socket"))
+         .expect("create the socket link");
+      // Timestamps are taken from the filesystem, so make the gap unambiguous rather than
+      // relying on two writes landing in the same clock tick.
+      let socket_link = dir.join("fd-socket");
+      let newest = fs::symlink_metadata(&socket_link)
+         .expect("read the socket link")
+         .modified()
+         .expect("the socket link has an mtime");
+      for index in 0..(MAX_FDS + 9) {
+         let stale = dir.join(format!("stale-{index}"));
+         fs::File::options()
+            .write(true)
+            .open(&stale)
+            .expect("open a stale descriptor")
+            .set_modified(newest - StdDuration::from_secs(3_600))
+            .expect("backdate a stale descriptor");
+      }
+
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
+         read_fd_dir(dir.clone())
+      });
+      assert_eq!(
+         owner,
+         Some((pid, uid)),
+         "the newest descriptor must be inspected even when the directory exceeds the budget"
+      );
+      assert_eq!(
+         attributor.stats().scan_budget_exhausted,
+         1,
+         "the trimmed directory must still be reported as over budget"
+      );
+
+      let _ = fs::remove_dir_all(&dir);
+   }
+
+   /// A `/proc/<pid>` fixture holding the four files `ProcessCache::record` reads.
+   fn proc_fixture(name: &str, exe: Option<&str>, comm: &str) -> PathBuf {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let root = std::env::temp_dir().join(format!("netshield-{name}-{nanos}"));
+      let dir = root.join("4242");
+      fs::create_dir_all(&dir).expect("create the pid directory");
+      if let Some(exe) = exe {
+         std::os::unix::fs::symlink(exe, dir.join("exe")).expect("create the exe link");
+      }
+      fs::write(dir.join("comm"), format!("{comm}\n")).expect("write comm");
+      fs::write(
+         dir.join("status"),
+         "Name:\tfirefox\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n",
+      )
+      .expect("write status");
+      fs::write(
+         dir.join("stat"),
+         // Field 22 is 987654; the parentheses hold spaces and digits so a naive split
+         // would shift the start time.
+         "4242 (fi (re) fox) S 1 4242 4242 0 -1 4194560 0 0 0 0 12 34 0 0 20 0 1 0 987654 0",
+      )
+      .expect("write stat");
+      root
+   }
+
+   #[test]
+   fn process_cache_records_uid_starttime_and_exe() {
+      let root = proc_fixture(
+         "cache-hit",
+         Some("/usr/lib/firefox/firefox"),
+         "firefox",
+      );
+      let identity = identity_at(4242, &root).expect("a fully readable process");
+      assert_eq!(identity.uid, 1000);
+      assert_eq!(identity.starttime, 987_654);
+      assert_eq!(identity.comm, "firefox");
+      assert_eq!(
+         identity.exe,
+         Some(PathBuf::from("/usr/lib/firefox/firefox"))
+      );
+
+      let mut cache = ProcessCache::new();
+      cache.insert(4242, identity.clone());
+      assert_eq!(cache.get(4242), Some(&identity));
+      assert_eq!(cache.len(), 1);
+
+      cache.forget(4242);
+      assert_eq!(cache.get(4242), None);
+      assert!(cache.is_empty());
+
+      let _ = fs::remove_dir_all(&root);
+   }
+
+   #[test]
+   fn process_cache_tolerates_a_missing_exe() {
+      // The racing-exit case: the pid directory is readable but `exe` is gone. The
+      // identity must still be recorded so the uid and start time are known.
+      let root = proc_fixture("cache-no-exe", None, "vanished");
+      let identity = identity_at(4242, &root).expect("uid and start time are readable");
+      assert_eq!(identity.exe, None);
+      assert_eq!(identity.uid, 1000);
+      assert_eq!(identity.starttime, 987_654);
+      assert_eq!(identity.comm, "vanished");
+
+      let _ = fs::remove_dir_all(&root);
+   }
+
+   #[test]
+   fn process_cache_skips_a_pid_whose_metadata_is_gone() {
+      let root = std::env::temp_dir().join("netshield-cache-missing");
+      assert_eq!(identity_at(999_999, &root), None);
+   }
+
+   #[test]
+   fn status_uid_reads_the_first_field_only() {
+      let status = "Name:\tsleep\nUid:\t0\t1000\t1000\t1000\nGid:\t0\t1000\t1000\t1000\n";
+      assert_eq!(status_uid(status), Some(0));
+      assert_eq!(status_uid("Name:\tx\n"), None);
+   }
+
+   #[test]
+   fn stat_starttime_ignores_comm_parentheses_and_spaces() {
+      let stat = "7 (a (b) c) S 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 555 0";
+      assert_eq!(stat_starttime(stat), Some(555));
+      assert_eq!(stat_starttime("garbage"), None);
+      assert_eq!(stat_starttime("7 (short)"), None);
+   }
+
+   #[test]
+   fn a_cached_identity_never_answers_for_an_unheld_inode() {
+      // The flow is not in any socket table, so the scan finds no owner. Even though the
+      // cache knows a pid and its uid, the answer must stay Unknown: the cache carries
+      // identity, never ownership.
+      let mut cache = ProcessCache::new();
+      cache.insert(
+         4,
+         CachedIdentity {
+            exe: Some(PathBuf::from("/usr/bin/curl")),
+            comm: "curl".to_owned(),
+            uid: own_uid(),
+            starttime: 1,
+         },
+      );
+      let shared = Arc::new(Mutex::new(cache));
+      let mut attributor = Attributor::with_process_cache(Arc::clone(&shared));
+      let attribution = attributor.attribute(
+         v4([127, 0, 0, 1], 1),
+         v4([192, 0, 2, 1], 65_000),
+         L4Proto::Tcp,
+         Some(own_uid()),
+      );
+      assert_eq!(attribution, Attribution::Unknown);
+      assert_eq!(attributor.stats().hits, 0);
+      assert_eq!(attributor.stats().misses, 1);
+      assert_eq!(
+         shared.lock().expect("process cache").len(),
+         1,
+         "a lookup must not rewrite the identity cache with an ownership answer"
+      );
+   }
+
+   #[test]
+   fn a_cache_hit_with_a_disagreeing_uid_is_dropped_not_laundered() {
+      // A pid belongs to uid 7; the packet claims uid 1000. The cached identity must not
+      // be returned, because the descriptor scan's uid agreement check would then pass on
+      // an identity that belongs to someone else.
+      let pid = 999_999;
+      let mut cache = ProcessCache::new();
+      cache.insert(
+         pid,
+         CachedIdentity {
+            exe: Some(PathBuf::from("/usr/bin/curl")),
+            comm: "curl".to_owned(),
+            uid: own_uid().wrapping_add(1),
+            starttime: 1,
+         },
+      );
+      let shared = Arc::new(Mutex::new(cache));
+      let mut attributor = Attributor::with_process_cache(Arc::clone(&shared));
+      let resolved = attributor.process_identity(pid, own_uid());
+      assert!(
+         resolved.is_none(),
+         "a recycled pid must not reuse the old identity: {resolved:?}"
+      );
+      assert_eq!(
+         shared.lock().expect("process cache").len(),
+         0,
+         "the stale identity is dropped"
       );
    }
 }

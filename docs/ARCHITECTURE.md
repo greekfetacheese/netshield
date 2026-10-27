@@ -280,6 +280,10 @@ Consequences worth stating plainly:
 6. Duplicate flows while a prompt is open (same app, same destination) join the open
    prompt instead of stacking new windows; the alert shows "n pending" and the decisions
    apply together.
+7. A decision that creates a rule is applied retroactively to the prompts still queued,
+   because a browser can queue dozens of flows before the first answer; queued prompts a
+   rule now covers are verdicted and never shown. The prompt being answered is never swept,
+   and a queued prompt a rule does not cover keeps waiting without a deadline.
 
 The alert is modelled on Little Snitch's connection alert: app icon and name, "wants to
 connect to *host*", a duration selector, a scope radio group ("Any connection" / "Only
