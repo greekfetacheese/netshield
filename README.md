@@ -49,6 +49,11 @@ and delete the `inet netshield` nftables table.
 - Domain learning depends on plaintext DNS, so clients using DoH/DoT show an address
   rather than a name.
 
+## Debugging
+
+See [docs/DEBUGGING.md](docs/DEBUGGING.md) for the runbook and [dev/](dev/README.md) for the
+non-root harnesses it uses.
+
 ## Requirements
 
 Linux with nftables (kernel ≥ 5.10 realistic, developed against 7.0), Rust ≥ 1.90 to
