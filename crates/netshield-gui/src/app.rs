@@ -1,6 +1,6 @@
 //! The application shell: navigation, the daemon poll and the current page.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,9 +46,13 @@ pub struct App {
    /// Wall-clock deadline per prompt id, derived from `timeout_secs` on arrival. The
    /// daemon enforces the timeout; this clock only drives the countdown.
    prompt_deadlines: HashMap<u64, Instant>,
-   /// Last prompt the `--alert` root window was shown for, so the show/focus commands
+   /// Last prompt whose window was raised, in both display modes, so the raise commands
    /// are sent once per prompt rather than every frame.
    last_alert_id: Option<u64>,
+   /// Prompts whose floating alert has already been focused and levelled from inside its
+   /// own viewport. Kept on `App` rather than in the closure because the immediate-viewport
+   /// closure can run more than once per prompt.
+   raised_alerts: HashSet<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
    /// Synthetic prompt and connection stream; always present in `--mock`.
@@ -112,6 +116,7 @@ impl App {
          alerts: HashMap::new(),
          prompt_deadlines: HashMap::new(),
          last_alert_id: None,
+         raised_alerts: HashSet::new(),
          alert_hidden: false,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
@@ -201,6 +206,17 @@ impl App {
       self.pending.retain(|queued| queued.id != id);
       self.alerts.remove(&id);
       self.prompt_deadlines.remove(&id);
+      self.raised_alerts.remove(&id);
+   }
+
+   /// Reports whether this prompt's alert still needs raising, recording it as raised.
+   ///
+   /// The floating alert's viewport only exists inside its own closure, so the focus and
+   /// level commands must be sent from there -- and exactly once, because a repeated
+   /// `Focus` steals the keyboard continuously. The set lives on `App` because the
+   /// immediate-viewport closure can run more than once per frame.
+   fn raise_alert_once(&mut self, prompt_id: u64) -> bool {
+      self.raised_alerts.insert(prompt_id)
    }
 
    /// Sends one decision (or, in `--mock`, only logs it) and closes the prompt locally.
@@ -230,15 +246,26 @@ impl App {
       })
    }
 
-   /// Shows the root window for a new prompt, or hides it once the queue is empty.
+   /// Raises the alert for a newly active prompt, or hides the `--alert` root when the
+   /// queue drains.
    ///
    /// This runs in `App::logic` because a hidden eframe window still ticks logic but runs
    /// no `ui` pass; the show command must therefore be sent from the logic side or a new
-   /// prompt would keep the window hidden forever. Commands are sent once per prompt id,
-   /// not every frame.
+   /// prompt would keep the window hidden forever. Everything is guarded by `last_alert_id`:
+   /// sent once per prompt, never every frame, because a repeated `Focus` steals the
+   /// keyboard continuously while a prompt is open.
+   ///
+   /// Follows Zeus' `GUI::bring_to_front`: unhide and unminimise the root window, then ask
+   /// the window manager for critical attention. In floating-alert mode the alert has its
+   /// own viewport, which does not exist yet at this point in the frame; that one is
+   /// levelled from inside its own closure instead, and activates itself when created (see
+   /// `floating_alert`), so nothing is sent to it here. Answering a prompt is unchanged; this
+   /// only raises it.
    fn alert_viewport(&mut self, ctx: &egui::Context) {
       let Some(first) = self.pending.first() else {
-         if !self.alert_hidden {
+         // In normal mode the floating alert simply stops being shown; hiding the root
+         // there would hide the main window.
+         if self.alert && !self.alert_hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.alert_hidden = true;
             self.last_alert_id = None;
@@ -246,19 +273,44 @@ impl App {
          return;
       };
 
-      if self.last_alert_id != Some(first.id) {
+      if self.last_alert_id == Some(first.id) {
+         return;
+      }
+
+      if self.alert {
+         // The root window *is* the alert, so it also takes the alert's own size and level.
          ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             alert::WIDTH,
             alert::HEIGHT,
          )));
-         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            egui::WindowLevel::AlwaysOnTop,
-         ));
-         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-         self.last_alert_id = Some(first.id);
-         self.alert_hidden = false;
       }
+
+      let root = egui::ViewportId::ROOT;
+      ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Minimized(false));
+      ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Visible(true));
+      if self.alert {
+         // The root window *is* the alert here, so it is the one that must take focus.
+         ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Focus);
+      }
+      // In floating mode the alert owns its own viewport and is the only window the user
+      // types into; focusing the root there is what kept the alert behind the main window,
+      // because the root's request is the one that lands. The alert is activated when its
+      // viewport is created instead. Un-minimising the root is still needed so the alert is
+      // not owned by a minimised parent. Do not re-add a root `Focus` as a fallback.
+      ctx.send_viewport_cmd_to(
+         root,
+         egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
+      );
+
+      if self.alert {
+         ctx.send_viewport_cmd_to(
+            root,
+            egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+         );
+      }
+
+      self.last_alert_id = Some(first.id);
+      self.alert_hidden = false;
    }
 
    /// Draws the oldest prompt into the root window.
@@ -291,19 +343,31 @@ impl App {
          .with_inner_size([alert::WIDTH, alert::HEIGHT])
          .with_resizable(false)
          .with_always_on_top()
+         // Activation is a creation-time request: `ViewportCommand::Focus` sent to an
+         // immediate viewport is ignored by the window manager, so ask for it here instead.
+         .with_active(true)
          .with_visible(true);
 
-      let decision = ctx.show_viewport_immediate(
-         egui::ViewportId::from_hash_of(("alert", prompt.id)),
-         builder,
-         |ctx, _| {
+      let decision =
+         ctx.show_viewport_immediate(alert_viewport_id(prompt.id), builder, |ctx, _| {
+            // This `ctx` is the alert viewport's own context, the only one valid here: the
+            // viewport does not exist before this call. Raise it on its first frame only.
+            // Activation is not commanded here: `ViewportCommand::Focus` is ignored for an
+            // immediate viewport, so the builder's `with_active(true)` requests it at creation.
+            if self.raise_alert_once(prompt.id) {
+               ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                  egui::WindowLevel::AlwaysOnTop,
+               ));
+               ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                  egui::UserAttentionType::Critical,
+               ));
+            }
             let mut decision = None;
             egui::CentralPanel::default().show(ctx, |ui| {
                decision = alert::ui(ui, &prompt, &mut state, remaining);
             });
             decision
-         },
-      );
+         });
 
       self.alerts.insert(prompt.id, state);
       if let Some(decision) = decision {
@@ -406,9 +470,7 @@ impl eframe::App for App {
    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
       self.update();
       ctx.request_repaint_after(POLL_EVERY);
-      if self.alert {
-         self.alert_viewport(ctx);
-      }
+      self.alert_viewport(ctx);
    }
 
    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -438,6 +500,14 @@ impl eframe::App for App {
          self.page_content(ui);
       });
    }
+}
+
+/// The viewport id the floating alert for `prompt_id` is shown in.
+///
+/// One id per prompt, shared by the `show_viewport_immediate` call and the raise commands,
+/// so the alert's own window is focused rather than a stale one for a previous prompt.
+fn alert_viewport_id(prompt_id: u64) -> egui::ViewportId {
+   egui::ViewportId::from_hash_of(("alert", prompt_id))
 }
 
 /// Seconds since the unix epoch; the UI clock, never used for enforcement.
@@ -516,5 +586,25 @@ mod tests {
       app.enqueue_prompt(prompt(1));
       app.remove_prompt(99);
       assert_eq!(app.pending.len(), 1);
+   }
+
+   #[test]
+   fn a_prompt_is_raised_once_until_it_is_answered() {
+      let mut app = app();
+      app.enqueue_prompt(prompt(1));
+      app.enqueue_prompt(prompt(2));
+
+      // The immediate-viewport closure may run more than once for one prompt; the second
+      // call must not send another `Focus`, which would steal the keyboard every frame.
+      assert!(app.raise_alert_once(1));
+      assert!(!app.raise_alert_once(1));
+      assert!(!app.raised_alerts.contains(&2));
+
+      // Answering drops the bookkeeping, so a reused id is raised again.
+      app.remove_prompt(1);
+      assert!(!app.raised_alerts.contains(&1));
+      app.enqueue_prompt(prompt(1));
+      assert!(app.raise_alert_once(1));
+      assert!(!app.raise_alert_once(1));
    }
 }

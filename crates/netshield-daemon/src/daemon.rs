@@ -42,7 +42,7 @@ use netshield_core::{DestMatcher, ScopeRequest, rule_from_scope};
 use crate::firewall::{self, FirewallError};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
-use crate::pending::PendingPrompts;
+use crate::pending::{PendingPrompts, PromptRecord};
 use crate::policy::{Decision, Policy};
 use crate::proc::Attributor;
 use crate::store::{RuleStore, StoreError};
@@ -495,13 +495,16 @@ impl Daemon {
 
    /// Answers one prompt.
    fn decide(&mut self, _client: u64, decide: DecideRequest) {
-      let Some(record) = self.pending.resolve(decide.prompt_id) else {
-         debug!(
-            "decision for prompt {} which is no longer open",
+      let Some(resolved) = self.pending.resolve(decide.prompt_id, Instant::now()) else {
+         // A GUI click can arrive after the prompt expired; the user believes a rule was
+         // created, so the discarded choice must be visible at the operator's log level.
+         warn!(
+            "prompt {} is no longer open; discarding the decision and creating no rule",
             decide.prompt_id
          );
          return;
       };
+      let record = resolved.record;
 
       let verdict = match decide.action {
          Action::Allow => Verdict::Accept,
@@ -547,7 +550,49 @@ impl Daemon {
          resolution,
       });
       self.broadcast_connection(&record.connection, decide.action, None, true);
+      if let Some(next) = resolved.activated {
+         self.announce_prompt(&next);
+      }
       self.publish_status();
+   }
+
+   /// Makes an activated prompt visible: broadcasts it with the number of prompts still
+   /// queued behind it, and repeats the timeout warning when no client is attached.
+   fn announce_prompt(&mut self, record: &PromptRecord) {
+      let timeout_secs = self.config.prompt_timeout_secs;
+      let pending = self.pending.queued_behind(record.id);
+      self.ipc.broadcast(&Response::Prompt(PromptRequest {
+         id: record.id,
+         connection: self.view(&record.connection),
+         timeout_secs,
+         domain_scope_available: record.connection.domain.is_some(),
+         pending,
+      }));
+      info!(
+         "prompt {} for {} -> {}:{} ({} packet(s) held, {} queued)",
+         record.id,
+         record.connection.app_name(),
+         record.connection.remote.addr,
+         record.connection.remote.port,
+         record.packet_ids.len(),
+         pending
+      );
+
+      if !self.ipc.is_subscribed() {
+         let dest = format!(
+            "{}:{}",
+            record.connection.remote.addr, record.connection.remote.port
+         );
+         warn!(
+            "{}",
+            missing_client_warning(
+               record.id,
+               &record.connection.app_name(),
+               &dest,
+               timeout_secs,
+            )
+         );
+      }
    }
 
    /// Answers every packet id of a prompt in one pass.
@@ -669,40 +714,27 @@ impl Daemon {
          timeout,
          Instant::now(),
       );
-      let timeout_secs = self.config.prompt_timeout_secs;
-      let view = self.view(connection);
-      self.ipc.broadcast(&Response::Prompt(PromptRequest {
-         id,
-         connection: view,
-         timeout_secs,
-         domain_scope_available: connection.domain.is_some(),
-         pending: self.pending.len().saturating_sub(1),
-      }));
-      info!(
-         "prompt {id} for {} -> {}:{} ({} packet(s) held)",
-         connection.app_name(),
-         connection.remote.addr,
-         connection.remote.port,
-         self.pending.len()
-      );
-
-      if !self.ipc.is_subscribed() {
-         let dest = format!(
-            "{}:{}",
-            connection.remote.addr, connection.remote.port
-         );
-         warn!(
-            "{}",
-            missing_client_warning(id, &connection.app_name(), &dest, timeout_secs,)
+      // Only the head is on screen; a prompt queued behind it waits without a deadline and
+      // is broadcast when it is activated, so it gets its full timeout while visible.
+      if self.pending.is_active(id) {
+         let record = self.pending.get(id).expect("just opened").clone();
+         self.announce_prompt(&record);
+      } else {
+         debug!(
+            "prompt {id} for {} -> {}:{} queued behind an open prompt",
+            connection.app_name(),
+            connection.remote.addr,
+            connection.remote.port
          );
       }
       self.publish_status();
    }
 
-   /// Times out expired prompts, expires grants and prunes the DNS cache.
+   /// Times out the active prompt, expires grants and prunes the DNS cache.
    fn sweep(&mut self, now: Instant) {
       let expired = self.pending.expired(now);
-      for record in &expired {
+      if let Some(resolved) = expired {
+         let record = resolved.record;
          if let Err(err) = self.answer_packets(&record.packet_ids, Verdict::Drop) {
             warn!(
                "could not deny prompt {}'s packets: {err}",
@@ -723,6 +755,10 @@ impl Daemon {
             resolution: Resolution::TimedOut,
          });
          self.broadcast_connection(&record.connection, Action::Deny, None, true);
+         if let Some(next) = resolved.activated {
+            self.announce_prompt(&next);
+         }
+         self.publish_status();
       }
 
       let epoch = now_secs();
@@ -731,10 +767,6 @@ impl Daemon {
          debug!("expired {removed} flow grant(s)");
       }
       self.dns_cache.lock().expect("dns cache").expire(epoch);
-
-      if !expired.is_empty() {
-         self.publish_status();
-      }
    }
 
    /// Builds the [`Connection`] for a parsed packet, or `None` when the transport has no
