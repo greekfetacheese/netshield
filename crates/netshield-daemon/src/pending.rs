@@ -8,10 +8,15 @@
 //! packet id of its flow (ARCHITECTURE §8), and a duplicate attempt from the same app to
 //! the same destination joins the open prompt instead of stacking a second alert.
 //!
+//! Prompts form a FIFO with exactly one active head: only the head has a deadline and is
+//! broadcast to the clients, so every prompt gets the full timeout once it is visible
+//! instead of spending that time queued behind the others. Resolving or expiring the head
+//! activates the next prompt with a deadline counted from that moment.
+//!
 //! The module takes `Instant` and `Duration` at every entry point, so deadlines are
 //! unit-testable without sleeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use netshield_core::connection::{Connection, FlowKey};
@@ -23,14 +28,27 @@ pub struct PromptRecord {
    pub connection: Connection,
    /// Every packet id belonging to this flow, in arrival order.
    pub packet_ids: Vec<u32>,
-   pub deadline: Instant,
+   /// When the prompt expires; `None` while it is queued behind the active head.
+   pub deadline: Option<Instant>,
+   /// The timeout this prompt was opened with, applied when it becomes the head.
+   timeout: Duration,
 }
 
-/// Open prompts, keyed by id, plus the flow index that de-duplicates them.
+/// The prompt that left the set, plus the queued prompt activated in its place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolved {
+   pub record: PromptRecord,
+   /// The new head when `record` was the head, already carrying its deadline.
+   pub activated: Option<PromptRecord>,
+}
+
+/// Open prompts in arrival order, keyed by id, plus the flow index that de-duplicates them.
 #[derive(Debug, Default)]
 pub struct PendingPrompts {
    by_id: HashMap<u64, PromptRecord>,
    by_flow: HashMap<FlowKey, u64>,
+   /// Prompt ids in arrival order; the front is the active head.
+   queue: VecDeque<u64>,
    next_id: u64,
 }
 
@@ -40,15 +58,17 @@ impl PendingPrompts {
       Self {
          by_id: HashMap::new(),
          by_flow: HashMap::new(),
+         queue: VecDeque::new(),
          next_id: 1,
       }
    }
 
    /// Opens a prompt for `connection`, owning `first_packet`, and returns its id.
    ///
-   /// A prompt already open for the flow is extended rather than duplicated: the caller
-   /// checks [`PendingPrompts::attach`] first, but calling `open` twice must not create two
-   /// windows for one connection attempt.
+   /// Only a prompt that becomes the head is given a deadline; one queued behind it waits
+   /// without a clock until it is activated. A prompt already open for the flow is
+   /// extended rather than duplicated: the caller checks [`PendingPrompts::attach`] first,
+   /// but calling `open` twice must not create two windows for one connection attempt.
    pub fn open(
       &mut self,
       connection: Connection,
@@ -64,14 +84,21 @@ impl PendingPrompts {
 
       let id = self.next_id;
       self.next_id += 1;
+      let deadline = if self.queue.is_empty() {
+         Some(now.checked_add(timeout).unwrap_or(now))
+      } else {
+         None
+      };
       let record = PromptRecord {
          id,
          connection,
          packet_ids: vec![first_packet],
-         deadline: now.checked_add(timeout).unwrap_or(now),
+         deadline,
+         timeout,
       };
       self.by_id.insert(id, record);
       self.by_flow.insert(flow, id);
+      self.queue.push_back(id);
       id
    }
 
@@ -92,31 +119,69 @@ impl PendingPrompts {
    /// Removes and returns the prompt with `id`.
    ///
    /// `None` means it was already answered, timed out or never existed; the caller must not
-   /// answer its packet ids a second time.
-   pub fn resolve(&mut self, id: u64) -> Option<PromptRecord> {
+   /// answer its packet ids a second time. Removing the head activates the next queued
+   /// prompt with a deadline counted from `now`, not from that prompt's arrival.
+   pub fn resolve(&mut self, id: u64, now: Instant) -> Option<Resolved> {
+      let was_head = self.queue.front() == Some(&id);
       let record = self.by_id.remove(&id)?;
       self.by_flow.remove(&record.connection.flow_key());
-      Some(record)
+      if was_head {
+         self.queue.pop_front();
+      } else if let Some(position) = self.queue.iter().position(|queued| *queued == id) {
+         self.queue.remove(position);
+      }
+      let activated = if was_head { self.activate(now) } else { None };
+      Some(Resolved { record, activated })
+   }
+
+   /// Gives the queued head its deadline and returns a snapshot of it.
+   fn activate(&mut self, now: Instant) -> Option<PromptRecord> {
+      let id = *self.queue.front()?;
+      let record = self.by_id.get_mut(&id)?;
+      record.deadline = Some(now.checked_add(record.timeout).unwrap_or(now));
+      Some(record.clone())
    }
 
    /// Removes and returns every open prompt, for a mode switch that answers them all.
    pub fn take_all(&mut self) -> Vec<PromptRecord> {
       self.by_flow.clear();
+      self.queue.clear();
       std::mem::take(&mut self.by_id).into_values().collect()
    }
 
-   /// Removes and returns every prompt whose deadline has passed.
-   pub fn expired(&mut self, now: Instant) -> Vec<PromptRecord> {
-      let ids: Vec<u64> = self
-         .by_id
-         .values()
-         .filter(|record| record.deadline <= now)
-         .map(|record| record.id)
-         .collect();
-      ids.into_iter().filter_map(|id| self.resolve(id)).collect()
+   /// Removes and returns the active prompt when its deadline has passed.
+   ///
+   /// Queued prompts have no deadline and can never expire here, however much time passes.
+   /// The newly activated head carries a deadline counted from `now`.
+   pub fn expired(&mut self, now: Instant) -> Option<Resolved> {
+      let id = *self.queue.front()?;
+      if self.by_id.get(&id)?.deadline? > now {
+         return None;
+      }
+      self.resolve(id, now)
    }
 
-   /// Number of open prompts.
+   /// The prompt with `id`, if it is still open.
+   pub fn get(&self, id: u64) -> Option<&PromptRecord> {
+      self.by_id.get(&id)
+   }
+
+   /// Whether `id` is the active head, and therefore the prompt the clients can see.
+   pub fn is_active(&self, id: u64) -> bool {
+      self.queue.front() == Some(&id)
+   }
+
+   /// How many prompts are waiting behind `id`, which is what its broadcast reports as
+   /// `pending`; `0` when `id` is unknown or last.
+   pub fn queued_behind(&self, id: u64) -> usize {
+      self
+         .queue
+         .iter()
+         .position(|queued| *queued == id)
+         .map_or(0, |at| self.queue.len() - at - 1)
+   }
+
+   /// Number of open prompts, resolved or not: the active head plus everything queued.
    pub fn len(&self) -> usize {
       self.by_id.len()
    }
@@ -159,6 +224,24 @@ mod tests {
 
    const TIMEOUT: Duration = Duration::from_secs(30);
 
+   /// Opens three prompts one second apart and returns their ids.
+   fn open_three(pending: &mut PendingPrompts, start: Instant) -> (u64, u64, u64) {
+      let first = pending.open(conn(443), 10, TIMEOUT, start);
+      let second = pending.open(
+         conn(8443),
+         20,
+         TIMEOUT,
+         start + Duration::from_secs(1),
+      );
+      let third = pending.open(
+         conn(9443),
+         30,
+         TIMEOUT,
+         start + Duration::from_secs(2),
+      );
+      (first, second, third)
+   }
+
    #[test]
    fn attach_twice_then_resolve_returns_all_three_ids() {
       let mut pending = PendingPrompts::new();
@@ -170,10 +253,15 @@ mod tests {
       assert_eq!(pending.attach(&flow, 11), Some(id));
       assert_eq!(pending.attach(&flow, 12), Some(id));
 
-      let record = pending.resolve(id).expect("still open");
+      let resolved = pending.resolve(id, start).expect("still open");
+      let record = resolved.record;
       assert_eq!(record.packet_ids, vec![10, 11, 12]);
       assert_eq!(record.connection, connection);
-      assert_eq!(record.deadline, start + TIMEOUT);
+      assert_eq!(record.deadline, Some(start + TIMEOUT));
+      assert_eq!(
+         resolved.activated, None,
+         "nothing was queued behind it"
+      );
       assert_eq!(pending.len(), 0);
    }
 
@@ -188,7 +276,7 @@ mod tests {
       pending.attach(&flow, 11);
       pending.attach(&flow, 11);
 
-      let record = pending.resolve(id).expect("still open");
+      let record = pending.resolve(id, Instant::now()).expect("still open").record;
       assert_eq!(record.packet_ids, vec![10, 11]);
    }
 
@@ -206,11 +294,14 @@ mod tests {
 
       assert_eq!(first, second, "one prompt per flow");
       assert_eq!(pending.len(), 1);
-      let record = pending.resolve(first).expect("still open");
+      let record = pending
+         .resolve(first, start + Duration::from_secs(5))
+         .expect("still open")
+         .record;
       assert_eq!(record.packet_ids, vec![10, 11]);
       assert_eq!(
          record.deadline,
-         start + TIMEOUT,
+         Some(start + TIMEOUT),
          "the first deadline stands"
       );
    }
@@ -241,33 +332,226 @@ mod tests {
    }
 
    #[test]
-   fn expired_returns_only_prompts_past_their_deadline() {
+   fn opening_three_prompts_activates_only_the_first() {
       let mut pending = PendingPrompts::new();
       let start = Instant::now();
-      let short = pending.open(conn(443), 10, Duration::from_secs(5), start);
-      let long = pending.open(conn(8443), 20, TIMEOUT, start);
+      let (first, second, third) = open_three(&mut pending, start);
 
-      assert!(pending.expired(start + Duration::from_secs(4)).is_empty());
-      let due = pending.expired(start + Duration::from_secs(5));
-      assert_eq!(due.len(), 1);
-      assert_eq!(due[0].id, short);
-      assert_eq!(due[0].packet_ids, vec![10]);
+      assert!(
+         pending.is_active(first),
+         "the first prompt is the head"
+      );
+      assert!(!pending.is_active(second));
+      assert!(!pending.is_active(third));
+      assert_eq!(pending.len(), 3);
+      assert_eq!(
+         pending.get(first).expect("open").deadline,
+         Some(start + TIMEOUT),
+         "only the head carries a deadline"
+      );
+      assert_eq!(pending.get(second).expect("open").deadline, None);
+      assert_eq!(pending.get(third).expect("open").deadline, None);
+   }
 
-      assert_eq!(pending.len(), 1);
-      let due = pending.expired(start + TIMEOUT);
-      assert_eq!(due.len(), 1);
-      assert_eq!(due[0].id, long);
-      assert!(pending.is_empty());
+   #[test]
+   fn queued_prompts_never_expire_while_the_head_is_open() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      assert!(pending.expired(start + TIMEOUT - Duration::from_millis(1)).is_none());
+      assert_eq!(
+         pending.get(second).expect("open").deadline,
+         None,
+         "the second prompt still has no clock"
+      );
+      assert_eq!(pending.get(third).expect("open").deadline, None);
+
+      // Time running far past every arrival changes nothing for the queued prompts: only
+      // the head's own deadline can expire a prompt.
+      let far_future = start + Duration::from_secs(3_600);
+      let expired = pending.expired(far_future).expect("the head is overdue");
+      assert_eq!(expired.record.id, first);
+      assert_eq!(
+         expired.activated.as_ref().map(|record| record.id),
+         Some(second)
+      );
+      assert_eq!(pending.len(), 2);
+      assert_eq!(
+         pending.get(third).expect("open").deadline,
+         None,
+         "the third prompt did not expire with the head"
+      );
+      assert!(
+         pending.expired(far_future).is_none(),
+         "the newly activated head is not overdue yet"
+      );
+   }
+
+   #[test]
+   fn resolving_the_head_activates_the_next_from_the_resolution_moment() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      let resolved_at = start + Duration::from_secs(5);
+      let resolved = pending.resolve(first, resolved_at).expect("head is open");
+
+      let activated = resolved.activated.expect("the second prompt became active");
+      assert_eq!(activated.id, second);
+      assert_eq!(
+         activated.deadline,
+         Some(resolved_at + TIMEOUT),
+         "the deadline starts at activation, not at arrival"
+      );
+      assert!(pending.is_active(second));
+      assert_eq!(pending.get(third).expect("open").deadline, None);
+   }
+
+   #[test]
+   fn expiring_the_head_activates_the_next_from_the_expiry_moment() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      let expired_at = start + TIMEOUT;
+      let expired = pending.expired(expired_at).expect("the head is due");
+      assert_eq!(expired.record.id, first);
+
+      let activated = expired.activated.expect("the second prompt became active");
+      assert_eq!(activated.id, second);
+      assert_eq!(
+         activated.deadline,
+         Some(expired_at + TIMEOUT),
+         "the queued prompt gets its full timeout from activation"
+      );
+      assert!(pending.is_active(second));
+      assert_eq!(pending.get(third).expect("open").deadline, None);
+   }
+
+   #[test]
+   fn the_count_broadcast_with_each_head_falls_from_two_to_zero() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+      assert_eq!(
+         pending.queued_behind(first),
+         2,
+         "the first head reports two queued behind it"
+      );
+
+      let answered_at = start + Duration::from_secs(5);
+      let resolved = pending.resolve(first, answered_at).expect("head is open");
+      assert_eq!(
+         resolved.activated.as_ref().map(|record| record.id),
+         Some(second)
+      );
+      assert_eq!(
+         pending.queued_behind(second),
+         1,
+         "the second head reports one queued behind it"
+      );
+
+      // The second prompt gets a full timeout from its activation, then the third is the
+      // only prompt left and is broadcast with nothing behind it.
+      assert!(pending.expired(answered_at + TIMEOUT - Duration::from_millis(1)).is_none());
+      let expired = pending.expired(answered_at + TIMEOUT).expect("the head is due");
+      assert_eq!(expired.record.id, second);
+      assert_eq!(
+         expired.activated.as_ref().map(|record| record.id),
+         Some(third)
+      );
+      assert_eq!(pending.queued_behind(third), 0);
+   }
+
+   #[test]
+   fn a_packet_joining_the_head_does_not_change_the_queue_or_any_deadline() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+      let head_deadline = pending.get(first).expect("open").deadline;
+
+      assert_eq!(
+         pending.attach(&conn(443).flow_key(), 11),
+         Some(first)
+      );
+      assert_eq!(
+         pending.get(first).expect("open").deadline,
+         head_deadline,
+         "a retransmission does not move the head's deadline"
+      );
+      assert_eq!(pending.get(second).expect("open").deadline, None);
+      assert_eq!(pending.get(third).expect("open").deadline, None);
+      assert!(pending.is_active(first));
+      assert_eq!(pending.len(), 3);
+      assert_eq!(pending.queued_behind(first), 2);
+
+      let resolved = pending.resolve(first, start + Duration::from_secs(5));
+      assert_eq!(
+         resolved.expect("head is open").activated.map(|record| record.id),
+         Some(second),
+         "the queue order is unchanged"
+      );
+   }
+
+   #[test]
+   fn a_packet_joining_a_queued_prompt_attaches_to_it_not_to_the_head() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      assert_eq!(
+         pending.attach(&conn(8443).flow_key(), 21),
+         Some(second),
+         "the queued prompt owns the packet"
+      );
+      assert_eq!(
+         pending.get(second).expect("open").packet_ids,
+         vec![20, 21]
+      );
+      assert_eq!(
+         pending.get(first).expect("open").packet_ids,
+         vec![10],
+         "the head did not absorb the queued prompt's packet"
+      );
+      assert_eq!(
+         pending.get(third).expect("open").packet_ids,
+         vec![30]
+      );
+      assert!(pending.is_active(first));
+      assert_eq!(pending.get(second).expect("open").deadline, None);
+   }
+
+   #[test]
+   fn resolving_a_queued_prompt_leaves_the_head_active() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, _third) = open_three(&mut pending, start);
+
+      let resolved = pending
+         .resolve(second, start + Duration::from_secs(5))
+         .expect("queued prompt is open");
+      assert_eq!(
+         resolved.activated, None,
+         "the head was not removed"
+      );
+      assert!(pending.is_active(first));
+      assert_eq!(pending.len(), 2);
+      assert_eq!(
+         pending.get(first).expect("open").deadline,
+         Some(start + TIMEOUT)
+      );
    }
 
    #[test]
    fn resolving_a_taken_prompt_returns_none() {
       let mut pending = PendingPrompts::new();
       let flow = conn(443).flow_key();
-      let id = pending.open(conn(443), 10, TIMEOUT, Instant::now());
-      assert!(pending.resolve(id).is_some());
+      let now = Instant::now();
+      let id = pending.open(conn(443), 10, TIMEOUT, now);
+      assert!(pending.resolve(id, now).is_some());
 
-      assert_eq!(pending.resolve(id), None, "already answered");
+      assert_eq!(pending.resolve(id, now), None, "already answered");
       assert_eq!(
          pending.attach(&flow, 11),
          None,
@@ -297,7 +581,7 @@ mod tests {
       let mut pending = PendingPrompts::new();
       let start = Instant::now();
       let first = pending.open(conn(443), 1, TIMEOUT, start);
-      pending.resolve(first);
+      pending.resolve(first, start);
       let second = pending.open(conn(443), 2, TIMEOUT, start);
       assert_ne!(first, second);
    }
