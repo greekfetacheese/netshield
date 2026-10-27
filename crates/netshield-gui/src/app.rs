@@ -12,6 +12,7 @@ use netshield_core::rule::Rule;
 
 use crate::alert::{self, AlertModel, AlertState, Decision};
 use crate::mock::{Mock, MockEvent};
+use crate::tray::{self, Action, Tray};
 use crate::ui;
 use crate::{
    Cli,
@@ -112,6 +113,19 @@ pub struct App {
    /// Set when a mutation went out; the next update rewrites the rule list instead of
    /// waiting up to `REFRESH_EVERY` for the periodic tick.
    refresh_rules: bool,
+   /// The system tray, owned for the app's lifetime. `None` in `--alert` mode, which is a
+   /// bare prompt window, and when the desktop has no StatusNotifier host.
+   tray: Option<Tray>,
+   /// Whether building the tray has been attempted. `App::new` runs before eframe hands
+   /// the app a `Context`, so the tray is built on the first `logic` pass; this flag keeps
+   /// a host-less machine from retrying every frame.
+   tray_tried: bool,
+   /// Whether this app hid the window to the tray. `ViewportCommand::Visible` is not
+   /// echoed back into `ViewportInfo`, so this flag is the single source of truth.
+   hidden_to_tray: bool,
+   /// Set when the tray asked to quit, so the close path below lets the close through
+   /// instead of turning it into another hide.
+   allow_close: bool,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +233,61 @@ impl App {
          connections_selection: ui::connections::Selection::default(),
          editor: ui::rules::Editor::default(),
          refresh_rules: false,
+         tray: None,
+         tray_tried: false,
+         hidden_to_tray: false,
+         allow_close: false,
+      }
+   }
+
+   /// Builds the tray once, on the first pass, and applies whatever it has queued.
+   ///
+   /// This has to run in `logic`, not `ui`: eframe runs no egui pass while the window is
+   /// hidden and calls `logic` instead, which is exactly the state the tray leaves the
+   /// window in. A desktop without a StatusNotifier host builds no tray and keeps the
+   /// window's normal close-with-no-tray behaviour.
+   ///
+   /// `--alert` mode is a bare prompt window: no tray, and its close is not intercepted.
+   fn handle_tray(&mut self, ctx: &egui::Context) {
+      if self.alert {
+         return;
+      }
+      if self.tray.is_none() && !self.tray_tried {
+         self.tray_tried = true;
+         self.tray = Tray::new(ctx);
+      }
+
+      let Some(tray) = self.tray.as_mut() else {
+         return;
+      };
+      for action in tray.drain() {
+         match action {
+            Action::Show => {
+               self.hidden_to_tray = false;
+               tray::show_window(ctx);
+            }
+            Action::OpenRules => {
+               self.page = Page::Rules;
+               self.hidden_to_tray = false;
+               tray::show_window(ctx);
+            }
+            Action::Quit => {
+               // The same close the window's button would send; `allow_close` keeps the
+               // close path below from hiding the window it is trying to exit.
+               self.allow_close = true;
+               log::info!("quit requested from the tray");
+               ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+         }
+      }
+
+      // The close button hides to the tray only when there is one; without a tray the
+      // close must go through, or the process would be left running with no way back.
+      if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+         self.hidden_to_tray = true;
+         tray::hide_window(ctx);
+         log::info!("window closed to tray");
       }
    }
 
@@ -719,6 +788,7 @@ impl eframe::App for App {
       }
       self.alert_viewport(ctx);
       self.alert_window(ctx);
+      self.handle_tray(ctx);
    }
 
    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
