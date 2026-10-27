@@ -143,27 +143,28 @@ fn primary_gid(uid: u32) -> Option<u32> {
    })
 }
 
-/// Hands the socket to `allowed_uid` and its primary group, then applies the mode.
+/// Sets the socket's mode, then hands it to `allowed_uid` and its primary group.
 ///
-/// The mode is set after the chown because `chown` clears the set-id bits; doing it in
-/// this order means a later ownership change can never relax the access bits. A missing
-/// passwd entry leaves the socket `root:root`, which the GUI cannot open, so it is
-/// logged rather than guessed at.
+/// The mode comes first, while the file is still owned by root and no extra capability
+/// is needed. "chmod after chown" is the intuitive order and the wrong one here: once
+/// the socket belongs to the GUI user, changing its mode needs `CAP_FOWNER`, which the
+/// hardened unit does not grant. `chown` only clears the set-id bits and we never set
+/// them, so the mode survives the ownership change. If the chown fails the mode is kept
+/// and the error is returned for the caller to log; a missing passwd entry leaves the
+/// socket `root:root`, which the GUI cannot open, so it is logged rather than guessed at.
 fn apply_socket_ownership(path: &Path, allowed_uid: Option<u32>) -> io::Result<()> {
    let (uid, gid, mode) = socket_ownership(allowed_uid);
-   let mut ownership = Ok(());
+   fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
    if let Some(requested) = allowed_uid {
       if uid == requested {
-         ownership = chown_socket(path, uid, gid);
-      } else {
-         warn!(
-            "could not look up the primary group of uid {requested}: the control socket \
-             stays root:root and the GUI cannot connect"
-         );
+         return chown_socket(path, uid, gid);
       }
+      warn!(
+         "could not look up the primary group of uid {requested}: the control socket \
+          stays root:root and the GUI cannot connect"
+      );
    }
-   fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-   ownership
+   Ok(())
 }
 
 /// Changes ownership of the socket file at `path` to `uid:gid`.
@@ -806,16 +807,42 @@ mod tests {
       assert_eq!(socket_ownership(None), (0, 0, 0o660));
    }
 
-   // The chown itself is not tested: it needs root and a real user's passwd entry, and
-   // the socket path is a live filesystem object. Only the decision is unit-tested.
+   // The successful chown is not tested: it needs root and a real user's passwd entry,
+   // and the socket path is a live filesystem object. The decision and the failure
+   // ordering are unit-tested below.
    #[test]
    fn socket_ownership_keeps_the_mode_after_a_chown() {
       let (uid, gid, mode) = socket_ownership(Some(0));
       assert_eq!((uid, gid), (0, 0), "root's primary group is 0");
       assert_eq!(
          mode, 0o660,
-         "chown clears set-id bits, so the mode is applied after"
+         "chown clears set-id bits, so the mode is applied before it"
       );
+   }
+
+   #[test]
+   fn a_failed_chown_still_leaves_the_socket_at_the_right_mode() {
+      if our_uid() == Some(0) {
+         return;
+      }
+      let path = temp_socket("chown-failure");
+      fs::write(&path, b"").expect("write a fixture file");
+      fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("start at 0600");
+
+      // Root's passwd entry always resolves, so this reaches the chown; an unprivileged
+      // process cannot give the file away to root, and the failure must not undo the
+      // mode that was applied first. The exact errno depends on the sandbox (`EPERM`
+      // outside it, `EINVAL` under it), so only the failure itself is asserted.
+      let err =
+         apply_socket_ownership(&path, Some(0)).expect_err("chowning to root needs CAP_CHOWN");
+      assert!(err.raw_os_error().is_some(), "{err}");
+      let mode = fs::metadata(&path).expect("fixture metadata").permissions().mode();
+      assert_eq!(
+         mode & 0o777,
+         0o660,
+         "the failed chown must not leave the socket at the umask mode"
+      );
+      let _ = fs::remove_file(&path);
    }
 
    #[test]
