@@ -23,11 +23,26 @@ const LOG_CAPACITY: usize = 500;
 /// How often the GUI asks the daemon for a status snapshot.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
 
-/// How often the UI wakes so the socket queue is drained even when nothing is clicked.
+/// How often the mock demo ticks: its events are generated inside `update`, so it has no
+/// socket thread to wake it and must keep its own clock.
 const POLL_EVERY: Duration = Duration::from_millis(200);
+
+/// How often the main window repaints while a prompt is active or queued.
+///
+/// Belt and braces beside the socket thread's wake: the alert viewport repaints itself, but
+/// registering it happens on the main window's frame path, so a lost wake-up must not be
+/// able to strand a prompt until the user restores the window.
+const PROMPT_REPAINT_EVERY: Duration = Duration::from_millis(500);
 
 /// Red used by the offline banner; loud on purpose.
 const BANNER_RED: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x1F, 0x1F);
+
+/// The slot the socket thread reads to wake the UI.
+///
+/// Empty until the first pass, because `App::new` runs before eframe hands the app a
+/// `Context`. A minimised window gets no input and schedules no frames, so this wake is
+/// what drains the queue and registers the alert viewport while it is iconified.
+type UiWaker = Arc<Mutex<Option<egui::Context>>>;
 
 /// Top-level application state.
 pub struct App {
@@ -61,6 +76,8 @@ pub struct App {
    last_alert_id: Option<u64>,
    /// Whether the `--alert` root window has been asked to hide already.
    alert_hidden: bool,
+   /// Shared with the socket thread, which wakes the UI after every event it queues.
+   ui_waker: UiWaker,
    /// Synthetic prompt and connection stream; always present in `--mock`.
    mock_stream: Mock,
    mode: Mode,
@@ -100,10 +117,19 @@ impl Page {
 impl App {
    /// Builds the app and, outside mock mode, starts talking to the daemon.
    pub fn new(cli: Cli) -> Self {
+      let ui_waker: UiWaker = Arc::new(Mutex::new(None));
       let ipc = if cli.mock {
          None
       } else {
-         let client = IpcClient::spawn(cli.socket.clone());
+         // The thread wakes the UI through this slot; it stays empty until the first pass
+         // stores the context, and the queued handshake is drained by that same pass.
+         let wake_slot = Arc::clone(&ui_waker);
+         let waker = Arc::new(move || {
+            if let Some(ctx) = wake_slot.lock().ok().and_then(|slot| slot.clone()) {
+               ctx.request_repaint();
+            }
+         });
+         let client = IpcClient::spawn(cli.socket.clone(), waker);
          client.send(&Request::Subscribe);
          client.send(&Request::Status);
          client.send(&Request::ListRules);
@@ -129,6 +155,7 @@ impl App {
          alert_viewport: false,
          last_alert_id: None,
          alert_hidden: false,
+         ui_waker,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
          status: None,
@@ -140,7 +167,15 @@ impl App {
    }
 
    /// Drains the socket queue (or the mock stream) and schedules the next periodic refresh.
-   fn update(&mut self) {
+   ///
+   /// The first call publishes the context into the waker slot: it cannot be done in
+   /// `App::new`, which runs before eframe hands the app its `Context`.
+   fn update(&mut self, ctx: &egui::Context) {
+      if let Ok(mut slot) = self.ui_waker.lock()
+         && slot.is_none()
+      {
+         *slot = Some(ctx.clone());
+      }
       // Prompts are buffered rather than queued inside the drain: queueing needs `&mut
       // self`, and the drain holds an immutable borrow of the client.
       let mut arrived = Vec::new();
@@ -476,13 +511,27 @@ impl App {
 }
 
 impl eframe::App for App {
-   /// Polls the daemon and, in `--alert` mode, drives the root window's visibility.
+   /// Drains the daemon queue and, in `--alert` mode, drives the root window's visibility.
    ///
    /// eframe keeps calling this for a hidden window but skips [`Self::ui`], so the polling
-   /// and the "a prompt arrived, show the window" command must live here.
+   /// and the "a prompt arrived, show the window" command must live here. The root window
+   /// is refreshed only through the socket thread's wake; only a pending prompt earns a
+   /// timed repaint, because a lost wake-up would otherwise strand it until the next input.
    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-      self.update();
-      ctx.request_repaint_after(POLL_EVERY);
+      self.update(ctx);
+      // `--mock` has no socket thread to wake it, so it keeps its own demo clock. A real
+      // daemon wakes the UI per event; only a pending prompt earns a timed repaint, so a
+      // lost wake-up cannot strand the alert until the user restores the window.
+      let interval = if self.mock {
+         Some(POLL_EVERY)
+      } else if !self.pending.is_empty() || self.model().prompt().is_some() {
+         Some(PROMPT_REPAINT_EVERY)
+      } else {
+         None
+      };
+      if let Some(interval) = interval {
+         ctx.request_repaint_after(interval);
+      }
       self.alert_viewport(ctx);
       self.alert_window(ctx);
    }

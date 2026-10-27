@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -21,6 +22,14 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// How long to wait before redialling a daemon that is not running.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Wakes the UI thread after an event has been queued.
+///
+/// A minimised window paints no frames and gets no input, so queueing alone leaves the
+/// event unread until the user restores it; the wake is what schedules the frame that
+/// drains the queue. A callback rather than an `egui::Context` keeps this module free of
+/// the UI toolkit, and lets a test observe the wake with a counter.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// What the connection thread tells the UI.
 #[derive(Debug)]
@@ -68,15 +77,25 @@ impl Decider {
 impl IpcClient {
    /// Spawns the connection thread. Never blocks and never fails: connection errors
    /// surface as [`IpcEvent::Connected(false)`] and the thread keeps retrying.
-   pub fn spawn(socket_path: PathBuf) -> Self {
+   ///
+   /// Every queued event is followed by a `waker` call, because a hidden or minimised
+   /// root window schedules no frame on its own and would otherwise not drain the queue.
+   pub fn spawn(socket_path: PathBuf, waker: Waker) -> Self {
       let (out, out_rx) = mpsc::channel();
       let (events, events_rx) = mpsc::channel();
       let thread_events = events.clone();
-      let spawned = thread::Builder::new()
-         .name("netshield-ipc".to_owned())
-         .spawn(move || run(&socket_path, &out_rx, &thread_events));
+      let thread_waker = Arc::clone(&waker);
+      let spawned = thread::Builder::new().name("netshield-ipc".to_owned()).spawn(move || {
+         run(
+            &socket_path,
+            &out_rx,
+            &thread_events,
+            &thread_waker,
+         )
+      });
       if let Err(err) = spawned {
          log::warn!("cannot start the ipc thread: {err}");
+         waker();
          let _ = events.send(IpcEvent::Connected(false));
       }
       Self {
@@ -122,17 +141,29 @@ fn frame(request: &Request) -> Option<String> {
    String::from_utf8(encode_line(request).ok()?).ok()
 }
 
+/// Queues one event and then wakes the UI; false means the UI dropped the client.
+///
+/// The wake follows the send so the frame it schedules can already see the event; a wake
+/// before the send would race a UI that drains the empty channel and then sleeps again.
+fn send_event(events: &Sender<IpcEvent>, waker: &Waker, event: IpcEvent) -> bool {
+   if events.send(event).is_err() {
+      return false;
+   }
+   waker();
+   true
+}
+
 /// Owns the socket: dial, handshake, serve one connection, then retry forever.
-fn run(socket_path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>) {
+fn run(path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>, waker: &Waker) {
    // A missing daemon is normal, so the path is named on the first failure only.
    let mut reported_path = false;
    loop {
-      match UnixStream::connect(socket_path) {
+      match UnixStream::connect(path) {
          Ok(stream) => {
-            if events.send(IpcEvent::Connected(true)).is_err() {
+            if !send_event(events, waker, IpcEvent::Connected(true)) {
                return;
             }
-            if converse(stream, out, events) == Flow::Stop {
+            if converse(stream, out, events, waker) == Flow::Stop {
                return;
             }
          }
@@ -140,12 +171,12 @@ fn run(socket_path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>) {
          Err(err) => {
             log::debug!(
                "cannot connect to the daemon at {}: {err}",
-               socket_path.display()
+               path.display()
             );
             reported_path = true;
          }
       }
-      if events.send(IpcEvent::Connected(false)).is_err() {
+      if !send_event(events, waker, IpcEvent::Connected(false)) {
          return;
       }
       thread::sleep(RETRY_DELAY);
@@ -156,7 +187,12 @@ fn run(socket_path: &Path, out: &Receiver<String>, events: &Sender<IpcEvent>) {
 ///
 /// The read timeout is what keeps queued requests moving while the daemon is silent: a
 /// timeout is not an error, it just returns to the top of the loop and forwards again.
-fn converse(stream: UnixStream, out: &Receiver<String>, events: &Sender<IpcEvent>) -> Flow {
+fn converse(
+   stream: UnixStream,
+   out: &Receiver<String>,
+   events: &Sender<IpcEvent>,
+   waker: &Waker,
+) -> Flow {
    let mut writer = match stream.try_clone() {
       Ok(writer) => writer,
       Err(err) => {
@@ -207,7 +243,7 @@ fn converse(stream: UnixStream, out: &Receiver<String>, events: &Sender<IpcEvent
          return Flow::Reconnect;
       }
       if buf.last() == Some(&b'\n') {
-         let flow = dispatch(&buf, events);
+         let flow = dispatch(&buf, events, waker);
          buf.clear();
          if flow != Flow::Continue {
             return flow;
@@ -233,16 +269,20 @@ fn forward(out: &Receiver<String>, writer: &mut UnixStream) -> Flow {
 }
 
 /// Decodes one frame and hands it to the UI; a malformed frame is dropped, not fatal.
-fn dispatch(frame: &[u8], events: &Sender<IpcEvent>) -> Flow {
+fn dispatch(frame: &[u8], events: &Sender<IpcEvent>, waker: &Waker) -> Flow {
    let body = frame.strip_suffix(b"\n").unwrap_or(frame);
    if body.iter().all(u8::is_ascii_whitespace) {
       return Flow::Continue;
    }
    match decode_line::<Response>(body) {
-      Ok(response) => match events.send(IpcEvent::Message(Box::new(response))) {
-         Ok(()) => Flow::Continue,
-         Err(_) => Flow::Stop,
-      },
+      Ok(response) => {
+         let event = IpcEvent::Message(Box::new(response));
+         if send_event(events, waker, event) {
+            Flow::Continue
+         } else {
+            Flow::Stop
+         }
+      }
       Err(err) => {
          log::debug!("ignoring an undecodable ipc frame: {err}");
          Flow::Continue
@@ -256,10 +296,21 @@ mod tests {
    use netshield_core::ipc::Mode;
    use std::fs;
    use std::os::unix::net::UnixListener;
+   use std::sync::Arc;
    use std::sync::atomic::{AtomicUsize, Ordering};
    use std::time::Instant;
 
    const WAIT: Duration = Duration::from_secs(5);
+
+   /// A waker that counts its calls, so a test can tell a wake from a silent idle.
+   fn counted() -> (Waker, Arc<AtomicUsize>) {
+      let count = Arc::new(AtomicUsize::new(0));
+      let woken = Arc::clone(&count);
+      let waker: Waker = Arc::new(move || {
+         woken.fetch_add(1, Ordering::SeqCst);
+      });
+      (waker, count)
+   }
 
    /// A socket path no parallel test can collide on; the file is removed by each test.
    fn socket_path(label: &str) -> PathBuf {
@@ -336,7 +387,8 @@ mod tests {
    fn handshake_sends_gui_hello_and_reports_the_daemon() {
       let path = socket_path("handshake");
       let listener = UnixListener::bind(&path).expect("bind the listener");
-      let client = IpcClient::spawn(path.clone());
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
 
       let hello = hello();
@@ -354,7 +406,8 @@ mod tests {
    fn forwards_queued_requests() {
       let path = socket_path("forward");
       let listener = UnixListener::bind(&path).expect("bind the listener");
-      let client = IpcClient::spawn(path.clone());
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker);
       let (mut reader, _writer) = accept_hello(&listener);
 
       assert!(client.send(&Request::Status));
@@ -371,7 +424,8 @@ mod tests {
    #[test]
    fn retries_until_the_daemon_appears() {
       let path = socket_path("retry");
-      let client = IpcClient::spawn(path.clone());
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker);
 
       wait_connected(&client, false);
 
@@ -386,7 +440,8 @@ mod tests {
    fn ignores_a_bad_frame_and_keeps_reading() {
       let path = socket_path("bad-frame");
       let listener = UnixListener::bind(&path).expect("bind the listener");
-      let client = IpcClient::spawn(path.clone());
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
 
       writer.write_all(b"not json\n").expect("write the garbage");
@@ -396,6 +451,44 @@ mod tests {
          .expect("write the hello");
 
       assert_eq!(next_message(&client), hello);
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn the_waker_fires_for_a_prompt_and_stays_quiet_when_idle() {
+      let path = socket_path("wake");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker);
+      let (_reader, mut writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+
+      // Connected(true) is the only wake so far; a quiet socket must add none, or the
+      // thread would spin the UI for the whole session.
+      let settled = woken.load(Ordering::SeqCst);
+      thread::sleep(Duration::from_millis(300));
+      assert_eq!(
+         woken.load(Ordering::SeqCst),
+         settled,
+         "an idle connection must not keep waking the ui"
+      );
+
+      writer
+         .write_all(&encode_line(&hello()).expect("encode the hello"))
+         .expect("write the hello");
+      assert_eq!(next_message(&client), hello());
+
+      // The wake must cover the message itself, not only the connection event that
+      // preceded it: a minimised window has no other way to learn a prompt arrived.
+      let deadline = Instant::now() + WAIT;
+      while woken.load(Ordering::SeqCst) == settled && Instant::now() < deadline {
+         thread::sleep(Duration::from_millis(20));
+      }
+      assert!(
+         woken.load(Ordering::SeqCst) > settled,
+         "a prompt must wake the ui"
+      );
 
       fs::remove_file(&path).expect("remove the socket");
    }
