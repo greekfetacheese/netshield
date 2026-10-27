@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use netshield_core::ipc::{ConnectionEvent, ConnectionView};
+use netshield_core::rule::RuleId;
 
 /// Seconds in a day. The clock is UTC because this crate deliberately has no timezone
 /// dependency; the table header says so rather than inventing a local offset.
@@ -31,8 +32,8 @@ pub struct Row {
    pub proto: String,
    pub allowed: bool,
    pub via_prompt: bool,
-   /// Matched rule id in hex.
-   pub rule: Option<String>,
+   /// The rule that decided this connection, resolved against the rule list at render time.
+   pub rule_id: Option<RuleId>,
    /// First domain candidate when no domain was resolved; the table italicises it so the
    /// difference between a name and an address stays visible.
    pub candidate: Option<String>,
@@ -52,7 +53,7 @@ impl Row {
          proto: view.proto.as_str().to_owned(),
          allowed: event.allowed,
          via_prompt: event.via_prompt,
-         rule: event.matched_rule.as_ref().map(ToString::to_string),
+         rule_id: event.matched_rule.clone(),
          candidate: if domain.is_none() {
             view.domain_candidates.first().cloned()
          } else {
@@ -63,7 +64,7 @@ impl Row {
 }
 
 /// Formats unix seconds as `HH:MM:SS` in UTC.
-fn clock(at: u64) -> String {
+pub fn clock(at: u64) -> String {
    let secs = at % SECS_PER_DAY;
    format!(
       "{:02}:{:02}:{:02}",
@@ -89,6 +90,9 @@ pub struct ConnectionLog {
    rows: VecDeque<Row>,
    capacity: usize,
    dropped: u64,
+   /// Bumped whenever the contents change, so the UI can cache a derived line list and
+   /// rebuild it only when the log actually moved.
+   version: u64,
 }
 
 impl ConnectionLog {
@@ -98,6 +102,7 @@ impl ConnectionLog {
          rows: VecDeque::with_capacity(capacity),
          capacity,
          dropped: 0,
+         version: 0,
       }
    }
 
@@ -105,6 +110,7 @@ impl ConnectionLog {
    pub fn push(&mut self, event: &ConnectionEvent) {
       if self.capacity == 0 {
          self.dropped += 1;
+         self.version += 1;
          return;
       }
       while self.rows.len() >= self.capacity {
@@ -112,6 +118,7 @@ impl ConnectionLog {
          self.dropped += 1;
       }
       self.rows.push_back(Row::from_event(event));
+      self.version += 1;
    }
 
    /// Rows oldest first; the table reverses this so the newest is on top.
@@ -130,6 +137,11 @@ impl ConnectionLog {
    /// How many rows fell out of the front of the log.
    pub fn dropped(&self) -> u64 {
       self.dropped
+   }
+
+   /// A counter that changes whenever a row is pushed or dropped, never on a read.
+   pub fn version(&self) -> u64 {
+      self.version
    }
 }
 
@@ -230,11 +242,36 @@ mod tests {
       let mut matched = event(0, connection.clone());
       matched.matched_rule = Some(id.clone());
 
+      assert_eq!(Row::from_event(&matched).rule_id, Some(id));
       assert_eq!(
-         Row::from_event(&matched).rule.as_deref(),
-         Some(id.to_string().as_str())
+         Row::from_event(&event(0, connection)).rule_id,
+         None
       );
-      assert_eq!(Row::from_event(&event(0, connection)).rule, None);
+   }
+
+   #[test]
+   fn the_version_moves_only_when_the_log_changes() {
+      let mut log = ConnectionLog::new(2);
+      let start = log.version();
+      assert_eq!(
+         log.version(),
+         start,
+         "an idle log keeps its version"
+      );
+
+      log.push(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      assert!(log.version() > start, "a push is a change");
+
+      let pushed = log.version();
+      log.push(&event(1, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      log.push(&event(2, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      assert!(log.version() > pushed, "a drop is a change too");
+
+      // A zero-capacity log has no rows but still counts its drops.
+      let mut empty = ConnectionLog::new(0);
+      let before = empty.version();
+      empty.push(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      assert_eq!(empty.version(), before + 1);
    }
 
    #[test]
