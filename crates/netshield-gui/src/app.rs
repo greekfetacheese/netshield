@@ -107,6 +107,8 @@ pub struct App {
    connections_cache: ui::connections::LinesCache,
    /// The row whose details the Connections page shows in its right-hand pane.
    connections_selection: ui::connections::Selection,
+   /// The rule editor and its draft, if one is open.
+   editor: ui::rules::Editor,
    /// Set when a mutation went out; the next update rewrites the rule list instead of
    /// waiting up to `REFRESH_EVERY` for the periodic tick.
    refresh_rules: bool,
@@ -215,6 +217,7 @@ impl App {
          connections_collapsed: ui::connections::Collapsed::default(),
          connections_cache: ui::connections::LinesCache::default(),
          connections_selection: ui::connections::Selection::default(),
+         editor: ui::rules::Editor::default(),
          refresh_rules: false,
       }
    }
@@ -635,8 +638,14 @@ impl App {
 
    /// Sends the intents the Rules page collected, then re-lists so the table reflects
    /// the daemon's answer without waiting for the five-second tick.
+   ///
+   /// A queued edit only opens the editor; it is not a mutation, so it never triggers a
+   /// re-list on its own.
    fn apply_actions(&mut self, actions: ui::rules::Actions) {
-      if actions.toggles.is_empty() && actions.deletes.is_empty() {
+      if let Some(rule) = actions.edits.first() {
+         self.editor.open(rule);
+      }
+      if actions.toggles.is_empty() && actions.deletes.is_empty() && actions.upserts.is_empty() {
          return;
       }
       let mut listed = false;
@@ -646,6 +655,9 @@ impl App {
          }
          for id in actions.deletes {
             client.send(&Request::DeleteRule { id });
+         }
+         for rule in actions.upserts {
+            client.send(&Request::UpsertRule { rule });
          }
          // The daemon answers in order, so listing now reflects the mutations above
          // instead of leaving the table stale for up to a refresh interval.
@@ -669,6 +681,13 @@ impl App {
          Page::Rules => {
             let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
             self.apply_actions(actions);
+            // Drawn after the table so the modal sits over it.
+            if let Some(rule) = self.editor.show(ui.ctx(), unix_now()) {
+               self.apply_actions(ui::rules::Actions {
+                  upserts: vec![rule],
+                  ..Default::default()
+               });
+            }
          }
          Page::Settings => ui::settings::show(ui, self.mode),
          Page::Status => ui::status::show(ui, self.status.as_ref(), unix_now()),
