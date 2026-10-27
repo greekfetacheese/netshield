@@ -17,7 +17,10 @@ use netshield_core::rule::{Action, Duration};
 pub const WIDTH: f32 = 480.0;
 
 /// The host window's height. [`layout_height_estimate`] must stay below it.
-pub const HEIGHT: f32 = 404.0;
+///
+/// Grown from 404 when the rule preview line was added: the measured stack (with a queued
+/// prompt) is 410pt, and a fixed viewport silently clips rather than scrolls.
+pub const HEIGHT: f32 = 440.0;
 
 /// Inner margin of the alert panel, in points, applied on all four sides.
 const PANEL_MARGIN: i8 = 14;
@@ -52,6 +55,16 @@ const BUTTON_HEIGHT: f32 = 32.0;
 /// Longest process name drawn before it is elided; the row must stay one line.
 const APP_NAME_CHARS: usize = 30;
 
+/// Character budget of the rule preview line. The alert is only 480pt wide, so the line
+/// is elided to stay one line instead of wrapping into the buttons.
+const RULE_PREVIEW_CHARS: usize = 60;
+
+/// Longest app name kept in the rule preview before it is elided.
+const PREVIEW_APP_CHARS: usize = 20;
+
+/// Longest host kept in the rule preview before it is elided.
+const PREVIEW_HOST_CHARS: usize = 26;
+
 /// Red fill of the Deny button. White text keeps the contrast well above 4.5:1.
 const DENY_FILL: Color32 = Color32::from_rgb(0xB3, 0x2D, 0x2D);
 
@@ -71,9 +84,10 @@ pub struct Decision {
 
 /// Selection state for one alert.
 ///
-/// `duration` starts at `Forever` and `scope_domain` starts `false`, so the default is
-/// the broad decision: an allow writes a lasting rule, and a deny covers just this
-/// connection unless the user explicitly narrows it.
+/// `duration` starts at `Session` ("until restart") and `scope_domain` starts `false`, so
+/// the default is the broad decision: an app-wide rule that does not survive a restart,
+/// which the user can narrow or make permanent. `Forever` stays selectable but is never
+/// the default: an accidental click must not outlive the daemon.
 pub struct AlertState {
    pub duration: Duration,
    pub scope_domain: bool,
@@ -81,10 +95,10 @@ pub struct AlertState {
 }
 
 impl AlertState {
-   /// The default selection: `Forever`, scoped to this connection only.
+   /// The default selection: `Session`, scoped to any connection by this app.
    pub fn new() -> Self {
       Self {
-         duration: Duration::Forever,
+         duration: Duration::Session,
          scope_domain: false,
          subdomains: false,
       }
@@ -120,6 +134,44 @@ impl AlertState {
 impl Default for AlertState {
    fn default() -> Self {
       Self::new()
+   }
+}
+
+/// The rule the current selections would write, as one line:
+/// `allow firefox → anywhere · until restart`.
+///
+/// It renders exactly what [`AlertState::decision`] will send, never what the radios look
+/// like: a domain scope the daemon did not offer reads as `anywhere`, because that is the
+/// scope the decision actually produces. Pure, so the wording is testable without a window.
+pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) -> String {
+   let verb = match action {
+      Action::Allow => "allow",
+      Action::Deny => "deny",
+   };
+   let app = elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS);
+   let scope = preview_scope(prompt, state);
+   let duration = match state.duration {
+      Duration::Once => "once",
+      Duration::Session => "until restart",
+      Duration::Forever => "forever",
+   };
+   elide(
+      &format!("{verb} {app} → {scope} · {duration}"),
+      RULE_PREVIEW_CHARS,
+   )
+}
+
+/// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
+fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
+   let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
+   let Some(host) = host.filter(|_| state.scope_domain && prompt.domain_scope_available) else {
+      return "anywhere".to_owned();
+   };
+   let host = elide(host, PREVIEW_HOST_CHARS);
+   if state.subdomains {
+      format!("only *.{host}")
+   } else {
+      format!("only {host}")
    }
 }
 
@@ -221,6 +273,8 @@ pub fn layout_height_estimate() -> f32 {
       + RADIO_ROW
       + RADIO_ROW
       + SECTION_GAP
+      + SMALL_ROW
+      + SECTION_GAP
       + COUNTDOWN_HEIGHT
       + SECTION_GAP
       + BUTTON_HEIGHT;
@@ -314,28 +368,39 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
    });
 }
 
-/// The scope radios, the domain `Only this domain` applies to, and the subdomain opt-in.
+/// The scope radios, the domain `Only <host>` applies to, the subdomain opt-in and the
+/// rule preview.
 ///
-/// The muted `Scope` label keeps `This connection` from reading as a fourth duration
-/// option. The domain label shares the radio's line so the choice reads as one sentence.
-/// The subdomain checkbox is indented to the radio's *text*, not its circle, and stays
+/// The muted `Scope` label keeps `Any connection by this app` from reading as a fourth
+/// duration option. That first label is deliberately app-wide: the daemon turns
+/// `ScopeChoice::AnyConnection` into `DestMatcher::Any`, i.e. *any destination for this
+/// app*, so calling it "This connection" would promise a narrower rule than it writes.
+/// The domain label shares the radio's line so the choice reads as one sentence. The
+/// subdomain checkbox is indented to the radio's *text*, not its circle, and stays
 /// disabled until the domain scope is both offered and selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
    ui.label(RichText::new("Scope").small().weak());
-   ui.radio_value(&mut state.scope_domain, false, "This connection");
+   ui.radio_value(
+      &mut state.scope_domain,
+      false,
+      "Any connection by this app",
+   );
 
    let host = prompt.connection.domain.as_deref().filter(|host| !host.is_empty());
    ui.horizontal(|ui| {
       let enabled = prompt.domain_scope_available && host.is_some();
       let domain = ui.add_enabled(
          enabled,
-         egui::RadioButton::new(state.scope_domain, "Only this domain"),
+         egui::RadioButton::new(
+            state.scope_domain,
+            host.map_or_else(
+               || "Only this domain".to_owned(),
+               |host| format!("Only {}", elide(host, PREVIEW_HOST_CHARS)),
+            ),
+         ),
       );
       if domain.clicked() {
          state.scope_domain = true;
-      }
-      if let Some(host) = host {
-         ui.label(RichText::new(host).small().weak());
       }
    });
 
@@ -347,6 +412,15 @@ fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
          egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
       );
    });
+
+   // The line below the radios states the rule the current selections would write, so the
+   // app-wide scope above cannot be mistaken for a single flow.
+   ui.label(
+      RichText::new(rule_preview(prompt, state, Action::Allow))
+         .small()
+         .monospace()
+         .weak(),
+   );
 }
 
 /// `Auto-deny in <n>s`, or the denying state once the deadline has passed.
@@ -427,14 +501,83 @@ mod tests {
    }
 
    #[test]
-   fn default_decision_is_forever_and_any_connection() {
+   fn default_decision_is_session_and_any_connection() {
       let state = AlertState::new();
       let decision = state.decision(
          &prompt(Some("www.google.com"), true),
          Action::Allow,
       );
-      assert_eq!(decision.duration, Duration::Forever);
+      assert_eq!(decision.duration, Duration::Session);
       assert_eq!(decision.scope, ScopeChoice::AnyConnection);
+   }
+
+   #[test]
+   fn rule_preview_matches_the_decision_it_previews() {
+      let any = rule_preview(
+         &prompt(Some("www.google.com"), true),
+         &AlertState::new(),
+         Action::Allow,
+      );
+      assert_eq!(any, "allow firefox → anywhere · until restart");
+
+      let mut once = AlertState::new();
+      once.scope_domain = true;
+      once.duration = Duration::Once;
+      assert_eq!(
+         rule_preview(
+            &prompt(Some("www.google.com"), true),
+            &once,
+            Action::Allow
+         ),
+         "allow firefox → only www.google.com · once"
+      );
+
+      let mut forever = AlertState::new();
+      forever.scope_domain = true;
+      forever.duration = Duration::Forever;
+      forever.subdomains = true;
+      assert_eq!(
+         rule_preview(
+            &prompt(Some("github.com"), true),
+            &forever,
+            Action::Allow
+         ),
+         "allow firefox → only *.github.com · forever"
+      );
+   }
+
+   #[test]
+   fn rule_preview_never_claims_an_unavailable_domain_scope() {
+      let mut state = AlertState::new();
+      state.scope_domain = true;
+      assert_eq!(
+         rule_preview(
+            &prompt(Some("www.google.com"), false),
+            &state,
+            Action::Allow
+         ),
+         "allow firefox → anywhere · until restart"
+      );
+   }
+
+   #[test]
+   fn rule_preview_elides_a_long_app_and_domain() {
+      let mut request = prompt(
+         Some("a-very-long-subdomain.and-a-long-domain.example.com"),
+         true,
+      );
+      request.connection.app_name = "an-extremely-long-process-name-that-cannot-fit".to_owned();
+      let mut state = AlertState::new();
+      state.scope_domain = true;
+      let line = rule_preview(&request, &state, Action::Allow);
+      assert!(
+         line.chars().count() <= RULE_PREVIEW_CHARS,
+         "preview over budget: {line}"
+      );
+      assert!(
+         line.contains('…'),
+         "expected an ellipsis in: {line}"
+      );
    }
 
    #[test]
