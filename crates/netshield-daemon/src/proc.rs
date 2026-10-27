@@ -13,11 +13,12 @@
 //! `Unknown` matcher and a guessed owner could inherit another application's allow.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::time::{Duration as StdDuration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use log::{debug, warn};
 use netshield_core::{Attribution, Family, L4Proto, ProcessInfo};
@@ -544,17 +545,21 @@ impl Attributor {
             continue;
          }
 
-         let inodes = match read_inodes(pid) {
-            Ok(inodes) => inodes,
-            Err(ScanError::Budget) => {
-               self.budget_exhausted(&format!(
-                  "descriptor scan of pid {pid} exceeded {MAX_FDS} entries"
-               ));
-               return None;
-            }
+         let (inodes, over_budget) = match read_inodes(pid) {
+            Ok(inodes) => (inodes, false),
+            // The fresh entries were still inspected, so a socket among them is a real
+            // hit; the warning below records that the rest of the directory went unseen.
+            Err(ScanError::Budget(inodes)) => (inodes, true),
             Err(ScanError::Unreadable) => continue,
          };
+         if over_budget {
+            self.budget_exhausted(&format!(
+               "descriptor scan of pid {pid} exceeded {MAX_FDS} entries"
+            ));
+         }
          let found = inodes.contains(&inode);
+         // A trimmed snapshot is cached too: a positive is a real descriptor at that pid,
+         // and a negative stays only a hint that the next lookup refreshes.
          self.pid_fds.insert(
             pid,
             FdCacheEntry {
@@ -565,6 +570,11 @@ impl Attributor {
          );
          if found {
             return Some((pid, owner_uid));
+         }
+         if over_budget {
+            // The cut-off dropped descriptors this pid holds, so no other process can be
+            // ruled in or out: the answer is unknown, not a miss from a complete scan.
+            return None;
          }
       }
       None
@@ -649,12 +659,14 @@ impl Default for Attributor {
    }
 }
 
-/// Why a pid's descriptor directory could not be scanned.
+/// Why a pid's descriptor directory could not be fully scanned.
 enum ScanError {
    /// The process vanished or its fds are not readable by this daemon.
    Unreadable,
-   /// The directory held more entries than one lookup may examine.
-   Budget,
+   /// The directory held more entries than one lookup may examine. The payload is what the
+   /// newest [`MAX_FDS`] entries yielded: the scan must still attribute the fresh socket it
+   /// was allowed to inspect, while the caller counts and warns about the truncation.
+   Budget(Vec<u32>),
 }
 
 /// Returns the socket table for a protocol and family, or `None` when there is none.
@@ -895,21 +907,41 @@ fn candidate_owner(
 }
 
 /// Opens `/proc/<pid>/fd` and collects the socket inodes it holds.
+///
+/// Descriptors are ordered newest-first before any link is read, mirroring OpenSnitch's
+/// `sortFdsByTime`: a firewall looks for a socket created moments ago, so the newest
+/// [`MAX_FDS`] entries are the ones worth spending the budget on. A directory holding more
+/// than that is still trimmed, but its freshest entries are read; the caller is told with
+/// [`ScanError::Budget`] and receives those inodes rather than an empty list.
 fn socket_inodes(pid: u32) -> Result<Vec<u32>, ScanError> {
-   let directory = fs::read_dir(format!("{PROC}/{pid}/fd")).map_err(|_| ScanError::Unreadable)?;
-   let mut inodes = Vec::new();
+   read_fd_dir(Path::new(PROC).join(pid.to_string()).join("fd"))
+}
+
+/// Scans one descriptor directory, newest entry first, trimming the list to [`MAX_FDS`].
+///
+/// Split from [`socket_inodes`] so the ordering and the budget can be exercised on a
+/// directory the test controls instead of a live `/proc`.
+fn read_fd_dir(path: PathBuf) -> Result<Vec<u32>, ScanError> {
+   let directory = fs::read_dir(&path).map_err(|_| ScanError::Unreadable)?;
+   let mut entries = Vec::new();
    let mut seen = 0usize;
    for entry in directory {
       let Ok(entry) = entry else {
          continue;
       };
       seen += 1;
-      if seen > MAX_FDS {
-         return Err(ScanError::Budget);
-      }
-      let Ok(target) = fs::read_link(entry.path()) else {
+      // `metadata` follows the link, so this is the time of the file behind the
+      // descriptor; the directory entry's own time is not what a recent socket changes.
+      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
+      entries.push((entry.file_name(), mtime));
+   }
+   let over_budget = seen > MAX_FDS;
+   let mut inodes = Vec::new();
+   for name in sort_fds_newest_first(entries, MAX_FDS) {
+      let target = match fs::read_link(path.join(name)) {
+         Ok(target) => target,
          // A descriptor closed between readdir and readlink.
-         continue;
+         Err(_) => continue,
       };
       if let Some(target) = target.to_str()
          && let Some(inode) = socket_link_inode(target)
@@ -917,7 +949,23 @@ fn socket_inodes(pid: u32) -> Result<Vec<u32>, ScanError> {
          inodes.push(inode);
       }
    }
+   if over_budget {
+      return Err(ScanError::Budget(inodes));
+   }
    Ok(inodes)
+}
+
+/// Sorts `(name, mtime)` descriptor entries newest-first, as OpenSnitch does; entries
+/// without a time go last. Returns the file names to inspect, trimmed to `limit`.
+fn sort_fds_newest_first(
+   entries: Vec<(OsString, Option<SystemTime>)>,
+   limit: usize,
+) -> Vec<OsString> {
+   sort_newest_first(entries)
+      .into_iter()
+      .take(limit)
+      .map(|(name, _)| name)
+      .collect()
 }
 
 /// Parses a `/proc/<pid>/fd` link target of the form `socket:[<inode>]`.
@@ -935,7 +983,12 @@ fn read_pid_uid(pid: u32) -> Option<u32> {
    fs::metadata(path).ok().map(|meta| meta.uid())
 }
 
-/// Lists the numeric entries of `/proc`.
+/// Lists the numeric entries of `/proc`, newest process first.
+///
+/// The scan order matters: the socket being attributed was created moments ago, so the
+/// process that started last is the likeliest owner. A pid whose directory time cannot be
+/// read is still scanned, only last, so a racing exit or an unreadable entry never hides a
+/// younger process.
 fn numeric_pids() -> Option<Vec<u32>> {
    let entries = fs::read_dir(PROC).ok()?;
    let mut pids = Vec::new();
@@ -943,11 +996,33 @@ fn numeric_pids() -> Option<Vec<u32>> {
       let Ok(name) = entry.file_name().into_string() else {
          continue;
       };
-      if let Ok(pid) = name.parse::<u32>() {
-         pids.push(pid);
-      }
+      let Ok(pid) = name.parse::<u32>() else {
+         continue;
+      };
+      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
+      pids.push((pid, mtime));
    }
-   Some(pids)
+   Some(sort_pids_newest_first(pids))
+}
+
+/// Sorts `(pid, mtime)` pairs newest-first; entries without a time go last, ties keep input
+/// order.
+fn sort_pids_newest_first(entries: Vec<(u32, Option<SystemTime>)>) -> Vec<u32> {
+   sort_newest_first(entries).into_iter().map(|(pid, _)| pid).collect()
+}
+
+/// Sorts `(item, mtime)` entries newest-first, with untimed entries last and ties stable.
+///
+/// `sort_by` is a stable sort, so equal times and two missing times keep the readdir order;
+/// that keeps the scan deterministic for the tests and for a reproduced failure.
+fn sort_newest_first<T>(mut entries: Vec<(T, Option<SystemTime>)>) -> Vec<(T, Option<SystemTime>)> {
+   entries.sort_by(|(_, a), (_, b)| match (a, b) {
+      (Some(a), Some(b)) => b.cmp(a),
+      (Some(_), None) => std::cmp::Ordering::Less,
+      (None, Some(_)) => std::cmp::Ordering::Greater,
+      (None, None) => std::cmp::Ordering::Equal,
+   });
+   entries
 }
 
 /// Reads the process identity, or `None` when it can no longer be read.
@@ -1876,5 +1951,116 @@ mod tests {
          "too long ({}): {message}",
          message.len()
       );
+   }
+
+   /// A fixed instant for ordering tests; values are offsets from it.
+   fn at(offset: u64) -> SystemTime {
+      SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_000 + offset)
+   }
+
+   #[test]
+   fn sort_pids_newest_first_orders_newest_first_with_stable_ties() {
+      // Pids 10 and 11 share a timestamp: a stable sort keeps their readdir order.
+      let entries = vec![
+         (10, Some(at(1))),
+         (20, Some(at(9))),
+         (11, Some(at(1))),
+         (30, Some(at(5))),
+      ];
+      assert_eq!(
+         sort_pids_newest_first(entries),
+         vec![20, 30, 10, 11]
+      );
+   }
+
+   #[test]
+   fn sort_pids_newest_first_puts_untimed_entries_last() {
+      let entries = vec![(1, None), (2, Some(at(1))), (3, None), (4, Some(at(2)))];
+      assert_eq!(
+         sort_pids_newest_first(entries),
+         vec![4, 2, 1, 3],
+         "a pid with no readable time stays scannable, only last"
+      );
+   }
+
+   #[test]
+   fn sort_fds_newest_first_orders_newest_first_with_stable_ties() {
+      let entries = vec![
+         (OsString::from("a"), Some(at(1))),
+         (OsString::from("b"), Some(at(9))),
+         (OsString::from("c"), Some(at(1))),
+      ];
+      assert_eq!(
+         sort_fds_newest_first(entries, MAX_FDS),
+         vec![
+            OsString::from("b"),
+            OsString::from("a"),
+            OsString::from("c")
+         ]
+      );
+   }
+
+   #[test]
+   fn sort_fds_newest_first_puts_untimed_entries_last_and_keeps_the_newest() {
+      let entries = vec![
+         (OsString::from("stale"), Some(at(1))),
+         (OsString::from("untimed"), None),
+         (OsString::from("newest"), Some(at(9))),
+         (OsString::from("middle"), Some(at(5))),
+      ];
+      // The cut-off must drop the oldest and the untimed descriptors, never the newest.
+      assert_eq!(
+         sort_fds_newest_first(entries, 2),
+         vec![OsString::from("newest"), OsString::from("middle")]
+      );
+   }
+
+   /// Creates a descriptor directory holding `MAX_FDS + 10` entries where the only socket
+   /// is the newest: the budget may trim the directory but must still inspect that socket.
+   #[test]
+   fn descriptor_budget_keeps_the_newest_entries_and_still_finds_the_socket() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let dir = std::env::temp_dir().join(format!("netshield-fd-budget-{nanos}"));
+      fs::create_dir_all(&dir).expect("create the descriptor directory");
+
+      let inode = 987_654u32;
+      // A `/proc/<pid>/fd` socket link names a kernel inode that does not exist on disk.
+      // The test's link therefore needs a target that `metadata` can follow, and that
+      // target's mtime is the one `read_fd_dir` reads.
+      let target = format!("socket:[{inode}]");
+      fs::write(dir.join(&target), b"").expect("create the link target");
+      // Stamp it ahead of the stale descriptors created below, which carry "now".
+      fs::File::options()
+         .write(true)
+         .open(dir.join(&target))
+         .expect("open the link target")
+         .set_modified(SystemTime::now() + StdDuration::from_secs(3_600))
+         .expect("stamp the newest descriptor");
+
+      for index in 0..(MAX_FDS + 9) {
+         fs::write(dir.join(format!("stale-{index}")), b"").expect("create a stale descriptor");
+      }
+      std::os::unix::fs::symlink(&target, dir.join("fd-socket")).expect("create the socket link");
+
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
+         read_fd_dir(dir.clone())
+      });
+      assert_eq!(
+         owner,
+         Some((pid, uid)),
+         "the newest descriptor must be inspected even when the directory exceeds the budget"
+      );
+      assert_eq!(
+         attributor.stats().scan_budget_exhausted,
+         1,
+         "the trimmed directory must still be reported as over budget"
+      );
+
+      let _ = fs::remove_dir_all(&dir);
    }
 }
