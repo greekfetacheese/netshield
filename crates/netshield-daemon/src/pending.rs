@@ -149,6 +149,13 @@ impl PendingPrompts {
       std::mem::take(&mut self.by_id).into_values().collect()
    }
 
+   /// Every open prompt that is **not** the active head, in arrival order.
+   ///
+   /// Used when a new rule may already cover flows the user has not been shown yet.
+   pub fn queued_records(&self) -> Vec<PromptRecord> {
+      self.queue.iter().skip(1).filter_map(|id| self.by_id.get(id).cloned()).collect()
+   }
+
    /// Removes and returns the active prompt when its deadline has passed.
    ///
    /// Queued prompts have no deadline and can never expire here, however much time passes.
@@ -557,6 +564,69 @@ mod tests {
          None,
          "a resolved flow no longer accepts packets"
       );
+   }
+
+   #[test]
+   fn queued_records_returns_every_non_head_prompt_in_arrival_order() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      let queued = pending.queued_records();
+      assert_eq!(
+         queued.iter().map(|record| record.id).collect::<Vec<_>>(),
+         vec![second, third],
+         "the head is excluded and arrival order is kept"
+      );
+      assert_eq!(queued[0].packet_ids, vec![20]);
+      assert_eq!(
+         queued[0].deadline, None,
+         "queued prompts carry no clock"
+      );
+      assert_eq!(queued[1].deadline, None);
+      assert!(pending.is_active(first), "nothing was removed");
+      assert_eq!(pending.len(), 3);
+   }
+
+   #[test]
+   fn queued_records_of_a_single_prompt_is_empty() {
+      let mut pending = PendingPrompts::new();
+      let id = pending.open(conn(443), 10, TIMEOUT, Instant::now());
+      assert!(pending.queued_records().is_empty());
+      assert!(pending.is_active(id));
+   }
+
+   #[test]
+   fn queued_records_returns_clones_not_the_live_records() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      let mut queued = pending.queued_records();
+      let mut record = queued.pop().expect("the third prompt is queued");
+      assert_eq!(record.id, third);
+      record.packet_ids.push(99);
+      assert_eq!(
+         pending.get(third).expect("still open").packet_ids,
+         vec![30],
+         "mutating the snapshot must not touch the live prompt"
+      );
+      assert!(
+         pending.is_active(first),
+         "the snapshot left the queue alone"
+      );
+      assert_eq!(pending.get(second).expect("open").deadline, None);
+
+      // Answering every queued prompt removes them by id, and the head is still active.
+      for record in pending.queued_records() {
+         let resolved = pending.resolve(record.id, start).expect("still open");
+         assert_eq!(
+            resolved.activated, None,
+            "resolving a queued prompt leaves the head active"
+         );
+      }
+      assert!(pending.is_active(first));
+      assert_eq!(pending.len(), 1);
    }
 
    #[test]
