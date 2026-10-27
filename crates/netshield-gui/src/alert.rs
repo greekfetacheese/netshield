@@ -88,6 +88,7 @@ pub struct Decision {
 /// the default is the broad decision: an app-wide rule that does not survive a restart,
 /// which the user can narrow or make permanent. `Forever` stays selectable but is never
 /// the default: an accidental click must not outlive the daemon.
+#[derive(Debug)]
 pub struct AlertState {
    pub duration: Duration,
    pub scope_domain: bool,
@@ -134,6 +135,99 @@ impl AlertState {
 impl Default for AlertState {
    fn default() -> Self {
       Self::new()
+   }
+}
+
+/// The alert's whole state, with no egui windowing in it: the host owns a viewport, this owns
+/// what that viewport shows and what the answer is.
+///
+/// No host constructs it yet -- the deferred-viewport wiring is a separate change -- so the
+/// binary would otherwise warn on every field and method. Only the tests use it today.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+pub struct AlertModel {
+   prompt: Option<PromptRequest>,
+   state: AlertState,
+   deadline: Option<std::time::Instant>,
+   raised: std::collections::HashSet<u64>,
+   outgoing: Vec<DecideRequest>,
+}
+
+#[allow(dead_code)]
+impl AlertModel {
+   /// An idle model: no prompt, no countdown and nothing to send.
+   pub fn new() -> Self {
+      Self::default()
+   }
+
+   /// Shows `prompt`, resets the selection to the defaults, and starts its countdown.
+   ///
+   /// The daemon only activates one prompt at a time and queues the rest, so a prompt
+   /// presented while another is active replaces it rather than waiting its turn.
+   pub fn present(
+      &mut self,
+      prompt: PromptRequest,
+      timeout: std::time::Duration,
+      now: std::time::Instant,
+   ) {
+      self.state = AlertState::new();
+      self.deadline = Some(now + timeout);
+      self.prompt = Some(prompt);
+   }
+
+   /// The active prompt, if any.
+   pub fn prompt(&self) -> Option<&PromptRequest> {
+      self.prompt.as_ref()
+   }
+
+   /// The live selection, for `alert::ui`.
+   pub fn state_mut(&mut self) -> &mut AlertState {
+      &mut self.state
+   }
+
+   /// Seconds left, for `alert::ui`'s `remaining`; `None` when no prompt is active.
+   ///
+   /// Saturates at `0.0`, never negative, so the countdown text and bar see one shape.
+   pub fn remaining_secs(&self, now: std::time::Instant) -> Option<f32> {
+      self.prompt.as_ref()?;
+      let deadline = self.deadline?;
+      Some(deadline.saturating_duration_since(now).as_secs_f32())
+   }
+
+   /// Whether the countdown has reached its deadline.
+   pub fn is_expired(&self, now: std::time::Instant) -> bool {
+      self.prompt.is_some() && self.deadline.is_some_and(|deadline| now >= deadline)
+   }
+
+   /// Returns the prompt id the first time it is called for that prompt, then `None`.
+   /// This is the once-per-prompt guard for raising the window: never focus on every frame.
+   pub fn raise_once(&mut self) -> Option<u64> {
+      let id = self.prompt.as_ref()?.id;
+      self.raised.insert(id).then_some(id)
+   }
+
+   /// Builds the `DecideRequest` from the current selection and queues it in `outgoing`.
+   ///
+   /// The request comes from [`AlertState::decision`], so it is exactly the rule the
+   /// preview line describes. After queueing, the prompt stops being active.
+   pub fn submit(&mut self, decision: Decision) {
+      let Some(prompt) = self.prompt.as_ref() else {
+         return;
+      };
+      let request = self.state.decision(prompt, decision.action);
+      self.outgoing.push(request);
+      self.clear();
+   }
+
+   /// Hands the queued requests to the host, leaving the buffer empty.
+   pub fn take_outgoing(&mut self) -> Vec<DecideRequest> {
+      std::mem::take(&mut self.outgoing)
+   }
+
+   /// Drops the active prompt (after an answer or an expiry) and the countdown.
+   pub fn clear(&mut self) {
+      self.prompt = None;
+      self.deadline = None;
    }
 }
 
@@ -779,5 +873,164 @@ mod tests {
       assert_eq!(progress_fraction(15.0, 30), 0.5);
       assert_eq!(progress_fraction(60.0, 30), 1.0);
       assert_eq!(progress_fraction(1.0, 0), 0.0);
+   }
+
+   /// A fixed clock, so every model test is independent of wall time.
+   fn clock() -> std::time::Instant {
+      std::time::Instant::now()
+   }
+
+   #[test]
+   fn present_starts_a_countdown_that_saturates_at_the_deadline() {
+      let mut model = AlertModel::new();
+      let start = clock();
+      assert_eq!(
+         model.remaining_secs(start),
+         None,
+         "an idle model has no countdown"
+      );
+
+      let timeout = std::time::Duration::from_secs(30);
+      model.present(
+         prompt(Some("www.google.com"), true),
+         timeout,
+         start,
+      );
+
+      assert_eq!(model.remaining_secs(start), Some(30.0));
+      assert_eq!(
+         model.remaining_secs(start + std::time::Duration::from_secs(10)),
+         Some(20.0)
+      );
+      assert!(!model.is_expired(start + std::time::Duration::from_secs(29)));
+      assert_eq!(
+         model.remaining_secs(start + timeout),
+         Some(0.0),
+         "remaining must saturate at the deadline"
+      );
+      assert_eq!(
+         model.remaining_secs(start + std::time::Duration::from_secs(90)),
+         Some(0.0),
+         "remaining must never go negative"
+      );
+
+      assert!(!model.is_expired(start + timeout - std::time::Duration::from_nanos(1)));
+      assert!(model.is_expired(start + timeout));
+
+      // A prompt presented while one is active replaces it and resets the selection.
+      model.state_mut().duration = Duration::Forever;
+      model.state_mut().scope_domain = true;
+      let mut next = prompt(Some("github.com"), true);
+      next.id = 9;
+      model.present(
+         next.clone(),
+         std::time::Duration::from_secs(10),
+         start,
+      );
+      assert_eq!(model.prompt(), Some(&next));
+      assert_eq!(model.state_mut().duration, Duration::Session);
+      assert!(!model.state_mut().scope_domain);
+      assert_eq!(model.remaining_secs(start), Some(10.0));
+   }
+
+   #[test]
+   fn raise_once_fires_once_per_prompt_and_again_for_a_new_id() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      assert_eq!(
+         model.raise_once(),
+         None,
+         "nothing to raise while idle"
+      );
+
+      model.present(
+         prompt(Some("www.google.com"), true),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      assert_eq!(model.raise_once(), Some(7));
+      assert_eq!(model.raise_once(), None);
+
+      let mut next = prompt(Some("github.com"), true);
+      next.id = 9;
+      model.present(next, std::time::Duration::from_secs(30), now);
+      assert_eq!(model.raise_once(), Some(9));
+      assert_eq!(model.raise_once(), None);
+   }
+
+   #[test]
+   fn submit_queues_the_states_decision_and_clears_the_prompt() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      let request = prompt(Some("www.google.com"), true);
+      model.present(
+         request.clone(),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      model.state_mut().duration = Duration::Forever;
+      model.state_mut().scope_domain = true;
+
+      let expected = model.state_mut().decision(&request, Action::Allow);
+      model.submit(Decision {
+         action: Action::Allow,
+         duration: Duration::Forever,
+         scope: ScopeChoice::AnyConnection,
+      });
+
+      assert_eq!(model.take_outgoing(), vec![expected.clone()]);
+      assert_eq!(expected.prompt_id, 7);
+      assert_eq!(expected.action, Action::Allow);
+      assert_eq!(expected.duration, Duration::Forever);
+      assert_eq!(
+         expected.scope,
+         ScopeChoice::Domain {
+            host: "www.google.com".to_owned(),
+            subdomains: false,
+         }
+      );
+      assert!(model.prompt().is_none());
+      assert_eq!(model.remaining_secs(now), None);
+   }
+
+   #[test]
+   fn clear_without_submit_pushes_nothing() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      model.present(
+         prompt(Some("www.google.com"), true),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+      model.clear();
+
+      assert!(model.prompt().is_none());
+      assert!(!model.is_expired(now + std::time::Duration::from_secs(120)));
+      assert!(model.take_outgoing().is_empty());
+   }
+
+   #[test]
+   fn take_outgoing_empties_the_buffer() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      for id in [7u64, 9] {
+         let mut request = prompt(Some("www.google.com"), true);
+         request.id = id;
+         model.present(request, std::time::Duration::from_secs(30), now);
+         model.submit(Decision {
+            action: Action::Deny,
+            duration: Duration::Session,
+            scope: ScopeChoice::AnyConnection,
+         });
+      }
+
+      let drained = model.take_outgoing();
+      assert_eq!(drained.len(), 2);
+      assert_eq!(drained[0].prompt_id, 7);
+      assert_eq!(drained[1].prompt_id, 9);
+      assert!(
+         model.take_outgoing().is_empty(),
+         "the buffer must be empty after a take"
+      );
    }
 }
