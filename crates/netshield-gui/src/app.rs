@@ -288,7 +288,16 @@ impl App {
       let root = egui::ViewportId::ROOT;
       ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Minimized(false));
       ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Visible(true));
-      ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Focus);
+      if self.alert {
+         // The root window *is* the alert here, so it is the one that must take focus.
+         ctx.send_viewport_cmd_to(root, egui::ViewportCommand::Focus);
+      }
+      // In floating mode the alert owns its own viewport and is the only window the user
+      // types into; focusing the root there is what kept the alert behind the main window,
+      // because the root's request is the one that lands. The alert's own `Focus` decides
+      // the active window instead. Un-minimising the root is still needed so the alert is
+      // not owned by a minimised parent. Do not re-add a root `Focus` as a fallback: send
+      // `Focus` to the alert viewport and leave the root untouched.
       ctx.send_viewport_cmd_to(
          root,
          egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical),
