@@ -165,6 +165,18 @@ attributed to *unknown*, is shown as such in the prompt, and is governed by an e
 `unknown` matcher rather than being silently allowed. Silent allow is not an option: a
 firewall that fails open on lookup failure is a decoration.
 
+This attribution path has a hard limit that no amount of `/proc` polling removes: it can
+only attribute a socket that is still present when the scan runs, and it can only use the
+UID when the kernel supplied one with the packet (`uid: null` in the connection events
+means it did not). Both conditions fail at once for applications that resolve names
+directly against a public resolver (`2606:4700:4700::1111`, `127.0.0.53` and the like): the
+UDP socket is often already closed, and the kernel reports no UID, so the port-only UDP
+fallback yields a candidate inode that no process owns. Such flows are logged as
+`Unknown` — never treated as an allow; `default_action` decides them — and the durable fix
+is socket-creation tracking (eBPF on `connect()`), which is deliberately out of v1 scope.
+The one-second negative flow cache only makes the resulting miss cheap; it does not make a
+uid-less flow attributable.
+
 Root-owned sockets are excluded when the PID resolves to the daemon itself.
 
 Future optimisation, explicitly out of scope for v1: replace step 1 with `NETLINK_SOCK_DIAG`

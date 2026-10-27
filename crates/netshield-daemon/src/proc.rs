@@ -22,12 +22,30 @@ use std::time::{Duration as StdDuration, Instant};
 use log::{debug, warn};
 use netshield_core::{Attribution, Family, L4Proto, ProcessInfo};
 
-/// How long an inode→pid or pid→fd answer may be reused.
+/// How long an inode→pid, pid→fd or flow→owner answer may be reused.
 ///
-/// Short on purpose: inodes are recycled as soon as a socket closes, so a longer TTL could
-/// attribute a new socket to the previous owner. One second still collapses the burst of
-/// per-packet lookups a single connection produces.
+/// Short on purpose: inodes and port tuples are recycled as soon as a socket closes, so a
+/// longer TTL could attribute a new socket to the previous owner. One second still
+/// collapses the burst of per-packet lookups a single connection produces.
 const CACHE_TTL: StdDuration = StdDuration::from_secs(1);
+
+/// How long a flow that just missed stays marked so its next packets do not rescan.
+///
+/// Deliberately shorter than [`CACHE_TTL`]: a negative answer is cheap for a burst but
+/// wrong if the socket appears late, so it expires after one second.
+const NEGATIVE_TTL: StdDuration = StdDuration::from_secs(1);
+
+/// Most flow→owner/flow→miss entries kept; a few hundred flows is a desktop session.
+const MAX_FLOWS: usize = 512;
+
+/// Consecutive misses for one flow class that make the condition worth a `warn!`.
+const MISS_WARN_THRESHOLD: u32 = 5;
+
+/// How long one warned flow class stays quiet.
+const MISS_WARN_SUPPRESSION: StdDuration = StdDuration::from_secs(60);
+
+/// Most flow classes the miss-warning limiter remembers.
+const MAX_MISS_KEYS: usize = 256;
 
 /// Most pids one lookup may examine.
 const MAX_PIDS: usize = 4096;
@@ -58,9 +76,19 @@ pub struct AttributeStats {
    pub scan_budget_exhausted: u64,
 }
 
+/// A flow that was attributed, keyed by protocol and both endpoints.
+///
+/// The inode caches only help while the same inode repeats; a browser opens a fresh socket
+/// per connection, so the flow tuple is what actually repeats (retransmits, and the second
+/// and later packets of one flow).
+type FlowKey = (L4Proto, (IpAddr, u16), (IpAddr, u16));
+
+/// The flow class whose consecutive misses are tracked for the operator warning.
+type MissKey = (Option<u32>, L4Proto, u16);
+
 /// The `/proc` walker and its caches.
 ///
-/// The caches are keyed by inode and by pid because the expensive half is the directory
+/// The caches are keyed by flow, inode and pid because the expensive half is the directory
 /// scan, not the table parse: Firefox and Chrome hold hundreds of descriptors, and a
 /// browser opening ten connections in a second would otherwise rescan the same fd
 /// directories ten times.
@@ -68,6 +96,9 @@ pub struct AttributeStats {
 pub struct Attributor {
    inode_to_pid: HashMap<u32, InodeCacheEntry>,
    pid_fds: HashMap<u32, FdCacheEntry>,
+   flow_owners: HashMap<FlowKey, FlowCacheEntry>,
+   flow_misses: HashMap<FlowKey, Instant>,
+   miss_streaks: HashMap<MissKey, MissStreak>,
    stats: AttributeStats,
    /// When the budget warning was last emitted, so a busy scan cannot flood the journal.
    last_budget_warn: Option<Instant>,
@@ -89,12 +120,40 @@ struct FdCacheEntry {
    at: Instant,
 }
 
+/// A cached flow→owner answer.
+#[derive(Clone, Copy, Debug)]
+struct FlowCacheEntry {
+   pid: u32,
+   uid: u32,
+   at: Instant,
+}
+
+/// Consecutive misses for one flow class and when it was last warned about.
+#[derive(Clone, Copy, Debug, Default)]
+struct MissStreak {
+   consecutive: u32,
+   warned_at: Option<Instant>,
+}
+
+/// What a failure line must name so one cause is distinguishable from another.
+struct FailureContext<'a> {
+   local: (IpAddr, u16),
+   remote: (IpAddr, u16),
+   proto: L4Proto,
+   uid: Option<u32>,
+   table: Option<&'a str>,
+   candidates: Option<usize>,
+}
+
 impl Attributor {
    /// Creates an empty attributor with no cached answers.
    pub fn new() -> Self {
       Self {
          inode_to_pid: HashMap::new(),
          pid_fds: HashMap::new(),
+         flow_owners: HashMap::new(),
+         flow_misses: HashMap::new(),
+         miss_streaks: HashMap::new(),
          stats: AttributeStats::default(),
          last_budget_warn: None,
       }
@@ -113,11 +172,58 @@ impl Attributor {
       proto: L4Proto,
       uid: Option<u32>,
    ) -> Attribution {
+      let now = Instant::now();
+      let flow = (proto, local, remote);
+      if let Some((pid, owner_uid)) = self.cached_flow(flow, uid, now) {
+         return match read_process(pid, owner_uid) {
+            Some(process) => {
+               self.stats.hits += 1;
+               Attribution::Process(process)
+            }
+            // The cached owner is gone, so the positive answer is stale: drop it and let
+            // this call go through the `/proc` path instead of trusting it.
+            None => {
+               self.flow_owners.remove(&flow);
+               self.lookup(local, remote, proto, uid, now)
+            }
+         };
+      }
+      if self.flow_miss_active(flow, now) {
+         // The same flow just failed to resolve; its packet burst must cost one scan, not
+         // one per packet. This never becomes an answer, only a cheaper miss.
+         self.record_miss(proto, remote, uid, now);
+         return Attribution::Unknown;
+      }
+      self.lookup(local, remote, proto, uid, now)
+   }
+
+   /// Runs the `/proc` lookup and maintains the flow caches around it.
+   fn lookup(
+      &mut self,
+      local: (IpAddr, u16),
+      remote: (IpAddr, u16),
+      proto: L4Proto,
+      uid: Option<u32>,
+      now: Instant,
+   ) -> Attribution {
+      let flow = (proto, local, remote);
+      let context = FailureContext {
+         local,
+         remote,
+         proto,
+         uid,
+         table: None,
+         candidates: None,
+      };
       let Some(family) = family_of(local.0) else {
-         return self.unknown("local address has no family");
+         return self.unknown(&context, "local address has no family", now);
       };
       if family_of(remote.0) != Some(family) {
-         return self.unknown("flow endpoints mix address families");
+         return self.unknown(
+            &context,
+            "flow endpoints mix address families",
+            now,
+         );
       }
       let Some(table) = socket_table(proto, family) else {
          // ICMP and unknown protocols do not appear in a socket table; v1 does not prompt
@@ -128,27 +234,45 @@ impl Attributor {
             endpoint_label(local),
             endpoint_label(remote)
          );
+         // Not a flow class worth a warning: v1 never prompts for ICMP, so there is no
+         // unknown decision to make visible.
          self.stats.misses += 1;
          return Attribution::Unknown;
+      };
+      let context = FailureContext {
+         table: Some(table),
+         ..context
       };
 
       let text = match fs::read_to_string(format!("{PROC}/net/{table}")) {
          Ok(text) => text,
          Err(error) => {
-            return self.unknown(&format!("cannot read /proc/net/{table}: {error}"));
+            return self.unknown(
+               &context,
+               &format!("cannot read /proc/net/{table}: {error}"),
+               now,
+            );
          }
       };
       let candidates = inode_candidates(&text, family, local, remote, proto);
       if candidates.is_empty() {
-         return self.unknown(&format!(
-            "no /proc/net/{table} row for {} -> {}",
-            endpoint_label(local),
-            endpoint_label(remote)
-         ));
+         return self.unknown(
+            &context,
+            "no matching socket row in the table",
+            now,
+         );
       }
+      let context = FailureContext {
+         candidates: Some(candidates.len()),
+         ..context
+      };
       if candidates.len() == 1 && candidates[0] == 0 {
          // TIME_WAIT and friends keep a table row but no live socket to own it.
-         return self.unknown("the matching socket row has inode 0");
+         return self.unknown(
+            &context,
+            "the matching socket row has inode 0",
+            now,
+         );
       }
 
       let owner = candidate_owner(&candidates, uid, |inode| {
@@ -158,7 +282,11 @@ impl Attributor {
          }
       });
       let (inode, pid, process_uid) = match owner {
-         CandidateOwner::Found { inode, pid, uid } => (inode, pid, uid),
+         CandidateOwner::Found {
+            inode,
+            pid,
+            uid: owner_uid,
+         } => (inode, pid, owner_uid),
          CandidateOwner::Mismatch {
             inode,
             pid,
@@ -168,38 +296,54 @@ impl Attributor {
             // The fd exists but belongs to someone else than the packet said: the socket
             // was reused between the queue and this scan. Guessing would grant the wrong
             // application's policy.
-            self.stats.misses += 1;
             warn!(
                "attribution refused for inode {inode}: packet uid {packet_uid} but \
                 /proc/{pid} is owned by uid {owner_uid}"
             );
-            return Attribution::Unknown;
+            return self.unknown(
+               &context,
+               &format!(
+                  "socket inode {inode} is owned by uid {owner_uid}, not the packet uid \
+                   {packet_uid}"
+               ),
+               now,
+            );
          }
          CandidateOwner::Ambiguous => {
             return self.unknown(
+               &context,
                "several unconnected UDP sockets share the local port and the packet has no uid",
+               now,
             );
          }
          CandidateOwner::Missing => {
-            return self.unknown(&format!(
-               "no /proc/<pid>/fd link owns any of the {} candidate inode(s)",
-               candidates.len()
-            ));
+            return self.unknown(&context, "no /proc fd link holds the inode", now);
          }
       };
 
       let Some(process) = read_process(pid, process_uid) else {
-         return self.unknown(&format!(
-            "cannot read /proc/{pid} identity for inode {inode}"
-         ));
+         return self.unknown(
+            &context,
+            &format!("cannot read /proc/{pid} identity for inode {inode}"),
+            now,
+         );
       };
       self.inode_to_pid.insert(
          inode,
          InodeCacheEntry {
             pid,
             uid: process_uid,
-            at: Instant::now(),
+            at: now,
          },
+      );
+      self.remember_success(
+         flow,
+         FlowCacheEntry {
+            pid,
+            uid: process_uid,
+            at: now,
+         },
+         (uid, proto, remote.1),
       );
       self.stats.hits += 1;
       Attribution::Process(process)
@@ -208,6 +352,137 @@ impl Attributor {
    /// Returns the per-lookup counters.
    pub fn stats(&self) -> AttributeStats {
       self.stats
+   }
+
+   /// Returns a fresh flow→owner answer, or `None` when it is stale or disagrees with the
+   /// packet's uid.
+   fn cached_flow(&mut self, flow: FlowKey, uid: Option<u32>, now: Instant) -> Option<(u32, u32)> {
+      let entry = *self.flow_owners.get(&flow)?;
+      if now.saturating_duration_since(entry.at) >= CACHE_TTL {
+         self.flow_owners.remove(&flow);
+         return None;
+      }
+      if uid.is_some_and(|uid| uid != entry.uid) {
+         // A recycled tuple with a different owner is not evidence about this packet.
+         self.flow_owners.remove(&flow);
+         return None;
+      }
+      Some((entry.pid, entry.uid))
+   }
+
+   /// Records a success: it clears the flow's negative marker and the flow class's miss
+   /// streak, then stores the positive answer.
+   fn remember_success(&mut self, flow: FlowKey, entry: FlowCacheEntry, class: MissKey) {
+      self.flow_misses.remove(&flow);
+      self.miss_streaks.remove(&class);
+      self.remember_flow(flow, entry);
+   }
+
+   /// Stores a successful flow→owner answer, bounding the cache by dropping expired and
+   /// then oldest entries.
+   fn remember_flow(&mut self, flow: FlowKey, entry: FlowCacheEntry) {
+      if self.flow_owners.len() >= MAX_FLOWS {
+         self
+            .flow_owners
+            .retain(|_, cached| entry.at.saturating_duration_since(cached.at) < CACHE_TTL);
+         while self.flow_owners.len() >= MAX_FLOWS {
+            let Some(oldest) = self
+               .flow_owners
+               .iter()
+               .min_by_key(|(_, cached)| cached.at)
+               .map(|(flow, _)| *flow)
+            else {
+               break;
+            };
+            self.flow_owners.remove(&oldest);
+         }
+      }
+      self.flow_owners.insert(flow, entry);
+   }
+
+   /// Whether this flow failed recently enough that re-scanning it would be waste.
+   fn flow_miss_active(&mut self, flow: FlowKey, now: Instant) -> bool {
+      let Some(at) = self.flow_misses.get(&flow).copied() else {
+         return false;
+      };
+      if now.saturating_duration_since(at) >= NEGATIVE_TTL {
+         self.flow_misses.remove(&flow);
+         return false;
+      }
+      true
+   }
+
+   /// Marks a flow so its next packet in the next second does not rescan `/proc`.
+   fn mark_flow_miss(&mut self, flow: FlowKey, now: Instant) {
+      if self.flow_misses.len() >= MAX_FLOWS {
+         self
+            .flow_misses
+            .retain(|_, at| now.saturating_duration_since(*at) < NEGATIVE_TTL);
+         if self.flow_misses.len() >= MAX_FLOWS {
+            self.flow_misses.clear();
+         }
+      }
+      self.flow_misses.insert(flow, now);
+   }
+
+   /// Counts one miss and emits the operator warning when a flow class has failed often
+   /// enough to stop looking like a one-off race.
+   fn record_miss(
+      &mut self,
+      proto: L4Proto,
+      remote: (IpAddr, u16),
+      uid: Option<u32>,
+      now: Instant,
+   ) {
+      self.stats.misses += 1;
+      let key = (uid, proto, remote.1);
+      if let Some(message) = self.miss_warning(key, proto, remote, uid, now) {
+         warn!("{message}");
+      }
+   }
+
+   /// Tracks consecutive misses for one `(uid-or-none, proto, remote port)` class and
+   /// returns the warning text exactly when it is due.
+   ///
+   /// The threshold keeps a single race at `debug`; the suppression window keeps a DNS
+   /// burst from filling the journal once the condition is known.
+   fn miss_warning(
+      &mut self,
+      key: MissKey,
+      proto: L4Proto,
+      remote: (IpAddr, u16),
+      uid: Option<u32>,
+      now: Instant,
+   ) -> Option<String> {
+      if self.miss_streaks.len() >= MAX_MISS_KEYS && !self.miss_streaks.contains_key(&key) {
+         self.miss_streaks.retain(|_, streak| {
+            streak
+               .warned_at
+               .is_none_or(|at| now.saturating_duration_since(at) < MISS_WARN_SUPPRESSION)
+         });
+         if self.miss_streaks.len() >= MAX_MISS_KEYS {
+            self.miss_streaks.clear();
+         }
+      }
+      let streak = self.miss_streaks.entry(key).or_default();
+      streak.consecutive = streak.consecutive.saturating_add(1);
+      if streak.consecutive < MISS_WARN_THRESHOLD {
+         return None;
+      }
+      if streak
+         .warned_at
+         .is_some_and(|at| now.saturating_duration_since(at) < MISS_WARN_SUPPRESSION)
+      {
+         return None;
+      }
+      streak.warned_at = Some(now);
+      Some(format!(
+         "attribution cannot map {} flows destined to {} ({}) to a process: these flows \
+          stay unknown and policy decides them, not the daemon",
+         proto,
+         endpoint_label(remote),
+         uid_label(uid)
+      ))
    }
 
    /// Returns a fresh inode→pid cache answer, or `None` when it is stale or disagrees
@@ -316,11 +591,44 @@ impl Attributor {
       }
    }
 
-   /// Records a miss and logs why attribution failed.
-   fn unknown(&mut self, reason: &str) -> Attribution {
-      self.stats.misses += 1;
-      debug!("attribution failed: {reason}");
+   /// Records a miss, marks the flow negative and logs why attribution failed.
+   fn unknown(&mut self, context: &FailureContext<'_>, reason: &str, now: Instant) -> Attribution {
+      self.mark_flow_miss(
+         (context.proto, context.local, context.remote),
+         now,
+      );
+      self.record_miss(context.proto, context.remote, context.uid, now);
+      debug!(
+         "attribution failed: {}",
+         failure_message(context, reason)
+      );
       Attribution::Unknown
+   }
+}
+
+/// Renders the one-line diagnostic shared by every [`Attributor::unknown`] failure.
+///
+/// It names the flow, the protocol, the uid state and the table/candidate count because
+/// those four facts separate a vanished socket from a uid-less resolver packet; a bare
+/// reason cannot. Kept under 160 characters by keeping the table to its basename.
+fn failure_message(context: &FailureContext<'_>, reason: &str) -> String {
+   let table = context.table.map_or("no-table", |table| table);
+   format!(
+      "{} {} -> {} {} table={} cand={}: {reason}",
+      context.proto,
+      endpoint_label(context.local),
+      endpoint_label(context.remote),
+      uid_label(context.uid),
+      table,
+      context.candidates.map_or_else(|| "-".to_owned(), |count| count.to_string())
+   )
+}
+
+/// Renders the kernel-supplied uid state as `uid=Some(n)` or `uid=none`.
+fn uid_label(uid: Option<u32>) -> String {
+   match uid {
+      Some(uid) => format!("uid=Some({uid})"),
+      None => "uid=none".to_owned(),
    }
 }
 
@@ -1071,5 +1379,315 @@ mod tests {
       assert_eq!(attributor.stats().misses, 1);
       assert_eq!(attributor.stats().hits, 0);
       assert_eq!(attributor.stats().scan_budget_exhausted, 0);
+   }
+
+   #[test]
+   fn failure_message_names_flow_protocol_table_uid_and_candidates() {
+      let context = FailureContext {
+         local: v4([192, 168, 1, 5], 32768),
+         remote: v4([1, 1, 1, 1], 53),
+         proto: L4Proto::Udp,
+         uid: None,
+         table: Some("udp"),
+         candidates: Some(1),
+      };
+      let message = failure_message(&context, "no /proc fd link holds the inode");
+      assert!(message.contains("udp "), "{message}");
+      assert!(
+         message.contains("192.168.1.5:32768 -> 1.1.1.1:53"),
+         "{message}"
+      );
+      assert!(message.contains("uid=none"), "{message}");
+      assert!(message.contains("table=udp"), "{message}");
+      assert!(message.contains("cand=1"), "{message}");
+      assert!(
+         message.len() < 160,
+         "too long ({}): {message}",
+         message.len()
+      );
+
+      let with_uid = FailureContext {
+         uid: Some(1000),
+         ..context
+      };
+      let message = failure_message(&with_uid, "no matching socket row in the table");
+      assert!(message.contains("uid=Some(1000)"), "{message}");
+   }
+
+   #[test]
+   fn failure_message_renders_a_missing_table_and_candidate_count() {
+      let context = FailureContext {
+         local: v6(
+            "2606:4700:4700::1111".parse().expect("literal"),
+            5353,
+         ),
+         remote: v6(
+            "2606:4700:4700::1001".parse().expect("literal"),
+            53,
+         ),
+         proto: L4Proto::Udp,
+         uid: None,
+         table: None,
+         candidates: None,
+      };
+      let message = failure_message(&context, "local address has no family");
+      assert!(
+         message.contains("[2606:4700:4700::1111]:5353 ->"),
+         "{message}"
+      );
+      assert!(message.contains("uid=none"), "{message}");
+      assert!(message.contains("table=no-table"), "{message}");
+      assert!(message.contains("cand=-"), "{message}");
+   }
+
+   fn flow(local_port: u16, remote_port: u16) -> FlowKey {
+      (
+         L4Proto::Udp,
+         v4([10, 0, 0, 2], local_port),
+         v4([1, 1, 1, 1], remote_port),
+      )
+   }
+
+   #[test]
+   fn flow_cache_returns_the_same_owner_without_rescanning_proc() {
+      let mut attributor = Attributor::new();
+      let flow = flow(50_000, 53);
+      let start = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 4242,
+            uid: 1000,
+            at: start,
+         },
+      );
+
+      // A second call inside the TTL is answered from the flow cache alone; the test
+      // would have no `/proc` row for this synthetic tuple, so a scan could not pass.
+      assert_eq!(
+         attributor.cached_flow(
+            flow,
+            Some(1000),
+            start + StdDuration::from_millis(300)
+         ),
+         Some((4242, 1000))
+      );
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), start + CACHE_TTL),
+         None,
+         "an entry at the TTL bound is stale"
+      );
+      assert!(
+         attributor.flow_owners.is_empty(),
+         "expired entries are dropped"
+      );
+   }
+
+   #[test]
+   fn flow_cache_answers_a_second_lookup_after_the_socket_closed() {
+      let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+      socket.connect("127.0.0.1:9").expect("connect the datagram socket");
+      let local = socket.local_addr().expect("local address");
+      let peer = socket.peer_addr().expect("peer address");
+      let uid = own_uid();
+
+      let mut attributor = Attributor::new();
+      let first = attributor.attribute(
+         (local.ip(), local.port()),
+         (peer.ip(), peer.port()),
+         L4Proto::Udp,
+         Some(uid),
+      );
+      assert!(matches!(first, Attribution::Process(_)));
+      drop(socket);
+
+      // The socket is gone, so the table/scan path would now miss; the flow cache must
+      // answer with the owner it was told about for this still-fresh tuple.
+      let second = attributor.attribute(
+         (local.ip(), local.port()),
+         (peer.ip(), peer.port()),
+         L4Proto::Udp,
+         Some(uid),
+      );
+      assert_eq!(first, second);
+      assert_eq!(attributor.stats().hits, 2);
+      assert_eq!(attributor.stats().misses, 0);
+   }
+
+   #[test]
+   fn flow_cache_refuses_a_cached_owner_that_disagrees_with_the_packet_uid() {
+      let mut attributor = Attributor::new();
+      let flow = flow(50_001, 53);
+      let start = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1,
+            uid: 1000,
+            at: start,
+         },
+      );
+      assert_eq!(
+         attributor.cached_flow(flow, Some(0), start + StdDuration::from_millis(1)),
+         None
+      );
+      assert!(attributor.flow_owners.is_empty());
+   }
+
+   #[test]
+   fn flow_cache_is_bounded_to_a_few_hundred_entries() {
+      let mut attributor = Attributor::new();
+      let start = Instant::now();
+      for port in 0..(MAX_FLOWS as u16 + 16) {
+         attributor.remember_flow(
+            flow(20_000, port),
+            FlowCacheEntry {
+               pid: 1,
+               uid: 1,
+               at: start,
+            },
+         );
+      }
+      assert!(attributor.flow_owners.len() <= MAX_FLOWS);
+   }
+
+   #[test]
+   fn negative_flow_entry_expires_after_its_short_ttl() {
+      let mut attributor = Attributor::new();
+      let flow = flow(50_002, 53);
+      let start = Instant::now();
+      attributor.mark_flow_miss(flow, start);
+
+      assert!(attributor.flow_miss_active(flow, start + StdDuration::from_millis(500)));
+      assert!(!attributor.flow_miss_active(flow, start + NEGATIVE_TTL));
+      assert!(!attributor.flow_misses.contains_key(&flow));
+   }
+
+   #[test]
+   fn a_later_success_clears_the_negative_marker_and_the_miss_streak() {
+      let mut attributor = Attributor::new();
+      let flow = flow(50_003, 53);
+      let class = (Some(1000), L4Proto::Udp, 53);
+      let start = Instant::now();
+      attributor.mark_flow_miss(flow, start);
+      attributor.record_miss(L4Proto::Udp, flow.2, Some(1000), start);
+      assert_eq!(attributor.miss_streaks[&class].consecutive, 1);
+
+      attributor.remember_success(
+         flow,
+         FlowCacheEntry {
+            pid: 777,
+            uid: 1000,
+            at: start,
+         },
+         class,
+      );
+      assert!(!attributor.flow_misses.contains_key(&flow));
+      assert!(!attributor.miss_streaks.contains_key(&class));
+      assert_eq!(
+         attributor.cached_flow(
+            flow,
+            Some(1000),
+            start + StdDuration::from_millis(1)
+         ),
+         Some((777, 1000)),
+         "the success must overwrite the negative entry"
+      );
+   }
+
+   #[test]
+   fn miss_warning_fires_once_for_six_misses_and_again_after_suppression() {
+      let mut attributor = Attributor::new();
+      let start = Instant::now();
+      let remote = flow(50_004, 53).2;
+      let key = (None, L4Proto::Udp, 53);
+      let mut warnings = Vec::new();
+      for step in 0..6 {
+         let now = start + StdDuration::from_millis(step * 10);
+         if let Some(message) = attributor.miss_warning(key, L4Proto::Udp, remote, None, now) {
+            warnings.push(message);
+         }
+      }
+      assert_eq!(
+         warnings.len(),
+         1,
+         "one warning for the burst: {warnings:?}"
+      );
+      assert!(
+         warnings[0].contains("1.1.1.1:53"),
+         "{}",
+         warnings[0]
+      );
+      assert!(
+         warnings[0].contains("uid=none"),
+         "{}",
+         warnings[0]
+      );
+      assert!(
+         warnings[0].contains("cannot map udp flows"),
+         "{}",
+         warnings[0]
+      );
+
+      let later = start + MISS_WARN_SUPPRESSION - StdDuration::from_secs(1);
+      assert_eq!(
+         attributor.miss_warning(key, L4Proto::Udp, remote, None, later),
+         None,
+         "a warning inside the suppression window is dropped"
+      );
+      let after = start + MISS_WARN_SUPPRESSION + StdDuration::from_secs(1);
+      let message = attributor
+         .miss_warning(key, L4Proto::Udp, remote, None, after)
+         .expect("a warning after the suppression window");
+      assert!(message.contains("1.1.1.1:53"), "{message}");
+   }
+
+   #[test]
+   fn miss_warning_treats_different_flow_classes_separately() {
+      let mut attributor = Attributor::new();
+      let start = Instant::now();
+      let remote = flow(50_005, 53).2;
+      for step in 0..5 {
+         let now = start + StdDuration::from_millis(step);
+         let _ = attributor.miss_warning(
+            (None, L4Proto::Udp, 53),
+            L4Proto::Udp,
+            remote,
+            None,
+            now,
+         );
+      }
+      let other = (Some(1000), L4Proto::Udp, 53);
+      assert_eq!(
+         attributor.miss_warning(other, L4Proto::Udp, remote, Some(1000), start),
+         None,
+         "a different uid is a different class"
+      );
+      assert_eq!(attributor.miss_streaks[&other].consecutive, 1);
+   }
+
+   #[test]
+   fn failure_message_stays_one_line() {
+      let context = FailureContext {
+         local: v6(
+            "2001:db8:1234:5678:9abc:def0:1234:5678".parse().expect("literal"),
+            65535,
+         ),
+         remote: v6(
+            "2606:4700:4700::1111".parse().expect("literal"),
+            53,
+         ),
+         proto: L4Proto::Udp,
+         uid: Some(u32::MAX),
+         table: Some("udp6"),
+         candidates: Some(MAX_UDP_CANDIDATES),
+      };
+      let message = failure_message(&context, "no /proc fd link holds the inode");
+      assert!(!message.contains('\n'), "{message}");
+      assert!(
+         message.len() < 160,
+         "too long ({}): {message}",
+         message.len()
+      );
    }
 }
