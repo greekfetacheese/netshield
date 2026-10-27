@@ -1,2 +1,5 @@
 /target
 **/target
+
+# Python bytecode from the dev/ harnesses
+dev/__pycache__/

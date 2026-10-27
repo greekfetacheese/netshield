@@ -679,18 +679,36 @@ impl Daemon {
       // created. The answered prompt is settled here with the user's own verdict, so an
       // older rule cannot override an explicit answer.
       let now = now_secs();
-      match decide.duration {
+      let app = record.connection.app_name();
+      let dest = dest_label(&record.connection);
+      let rule_dest = match &decide.scope {
+         ScopeChoice::AnyConnection => "any".to_owned(),
+         ScopeChoice::Domain {
+            host,
+            subdomains: true,
+         } => format!("{host} (+subdomains)"),
+         ScopeChoice::Domain { host, .. } => host.clone(),
+         ScopeChoice::Address => record.connection.remote.addr.to_string(),
+      };
+      let app_kind = match &record.connection.process {
+         Attribution::Process(process) if process.exe.is_some() => "exe",
+         Attribution::Unknown => "unknown",
+         Attribution::Process(_) => "any",
+      };
+      let mechanism = match decide.duration {
          RuleDuration::Once => {
             self.policy.grant(
                record.connection.flow_key(),
                decide.action,
                now.saturating_add(crate::policy::GRANT_TTL_SECS),
             );
+            format!("created a once flow grant for {app}")
          }
          RuleDuration::Session => {
             let rule = rule_for(&record.connection, &decide, now);
             self.policy.upsert_rule(rule);
             self.publish_rules();
+            format!("created an in-memory {app_kind} rule for {app}")
          }
          RuleDuration::Forever => {
             let rule = rule_for(&record.connection, &decide, now);
@@ -699,8 +717,11 @@ impl Daemon {
                error!("could not persist a forever rule: {err}");
             }
             self.publish_rules();
+            format!("created and persisted a forever {app_kind} rule for {app}")
          }
-      }
+      };
+      let line = decision_line(record.id, &app, &dest, &decide);
+      info!("{line}");
 
       let Some(resolved) = self.pending.resolve(record.id, Instant::now()) else {
          // A `None` here means the prompt was already settled; answering its packets twice
@@ -726,7 +747,11 @@ impl Daemon {
       // and the new rule already decides it, so the sweep settles it (and any decided head
       // behind it) and announces only the head it stops on. The answered prompt is already
       // resolved, so it can never be announced here.
-      self.sweep_decided_prompts();
+      let swept = self.sweep_decided_prompts();
+      debug!(
+         "prompt {}: {} (dest {}); {} queued prompt(s) swept",
+         record.id, mechanism, rule_dest, swept
+      );
       // Resolve first, then inspect the new head: announce the activated prompt only when it
       // survived the sweep. When the sweep settled it, it has already announced the head the
       // queue stops on, and nothing else is visible.
@@ -745,7 +770,7 @@ impl Daemon {
    /// resolved, so the prompt activated behind it is very often another flow from the same
    /// app and already decided. The surviving head is announced only after the loop stops on
    /// it, so a prompt that is settled in the same pass is never broadcast.
-   fn sweep_decided_prompts(&mut self) {
+   fn sweep_decided_prompts(&mut self) -> usize {
       let PromptSweep {
          swept,
          announced,
@@ -764,6 +789,7 @@ impl Daemon {
             self.pending.len()
          );
       }
+      let count = swept.len();
       for swept in swept {
          // The survivors are announced below, once every prompt has been settled, so this
          // loop never announces a prompt that a later iteration could settle too.
@@ -772,6 +798,7 @@ impl Daemon {
       for head in announced {
          self.announce_prompt(&head);
       }
+      count
    }
 
    /// Answers a swept prompt's packets, closes it for the clients and logs why it was not
@@ -984,13 +1011,12 @@ impl Daemon {
             );
          }
          warn!(
-            "prompt {} timed out after {}s; denied {} from {} to {}:{}",
+            "prompt {} timed out after {}s; denied {} from {} to {}",
             record.id,
             self.config.prompt_timeout_secs,
             record.connection.app_name(),
             record.connection.local.addr,
-            record.connection.remote.addr,
-            record.connection.remote.port
+            dest_label(&record.connection)
          );
          self.ipc.broadcast(&Response::PromptClosed {
             id: record.id,
@@ -1105,6 +1131,51 @@ impl Daemon {
          via_prompt,
       };
       self.ipc.broadcast(&Response::Connection(event));
+   }
+}
+
+/// A short human label for the scope the user chose, for the decision log line.
+fn scope_label(scope: &ScopeChoice) -> String {
+   match scope {
+      ScopeChoice::AnyConnection => "any connection by this app".to_owned(),
+      ScopeChoice::Domain {
+         host,
+         subdomains: false,
+      } => format!("domain {host}"),
+      ScopeChoice::Domain {
+         host,
+         subdomains: true,
+      } => format!("domain {host} (+subdomains)"),
+      ScopeChoice::Address => "this address".to_owned(),
+   }
+}
+
+/// The one-line record of a decision: which action, for how long, and at what scope.
+fn decision_line(id: u64, app: &str, dest: &str, decide: &DecideRequest) -> String {
+   let action = match decide.action {
+      Action::Allow => "allow",
+      Action::Deny => "deny",
+   };
+   let duration = match decide.duration {
+      RuleDuration::Once => "once",
+      RuleDuration::Session => "until restart",
+      RuleDuration::Forever => "forever",
+   };
+   format!(
+      "prompt {id} for {app} -> {dest}: {action}, {duration}, scope {}",
+      scope_label(&decide.scope)
+   )
+}
+
+/// The destination as the prompt logs it: the learned domain when there is one, otherwise
+/// `addr:port`.
+fn dest_label(connection: &Connection) -> String {
+   match connection.domain.as_deref() {
+      Some(domain) => domain.to_owned(),
+      None => format!(
+         "{}:{}",
+         connection.remote.addr, connection.remote.port
+      ),
    }
 }
 
@@ -1586,6 +1657,112 @@ mod tests {
       assert!(would_block(&timed_out));
       assert!(would_block(&again));
       assert!(!would_block(&denied));
+   }
+
+   #[test]
+   fn scope_label_names_each_scope_and_keeps_the_host_as_given() {
+      assert_eq!(
+         scope_label(&ScopeChoice::AnyConnection),
+         "any connection by this app"
+      );
+      assert_eq!(
+         scope_label(&ScopeChoice::Domain {
+            host: "i.ytimg.com".to_owned(),
+            subdomains: false,
+         }),
+         "domain i.ytimg.com"
+      );
+      assert_eq!(
+         scope_label(&ScopeChoice::Domain {
+            host: "i.ytimg.com".to_owned(),
+            subdomains: true,
+         }),
+         "domain i.ytimg.com (+subdomains)"
+      );
+      assert_eq!(scope_label(&ScopeChoice::Address), "this address");
+      assert_eq!(
+         scope_label(&ScopeChoice::Domain {
+            host: "I.YTIMG.COM".to_owned(),
+            subdomains: false,
+         }),
+         "domain I.YTIMG.COM",
+         "the label prints the host as given; rule_for lower-cases for matching"
+      );
+   }
+
+   #[test]
+   fn decision_line_orders_action_duration_and_scope() {
+      let decide = |action, duration, scope| DecideRequest {
+         prompt_id: 12,
+         action,
+         duration,
+         scope,
+      };
+      assert_eq!(
+         decision_line(
+            12,
+            "brave",
+            "i.ytimg.com",
+            &decide(
+               Action::Allow,
+               RuleDuration::Session,
+               ScopeChoice::Domain {
+                  host: "i.ytimg.com".to_owned(),
+                  subdomains: true,
+               },
+            ),
+         ),
+         "prompt 12 for brave -> i.ytimg.com: allow, until restart, scope domain \
+          i.ytimg.com (+subdomains)"
+      );
+      assert_eq!(
+         decision_line(
+            13,
+            "curl",
+            "93.184.216.34:443",
+            &decide(
+               Action::Deny,
+               RuleDuration::Once,
+               ScopeChoice::Address,
+            ),
+         ),
+         "prompt 13 for curl -> 93.184.216.34:443: deny, once, scope this address"
+      );
+      assert_eq!(
+         decision_line(
+            14,
+            "firefox",
+            "example.com",
+            &decide(
+               Action::Allow,
+               RuleDuration::Forever,
+               ScopeChoice::AnyConnection,
+            ),
+         ),
+         "prompt 14 for firefox -> example.com: allow, forever, scope any connection by \
+          this app"
+      );
+   }
+
+   #[test]
+   fn dest_label_prefers_the_learned_domain() {
+      let mut connection = Connection {
+         family: Family::V4,
+         proto: L4Proto::Tcp,
+         local: Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 51_234,
+         },
+         remote: Endpoint {
+            addr: "93.184.216.34".parse().expect("an IPv4 address"),
+            port: 443,
+         },
+         process: Attribution::Unknown,
+         domain: Some("example.com".to_owned()),
+      };
+      assert_eq!(dest_label(&connection), "example.com");
+      connection.domain = None;
+      assert_eq!(dest_label(&connection), "93.184.216.34:443");
    }
 
    #[test]
