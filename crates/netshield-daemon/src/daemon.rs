@@ -553,8 +553,9 @@ impl Daemon {
             info!("shutdown signal received; stopping");
             let stats = self.attributor.stats();
             info!(
-               "attribution: {} flows came from the send registry, {} scans still found nothing",
-               stats.registry_hits, stats.misses
+               "attribution: {} flows came from the send registry ({} misses, {} refused), \
+                {} scans still found nothing",
+               stats.registry_hits, stats.registry_misses, stats.registry_refusals, stats.misses
             );
             return;
          }
