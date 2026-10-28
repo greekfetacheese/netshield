@@ -1,4 +1,5 @@
-//! The nftables table that hands new flows to the daemon.
+//! The nftables table that hands new flows to the daemon, and that kills the flows it
+//! later revokes.
 //!
 //! One `inet` table covers IPv4 and IPv6. It is always installed in a single
 //! `nft -f -` transaction and removed by name, so this module can never disturb another
@@ -7,6 +8,13 @@
 //! The ruleset itself is rendered by [`ruleset_text`], a pure function, because the text
 //! is the security-relevant artefact and must be assertable in a unit test — the sandbox
 //! this ships from has no `CAP_NET_ADMIN` and no business touching the host firewall.
+//!
+//! Killing a connection needs two parts. Deleting its conntrack entry only makes the
+//! kernel forget it, and the endpoints carry on; the connection ends only when its exact
+//! tuple is rejected. The two sets below are that mechanism: [`kill_flows`] adds the
+//! tuples of the flows being revoked, the reject rules reset them for the length of the
+//! element's timeout, and the `ct state established` match keeps a *new* connection from
+//! being rejected, so the app can reconnect and be prompted again.
 
 use std::fmt;
 use std::io::Write;
@@ -14,8 +22,21 @@ use std::process::{Command, Stdio};
 
 use log::{info, warn};
 
+use crate::conntrack::Flow;
+
 /// The one table this daemon owns, and the only one it ever touches.
 pub const TABLE: &str = "netshield";
+
+/// Marks this daemon writes into conntrack live in the top two bits, so a flush cannot touch a flow
+/// stamped by another tool (Docker and Kubernetes both use conntrack marks).
+pub const OWNER_TAG: u32 = 0x4000_0000;
+/// The bits that identify an owner at all, as opposed to which one.
+pub const OWNER_TAG_MASK: u32 = 0xc000_0000;
+
+/// The IPv4 set of tuples that are being rejected while their timeout lasts.
+const KILLED4: &str = "killed4";
+/// The IPv6 counterpart of [`KILLED4`].
+const KILLED6: &str = "killed6";
 
 /// Why an nftables operation failed.
 #[derive(Debug)]
@@ -54,6 +75,16 @@ impl std::error::Error for FirewallError {}
 pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String {
    let mut text = String::new();
    text.push_str("table inet netshield {\n");
+   // The sets have to be declared at table level, before the chain that references them:
+   // nft cannot forward-reference a set, and a set cannot be declared inside a chain.
+   text.push_str(&format!(
+      "    set {KILLED4} {{ type ipv4_addr . ipv4_addr . inet_service . inet_service; \
+       flags timeout; }}\n"
+   ));
+   text.push_str(&format!(
+      "    set {KILLED6} {{ type ipv6_addr . ipv6_addr . inet_service . inet_service; \
+       flags timeout; }}\n"
+   ));
    text.push_str("    chain output {\n");
    text.push_str("        type filter hook output priority mangle; policy accept;\n");
    if !filter_loopback {
@@ -61,6 +92,31 @@ pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String
          "        oifname \"lo\" return comment \"netshield: loopback is not filtered\"\n",
       );
    }
+   // Stamped before either queue rule: a queue verdict does not end chain traversal, but
+   // the mark has to be set before any decision is made about the packet.
+   text.push_str(&format!(
+      "        ct state new ct mark set meta skuid | {OWNER_TAG:#010x} \
+       comment \"netshield: record the owner\"\n"
+   ));
+   // `ct state established` is load-bearing: it keeps a new connection from being
+   // rejected, so the app can open a fresh one and be prompted again. Keying on the exact
+   // tuple is what kills only the revoked flow.
+   text.push_str(&format!(
+      "        ct state established ip saddr . ip daddr . tcp sport . tcp dport \
+       @{KILLED4} reject with tcp reset\n"
+   ));
+   text.push_str(&format!(
+      "        ct state established ip saddr . ip daddr . udp sport . udp dport \
+       @{KILLED4} reject with icmpx type admin-prohibited\n"
+   ));
+   text.push_str(&format!(
+      "        ct state established ip6 saddr . ip6 daddr . tcp sport . tcp dport \
+       @{KILLED6} reject with tcp reset\n"
+   ));
+   text.push_str(&format!(
+      "        ct state established ip6 saddr . ip6 daddr . udp sport . udp dport \
+       @{KILLED6} reject with icmpx type admin-prohibited\n"
+   ));
    text.push_str(&format!(
       "        tcp flags & (fin|syn|rst|ack) == syn queue num {queue} bypass \
        comment \"netshield: tcp syn\"\n"
@@ -81,6 +137,56 @@ pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String
    text.push_str("    }\n");
    text.push_str("}\n");
    text
+}
+
+/// Deletes the flows in `flows`: for the length of the timeout, the kernel resets them and
+/// the app has to open a new connection, which the daemon will decide again.
+///
+/// One `nft -f -` invocation adds every element, because a process per flow would be a
+/// process per connection. An empty `flows` is a no-op success.
+pub fn kill_flows(flows: &[Flow], timeout_secs: u64) -> Result<usize, FirewallError> {
+   if flows.is_empty() {
+      return Ok(0);
+   }
+   let script = element_text(flows, timeout_secs);
+   nft(&["-f", "-"], Some(&script))?;
+   info!(
+      "rejecting {} flow(s) for {timeout_secs}s",
+      flows.len()
+   );
+   Ok(flows.len())
+}
+
+/// Renders the one `nft -f -` script that adds every flow to its family's set.
+///
+/// Pure, so the exact element syntax — including the per-element timeout, without which
+/// the reject would outlive the revocation — is unit-tested without `nft`.
+fn element_text(flows: &[Flow], timeout_secs: u64) -> String {
+   let mut v4 = Vec::new();
+   let mut v6 = Vec::new();
+   for flow in flows {
+      match flow {
+         Flow::V4(source, source_port, destination, destination_port) => v4.push(format!(
+            "{} . {} . {} . {} timeout {timeout_secs}s",
+            source, destination, source_port, destination_port
+         )),
+         Flow::V6(source, source_port, destination, destination_port) => v6.push(format!(
+            "{} . {} . {} . {} timeout {timeout_secs}s",
+            source, destination, source_port, destination_port
+         )),
+      }
+   }
+   let mut script = String::new();
+   for (set, elements) in [(KILLED4, v4), (KILLED6, v6)] {
+      if elements.is_empty() {
+         continue;
+      }
+      script.push_str(&format!(
+         "add element inet {TABLE} {set} {{ {} }}\n",
+         elements.join(", ")
+      ));
+   }
+   script
 }
 
 /// Installs the table in one `nft -f -` transaction.
@@ -302,6 +408,8 @@ fn listed_queues(listing: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+   use std::net::{Ipv4Addr, Ipv6Addr};
+
    use super::*;
 
    #[test]
@@ -312,9 +420,23 @@ mod tests {
          lines,
          [
             "table inet netshield {",
+            "    set killed4 { type ipv4_addr . ipv4_addr . inet_service . inet_service; \
+             flags timeout; }",
+            "    set killed6 { type ipv6_addr . ipv6_addr . inet_service . inet_service; \
+             flags timeout; }",
             "    chain output {",
             "        type filter hook output priority mangle; policy accept;",
             "        oifname \"lo\" return comment \"netshield: loopback is not filtered\"",
+            "        ct state new ct mark set meta skuid | 0x40000000 \
+             comment \"netshield: record the owner\"",
+            "        ct state established ip saddr . ip daddr . tcp sport . tcp dport \
+             @killed4 reject with tcp reset",
+            "        ct state established ip saddr . ip daddr . udp sport . udp dport \
+             @killed4 reject with icmpx type admin-prohibited",
+            "        ct state established ip6 saddr . ip6 daddr . tcp sport . tcp dport \
+             @killed6 reject with tcp reset",
+            "        ct state established ip6 saddr . ip6 daddr . udp sport . udp dport \
+             @killed6 reject with icmpx type admin-prohibited",
             "        tcp flags & (fin|syn|rst|ack) == syn queue num 0 bypass \
              comment \"netshield: tcp syn\"",
             "        ct state new queue num 0 bypass comment \"netshield: non-tcp new flow\"",
@@ -326,6 +448,81 @@ mod tests {
             "    }",
             "}",
          ]
+      );
+   }
+
+   #[test]
+   fn the_reject_sets_are_declared_before_the_chain_that_uses_them() {
+      let text = ruleset_text(0, 1, false);
+      for set in [KILLED4, KILLED6] {
+         let declaration = text
+            .find(&format!("set {set} {{"))
+            .unwrap_or_else(|| panic!("{set} must be declared"));
+         let chain = text.find("chain output {").expect("the output chain exists");
+         assert!(
+            declaration < chain,
+            "{set} must be declared before the chain that references it"
+         );
+      }
+   }
+
+   #[test]
+   fn only_established_flows_match_a_reject_rule() {
+      // `ct state established` is what lets the app reconnect: without it the handshake
+      // of the next connection would be rejected too, and the daemon could never prompt.
+      let text = ruleset_text(0, 1, false);
+      for line in text.lines().filter(|line| line.contains("@killed")) {
+         assert!(
+            line.trim_start().starts_with("ct state established "),
+            "a reject rule must be gated on established state: {line}"
+         );
+      }
+   }
+
+   #[test]
+   fn the_element_file_batches_every_flow() {
+      let flows = [
+         Flow::V4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            51234,
+            Ipv4Addr::new(1, 2, 3, 4),
+            443,
+         ),
+         Flow::V6(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            51235,
+            Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+            80,
+         ),
+      ];
+      let script = element_text(&flows, 60);
+      assert_eq!(
+         script,
+         "add element inet netshield killed4 { 10.0.0.1 . 1.2.3.4 . 51234 . 443 timeout 60s }\n\
+          add element inet netshield killed6 { 2001:db8::1 . 2606:4700:4700::1111 . 51235 . 80 \
+          timeout 60s }\n"
+      );
+   }
+
+   #[test]
+   fn every_element_carries_its_timeout() {
+      let flows = [Flow::V4(
+         Ipv4Addr::new(10, 0, 0, 1),
+         1,
+         Ipv4Addr::new(10, 0, 0, 2),
+         2,
+      )];
+      let script = element_text(&flows, 90);
+      assert!(script.contains(" timeout 90s"));
+      assert_eq!(script.matches("add element").count(), 1);
+      assert_eq!(element_text(&[], 60), "");
+   }
+
+   #[test]
+   fn kill_flows_with_no_flows_is_a_successful_no_op() {
+      assert_eq!(
+         kill_flows(&[], 60).expect("an empty kill is a success"),
+         0
       );
    }
 
@@ -354,11 +551,53 @@ mod tests {
    #[test]
    fn every_rule_is_attributed_and_nothing_else_is_flushed() {
       let text = ruleset_text(3, 4, false);
-      assert_eq!(text.matches("comment \"netshield:").count(), 5);
+      // Six commented rules plus the two set declarations, which are not rules.
+      assert_eq!(text.matches("comment \"netshield:").count(), 6);
       assert!(!text.contains("flush ruleset"));
       assert!(!text.contains("iptables"));
       assert!(text.starts_with("table inet netshield {\n"));
       assert!(text.ends_with("}\n"));
+   }
+
+   #[test]
+   fn the_owner_is_stamped_before_any_queue_verdict() {
+      let text = ruleset_text(3, 4, false);
+      let stamp = text
+         .find(&format!(
+            "ct mark set meta skuid | {OWNER_TAG:#010x}"
+         ))
+         .expect("the output chain stamps the owner before any decision");
+      let syn = text.find("tcp flags").expect("the tcp syn rule is present");
+      let non_tcp = text.find("ct state new queue").expect("the non-tcp rule is present");
+      assert!(
+         stamp < syn,
+         "the stamp must precede the tcp queue rule"
+      );
+      assert!(
+         stamp < non_tcp,
+         "the stamp must precede the non-tcp queue rule"
+      );
+   }
+
+   #[test]
+   fn the_reject_rules_come_after_the_stamp_and_before_the_queues() {
+      let text = ruleset_text(3, 4, false);
+      let stamp = text.find("ct mark set meta skuid").expect("the owner stamp is rendered");
+      let first_reject = text.find("@killed4").expect("the v4 reject rules are rendered");
+      let first_queue = text.find("queue num 3").expect("the tcp queue rule is rendered");
+      assert!(
+         stamp < first_reject,
+         "the stamp must precede the reject rules"
+      );
+      assert!(
+         first_reject < first_queue,
+         "the reject rules must precede the queue rules"
+      );
+      assert_eq!(text.matches("reject with tcp reset").count(), 2);
+      assert_eq!(
+         text.matches("reject with icmpx type admin-prohibited").count(),
+         2
+      );
    }
 
    #[test]

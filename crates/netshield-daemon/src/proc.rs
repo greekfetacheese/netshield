@@ -183,6 +183,12 @@ impl ProcessCache {
       self.identities.get(&pid)
    }
 
+   /// Iterates over every cached identity, so a caller can answer "which processes run this
+   /// executable" from the evidence attribution already gathered instead of rescanning `/proc`.
+   pub fn identities(&self) -> impl Iterator<Item = &CachedIdentity> {
+      self.identities.values()
+   }
+
    /// Returns the number of cached identities.
    pub fn len(&self) -> usize {
       self.identities.len()
@@ -652,6 +658,18 @@ impl Attributor {
          stats.registry_misses = misses;
       }
       stats
+   }
+
+   /// The identities attribution has learned, copied out so the caller never holds the lock.
+   ///
+   /// Empty when nothing has been attributed yet, or when the cache lock was poisoned; a
+   /// revocation then finds no owner rather than panicking.
+   pub fn identities(&self) -> Vec<CachedIdentity> {
+      self
+         .process_cache
+         .lock()
+         .map(|cache| cache.identities().cloned().collect())
+         .unwrap_or_default()
    }
 
    /// The reason to report when no owner was found, and how final that is.

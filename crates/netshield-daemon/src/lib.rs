@@ -12,6 +12,7 @@
 //! control socket the GUI talks to. All four are unit-tested; [`daemon::run`] wires them
 //! together on a live machine.
 
+pub mod conntrack;
 pub mod daemon;
 pub mod ebpf;
 pub mod firewall;
