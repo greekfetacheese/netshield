@@ -17,6 +17,12 @@ use log::{info, warn};
 /// The one table this daemon owns, and the only one it ever touches.
 pub const TABLE: &str = "netshield";
 
+/// Marks this daemon writes into conntrack live in the top two bits, so a flush cannot touch a flow
+/// stamped by another tool (Docker and Kubernetes both use conntrack marks).
+pub const OWNER_TAG: u32 = 0x4000_0000;
+/// The bits that identify an owner at all, as opposed to which one.
+pub const OWNER_TAG_MASK: u32 = 0xc000_0000;
+
 /// Why an nftables operation failed.
 #[derive(Debug)]
 pub enum FirewallError {
@@ -61,6 +67,12 @@ pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String
          "        oifname \"lo\" return comment \"netshield: loopback is not filtered\"\n",
       );
    }
+   // Stamped before either queue rule: a queue verdict does not end chain traversal, but
+   // the mark has to be set before any decision is made about the packet.
+   text.push_str(&format!(
+      "        ct state new ct mark set meta skuid | {OWNER_TAG:#010x} \
+       comment \"netshield: record the owner\"\n"
+   ));
    text.push_str(&format!(
       "        tcp flags & (fin|syn|rst|ack) == syn queue num {queue} bypass \
        comment \"netshield: tcp syn\"\n"
@@ -315,6 +327,8 @@ mod tests {
             "    chain output {",
             "        type filter hook output priority mangle; policy accept;",
             "        oifname \"lo\" return comment \"netshield: loopback is not filtered\"",
+            "        ct state new ct mark set meta skuid | 0x40000000 \
+             comment \"netshield: record the owner\"",
             "        tcp flags & (fin|syn|rst|ack) == syn queue num 0 bypass \
              comment \"netshield: tcp syn\"",
             "        ct state new queue num 0 bypass comment \"netshield: non-tcp new flow\"",
@@ -354,11 +368,31 @@ mod tests {
    #[test]
    fn every_rule_is_attributed_and_nothing_else_is_flushed() {
       let text = ruleset_text(3, 4, false);
-      assert_eq!(text.matches("comment \"netshield:").count(), 5);
+      assert_eq!(text.matches("comment \"netshield:").count(), 6);
       assert!(!text.contains("flush ruleset"));
       assert!(!text.contains("iptables"));
       assert!(text.starts_with("table inet netshield {\n"));
       assert!(text.ends_with("}\n"));
+   }
+
+   #[test]
+   fn the_owner_is_stamped_before_any_queue_verdict() {
+      let text = ruleset_text(3, 4, false);
+      let stamp = text
+         .find(&format!(
+            "ct mark set meta skuid | {OWNER_TAG:#010x}"
+         ))
+         .expect("the output chain stamps the owner before any decision");
+      let syn = text.find("tcp flags").expect("the tcp syn rule is present");
+      let non_tcp = text.find("ct state new queue").expect("the non-tcp rule is present");
+      assert!(
+         stamp < syn,
+         "the stamp must precede the tcp queue rule"
+      );
+      assert!(
+         stamp < non_tcp,
+         "the stamp must precede the non-tcp queue rule"
+      );
    }
 
    #[test]
