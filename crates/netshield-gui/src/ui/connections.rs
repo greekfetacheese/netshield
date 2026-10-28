@@ -30,9 +30,20 @@ const COLUMN_GAP: f32 = 12.0;
 /// starts here, past the chevron gutter.
 const INDENT: f32 = 18.0;
 
-/// Where a group's name starts, past the painted chevron: four pixels right of [`INDENT`],
-/// so the parent's name sits just above the child text it owns.
-const GROUP_NAME_X: f32 = INDENT + 4.0;
+/// Where an application row's name starts, past the painted chevron: four pixels right of
+/// [`INDENT`], so the parent's name sits just above the child text it owns. The verdict dot
+/// is measured from the end of that `name count` text, not from a fixed column.
+const APP_NAME_X: f32 = INDENT + 4.0;
+
+/// Where the verdict dot's centre sits past the end of the `<name> <count>` text.
+const DOT_GAP: f32 = 7.0;
+
+/// The painted verdict dot's diameter; it stays a 3.5 radius circle.
+const DOT_SIZE: f32 = 7.0;
+
+/// Room the name galley leaves for the gap and the dot, so the dot cannot fall outside the
+/// Connection column however long the name is.
+const DOT_SPACE: f32 = 18.0;
 
 /// Width of the chevron's click target at the start of a group line.
 const CHEVRON_HIT: f32 = 22.0;
@@ -372,6 +383,27 @@ impl Cells<'_> {
    }
 }
 
+/// The width a group line's `<name> <count>` galley may use, i.e. the Connection column
+/// less the name's start and the room the verdict dot needs.
+fn name_width_limit(columns: &Columns) -> f32 {
+   (columns.connection - APP_NAME_X - DOT_SPACE).max(0.0)
+}
+
+/// The verdict dot's rectangle on a group line.
+///
+/// Measured from the row's left edge like every other cell, and from the end of the laid-out
+/// `name count` text: a dot pinned to a column instead sits in the middle of the row and,
+/// once the detail pane narrows the columns, on top of the application's own name.
+fn dot_rect(row: Rect, name_width: f32) -> Rect {
+   Rect::from_center_size(
+      pos2(
+         row.left() + APP_NAME_X + name_width + DOT_GAP,
+         row.center().y,
+      ),
+      vec2(DOT_SIZE, DOT_SIZE),
+   )
+}
+
 /// The `Connection Rule Activity` labels above the list.
 fn header_row(ui: &mut Ui, columns: &Columns) {
    let (rect, _) = ui.allocate_exact_size(
@@ -385,16 +417,16 @@ fn header_row(ui: &mut Ui, columns: &Columns) {
    let font = FontId::proportional(11.0);
    let color = ui.visuals().weak_text_color();
    cells.text(
-      GROUP_NAME_X,
-      (columns.connection - GROUP_NAME_X).max(0.0),
+      APP_NAME_X,
+      (columns.connection - APP_NAME_X).max(0.0),
       "Connection",
       &font,
       color,
       false,
    );
    cells.text(
-      columns.rule_x + 14.0,
-      columns.rule - 14.0,
+      columns.rule_x,
+      (columns.rule).max(0.0),
       "Rule",
       &font,
       color,
@@ -466,7 +498,7 @@ fn group_row(
 
    // The name is strong; the count trails it as a weak small label.
    let mut name = LayoutJob {
-      wrap: TextWrapping::truncate_at_width((columns.connection - GROUP_NAME_X).max(0.0)),
+      wrap: TextWrapping::truncate_at_width(name_width_limit(columns)),
       ..LayoutJob::default()
    };
    name.append(app, 0.0, TextFormat::simple(body.clone(), strong));
@@ -481,21 +513,23 @@ fn group_row(
       TextFormat::simple(small.clone(), weak),
    );
    let galley = painter.layout_job(name);
+   let name_width = galley.size().x;
    painter.galley(
       pos2(
-         rect.left() + GROUP_NAME_X,
+         rect.left() + APP_NAME_X,
          center_y - galley.size().y / 2.0,
       ),
       galley,
       strong,
    );
 
-   let dot = if *denied { DENIED } else { ALLOWED };
-   painter.circle_filled(pos2(columns.rule_x + 5.0, center_y), 3.5, dot);
+   let dot_colour = if *denied { DENIED } else { ALLOWED };
+   let dot = dot_rect(rect, name_width);
+   painter.circle_filled(dot.center(), 3.5, dot_colour);
    let cells = Cells { painter, rect };
    cells.text(
-      columns.rule_x + 14.0,
-      (columns.rule - 14.0).max(0.0),
+      columns.rule_x,
+      (columns.rule).max(0.0),
       rule,
       &body,
       visuals.text_color(),
@@ -1413,5 +1447,42 @@ mod tests {
       let rules = vec![rule(DestMatcher::Any, Action::Allow)];
       cache.refresh(&log, &rules, &expanded, &showing_all);
       assert_eq!(builds(), before + 5, "a rule list rebuilds too");
+   }
+
+   #[test]
+   fn the_verdict_dot_follows_the_count() {
+      let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
+
+      let dot = dot_rect(row, 50.0);
+
+      // Row-relative and text-relative: the pre-fix code painted at an absolute column x, so
+      // the dot sat ~195px from its column and landed on the name once the columns shrank.
+      assert_eq!(
+         dot.center().x,
+         100.0 + APP_NAME_X + 50.0 + DOT_GAP
+      );
+      assert!(
+         dot.left() > 100.0 + APP_NAME_X,
+         "the dot trails the name, it does not sit on it: {dot:?}"
+      );
+      assert_eq!(
+         dot.center().y,
+         row.center().y,
+         "the dot is vertically centred"
+      );
+   }
+
+   #[test]
+   fn the_name_width_leaves_room_for_the_dot() {
+      let columns = Columns::new(900.0);
+
+      let limit = name_width_limit(&columns);
+
+      assert!(
+         limit + APP_NAME_X + DOT_SPACE == columns.connection,
+         "the galley must stop short of the dot: limit {limit}, column {}",
+         columns.connection
+      );
+      assert!(limit > 0.0, "a 900px row has room for a name");
    }
 }
