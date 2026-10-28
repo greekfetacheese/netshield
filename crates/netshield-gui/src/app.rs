@@ -172,7 +172,11 @@ impl App {
          if let Ok(mut model) = model_slot.lock()
             && model.prompt().map(|open| open.id) != Some(prompt.id)
          {
-            model.present(prompt.clone(), timeout, Instant::now());
+            model.present(
+               with_destinations(prompt.clone()),
+               timeout,
+               Instant::now(),
+            );
          }
          if let Some(ctx) = ctx_slot.lock().ok().and_then(|slot| slot.clone()) {
             let id = alert_viewport_id();
@@ -391,10 +395,13 @@ impl App {
    ///
    /// The prompt is also presented to the alert model, which starts its countdown. The
    /// daemon only activates one prompt at a time, so a later one replaces the active alert.
+   /// [`with_destinations`] fills the destination list before the prompt is stored, so the
+   /// whole group the answer covers survives in the queue as well as in the alert.
    fn enqueue_prompt(&mut self, prompt: PromptRequest) {
       if self.pending.iter().any(|queued| queued.id == prompt.id) {
          return;
       }
+      let prompt = with_destinations(prompt);
       log::info!(
          "prompt {} presented for {}",
          prompt.id,
@@ -832,6 +839,18 @@ impl eframe::App for App {
    }
 }
 
+/// Fills a prompt's destination list, so the panel always sees what the answer covers.
+///
+/// A current daemon sends every destination; an older one leaves `dests` empty and its
+/// `connection` is the whole prompt, so the fallback keeps that prompt a single destination
+/// rather than an empty list the panel would have to special-case.
+fn with_destinations(mut prompt: PromptRequest) -> PromptRequest {
+   if prompt.dests.is_empty() {
+      prompt.dests = vec![prompt.connection.clone()];
+   }
+   prompt
+}
+
 /// The name the one alert viewport's id is hashed from.
 ///
 /// A single id for every prompt: the window is registered once and reused, so each new
@@ -961,8 +980,26 @@ mod tests {
             domain_candidates: Vec::new(),
          },
          timeout_secs: 30,
+         dests: Vec::new(),
          domain_scope_available: true,
          pending: 0,
+      }
+   }
+
+   /// The same connection, for the destinations of a group.
+   fn destination(domain: &str) -> ConnectionView {
+      ConnectionView {
+         app_name: "firefox".to_owned(),
+         exe: None,
+         pid: Some(4242),
+         uid: Some(1000),
+         family: Family::V4,
+         proto: L4Proto::Tcp,
+         remote_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 185, 78)),
+         remote_port: 443,
+         local_port: 51_000,
+         domain: Some(domain.to_owned()),
+         domain_candidates: Vec::new(),
       }
    }
 
@@ -1091,6 +1128,50 @@ mod tests {
 
       app.remove_prompt(2);
       assert!(app.model().prompt().is_none());
+   }
+
+   #[test]
+   fn a_prompt_keeps_its_whole_destination_list_in_the_prompt_state() {
+      let mut app = app();
+      let mut request = prompt(1);
+      request.dests = vec![
+         destination("accounts.google.com"),
+         destination("ssl.gstatic.com"),
+      ];
+      app.enqueue_prompt(request);
+
+      let queued = &app.pending[0];
+      assert_eq!(
+         queued.dests.len(),
+         2,
+         "the queue keeps every destination"
+      );
+      let model = app.model();
+      let presented = model.prompt().expect("the alert is presented");
+      assert_eq!(
+         presented.dests.len(),
+         2,
+         "the alert state gets the whole group, not just the first destination"
+      );
+   }
+
+   #[test]
+   fn an_empty_dests_field_is_filled_from_the_first_destination() {
+      let mut app = app();
+      let request = prompt(1);
+      assert!(
+         request.dests.is_empty(),
+         "an older daemon omits the field"
+      );
+      app.enqueue_prompt(request);
+
+      let model = app.model();
+      let presented = model.prompt().expect("the alert is presented");
+      assert_eq!(
+         presented.dests,
+         vec![presented.connection.clone()],
+         "the fallback makes the prompt a single destination"
+      );
    }
 
    #[test]

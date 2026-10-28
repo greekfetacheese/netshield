@@ -19,7 +19,8 @@ pub const WIDTH: f32 = 480.0;
 /// The host window's height. [`layout_height_estimate`] must stay below it.
 ///
 /// Grown from 404 when the rule preview line was added: the measured stack (with a queued
-/// prompt) is 410pt, and a fixed viewport silently clips rather than scrolls.
+/// prompt) is 410pt, and a fixed viewport silently clips rather than scrolls. A grouped
+/// prompt fits the same height: its destination list replaces the taller scope picker.
 pub const HEIGHT: f32 = 440.0;
 
 /// Inner margin of the alert panel, in points, applied on all four sides.
@@ -47,6 +48,9 @@ const DESTINATION_ROW: f32 = 26.0;
 const RADIO_ROW: f32 = 22.0;
 /// Height of the `N more waiting` line.
 const PENDING_ROW: f32 = 12.0;
+/// Longest destination line drawn in the alert before it is elided; the list is one line
+/// per destination and must not wrap into the buttons.
+const DEST_LINE_CHARS: usize = 60;
 /// Height of the countdown bar.
 const COUNTDOWN_HEIGHT: f32 = 18.0;
 /// Height of the Deny/Allow buttons.
@@ -58,6 +62,9 @@ const APP_NAME_CHARS: usize = 30;
 /// Character budget of the rule preview line. The alert is only 480pt wide, so the line
 /// is elided to stay one line instead of wrapping into the buttons.
 const RULE_PREVIEW_CHARS: usize = 60;
+
+/// How many destinations the group list shows before the `+N more` remainder.
+pub const DEST_LINES: usize = 4;
 
 /// Longest app name kept in the rule preview before it is elided.
 const PREVIEW_APP_CHARS: usize = 20;
@@ -152,6 +159,11 @@ impl AlertState {
    /// A domain scope is only expressible when the daemon learned a hostname *and* offered
    /// it; otherwise the answer falls back to the scope [`AlertState::effective_scope`]
    /// resolved, never to a scope the user could not select.
+   ///
+   /// A grouped prompt hides the picker, but the request still carries the scope: the
+   /// default `AnyConnection` is exactly what the daemon's group semantics need, because it
+   /// creates one rule per destination of the group and never a rule for anywhere. The GUI
+   /// does not decide rule shape.
    pub fn decision(&self, prompt: &PromptRequest, action: Action) -> DecideRequest {
       let scope = match self.effective_scope(prompt) {
          Scope::Any => ScopeChoice::AnyConnection,
@@ -287,16 +299,28 @@ pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) 
       Action::Deny => "deny",
    };
    let app = elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS);
-   let scope = preview_scope(prompt, state);
-   let duration = match state.duration {
-      Duration::Once => "once",
-      Duration::Session => "until restart",
-      Duration::Forever => "forever",
+   let scope = if is_group(prompt) {
+      // A group never writes a rule for anywhere: one rule per listed destination, so the
+      // preview names the reach of the answer instead.
+      let count = destinations(prompt).len();
+      format!("these {count} destinations")
+   } else {
+      preview_scope(prompt, state)
    };
+   let duration = duration_label(state.duration);
    elide(
       &format!("{verb} {app} → {scope} · {duration}"),
       RULE_PREVIEW_CHARS,
    )
+}
+
+/// The duration phrase shared by the preview and the grant sentence.
+fn duration_label(duration: Duration) -> &'static str {
+   match duration {
+      Duration::Once => "once",
+      Duration::Session => "until restart",
+      Duration::Forever => "forever",
+   }
 }
 
 /// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
@@ -343,13 +367,94 @@ fn broad_scope_available(prompt: &PromptRequest) -> bool {
    prompt.connection.pid.is_some()
 }
 
+/// Every destination the answer covers, or the first one for an older daemon.
+///
+/// A current daemon always sends at least one entry; `dests` is empty only in a frame from
+/// a daemon that predates it, where `connection` is the whole prompt.
+pub fn destinations(prompt: &PromptRequest) -> Vec<&ConnectionView> {
+   if prompt.dests.is_empty() {
+      return vec![&prompt.connection];
+   }
+   prompt.dests.iter().collect()
+}
+
+/// Whether the answer covers more than one destination.
+///
+/// A group drops the per-destination scope picker: the daemon creates one rule per
+/// destination shown, so there is no single host or address a scope could narrow to, and
+/// `anywhere` is a rule the group's answer never writes.
+pub fn is_group(prompt: &PromptRequest) -> bool {
+   destinations(prompt).len() > 1
+}
+
+/// Whether the panel draws the per-destination scope picker.
+///
+/// A group must not offer one: its answer covers exactly the destinations listed above, so
+/// a scope radio would either narrow to a host the group does not name or promise a rule for
+/// anywhere, which the daemon's group semantics never write. A single destination keeps the
+/// picker, unchanged.
+pub fn has_scope_picker(prompt: &PromptRequest) -> bool {
+   !is_group(prompt)
+}
+
+/// What the Allow button says the click grants.
+///
+/// A group names the number of destinations, because the click writes a rule for each of
+/// them; a single destination keeps the plain `Allow`, whose scope the picker below states.
+pub fn allow_label(prompt: &PromptRequest) -> String {
+   let count = destinations(prompt).len();
+   if count > 1 {
+      format!("Allow {count} destinations")
+   } else {
+      "Allow".to_owned()
+   }
+}
+
+/// The destinations a group lists, capped at [`DEST_LINES`], plus the `· +N more` remainder.
+///
+/// Each entry is exactly the line the panel draws, so the cap is testable without a window.
+/// A single destination draws no list at all: the header below the destination already
+/// names it.
+pub fn destination_lines(prompt: &PromptRequest) -> Vec<String> {
+   let dests = destinations(prompt);
+   if dests.len() <= 1 {
+      return Vec::new();
+   }
+   let mut lines: Vec<String> = dests
+      .iter()
+      .take(DEST_LINES)
+      .map(|view| {
+         format!(
+            "· {}",
+            elide(&destination_label(view), DEST_LINE_CHARS)
+         )
+      })
+      .collect();
+   let hidden = dests.len().saturating_sub(DEST_LINES);
+   if hidden > 0 {
+      lines.push(format!("· +{hidden} more"));
+   }
+   lines
+}
+
+/// How the destination is named: the learned hostname, or the endpoint otherwise.
+fn destination_label(view: &ConnectionView) -> String {
+   view
+      .domain
+      .as_deref()
+      .filter(|domain| !domain.is_empty())
+      .map_or_else(|| endpoint(view), str::to_owned)
+}
+
 /// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
 ///
-/// The fixed layout is sized for the 480x404 host: app name, destination, duration, scope,
+/// The fixed layout is sized for the 480x440 host: app name, destination, duration, scope,
 /// countdown and the two action buttons all fit without scrolling. The app row is drawn
 /// first so a future section cannot push it off the top again; [`layout_height_estimate`]
-/// is the budget that guards that. There are no keyboard shortcuts; Escape deliberately
-/// does nothing, because a stray key must not decide a firewall rule.
+/// is the budget that guards that. A grouped prompt replaces the scope picker with a capped
+/// destination list and states the grant under the buttons, because its answer writes one
+/// rule per destination and never one for anywhere. There are no keyboard shortcuts; Escape
+/// deliberately does nothing, because a stray key must not decide a firewall rule.
 pub fn ui(
    ui: &mut Ui,
    prompt: &PromptRequest,
@@ -379,13 +484,20 @@ pub fn ui(
       ui.add_space(SECTION_GAP);
       ui.label(RichText::new("wants to connect to").weak());
       destination(ui, view);
+      if is_group(prompt) {
+         destination_list(ui, prompt);
+      }
       ui.label(RichText::new(protocol_line(view)).weak());
 
       ui.add_space(SECTION_GAP);
       duration_section(ui, state);
 
-      ui.add_space(SECTION_GAP);
-      scope_section(ui, prompt, state);
+      // A group has no per-destination scope: its answer covers exactly the destinations
+      // listed above, so the picker that could promise a narrower or broader rule is gone.
+      if has_scope_picker(prompt) {
+         ui.add_space(SECTION_GAP);
+         scope_section(ui, prompt, state);
+      }
 
       ui.add_space(SECTION_GAP);
       let width = ui.available_width();
@@ -400,6 +512,19 @@ pub fn ui(
       );
 
       ui.add_space(SECTION_GAP);
+      // The sentence that used to sit under the scope radios. A group has no scope picker,
+      // so it states the grant here instead: one rule per destination listed above, never a
+      // rule for anywhere.
+      if is_group(prompt) {
+         ui.label(
+            RichText::new(rule_preview(prompt, state, Action::Allow))
+               .small()
+               .monospace()
+               .weak(),
+         );
+         ui.add_space(SECTION_GAP);
+      }
+
       ui.columns(2, |columns| {
          let deny =
             egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
@@ -409,7 +534,8 @@ pub fn ui(
          }
 
          let allow =
-            egui::Button::new(RichText::new("Allow").color(BUTTON_TEXT).strong()).fill(ALLOW_FILL);
+            egui::Button::new(RichText::new(allow_label(prompt)).color(BUTTON_TEXT).strong())
+               .fill(ALLOW_FILL);
          let allow_width = columns[1].available_width();
          if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
             decision = Some(decision_for(state, prompt, Action::Allow));
@@ -420,13 +546,25 @@ pub fn ui(
    decision
 }
 
-/// Conservative vertical budget of every section the panel can draw, in points.
+/// Conservative vertical budget of the tallest panel the alert can draw, in points.
 ///
 /// It is deliberately generous: a real render must fit the configured window with room to
 /// spare, and the test below keeps a future section from silently clipping the app row.
 /// The `pending` line is always counted, even though it only appears when prompts queue.
+///
+/// Two shapes share the fixed window. A single destination draws the whole scope picker and
+/// its preview; a group drops that block (a label, three radio rows and the preview) and
+/// draws the capped destination list plus its grant sentence instead. The list is shorter
+/// than the block it replaces, so this budget is the single-destination stack and the group
+/// is asserted against it below.
 pub fn layout_height_estimate() -> f32 {
-   let sections = PENDING_ROW
+   layout_height(false)
+}
+
+/// The stack of every section one prompt shape can draw; `group` trades the scope picker
+/// for the destination list and the sentence under the buttons.
+fn layout_height(group: bool) -> f32 {
+   let mut sections = PENDING_ROW
       + SECTION_GAP
       + APP_ROW
       + SECTION_GAP
@@ -435,19 +573,22 @@ pub fn layout_height_estimate() -> f32 {
       + SMALL_ROW
       + SECTION_GAP
       + SMALL_ROW
-      + RADIO_ROW
-      + SECTION_GAP
-      + SMALL_ROW
-      + RADIO_ROW
-      + RADIO_ROW
-      + RADIO_ROW
-      + SECTION_GAP
-      + SMALL_ROW
+      + RADIO_ROW;
+   if group {
+      // Four destination lines, the `+N more` remainder and the grant sentence.
+      sections += DEST_LINES as f32 * SMALL_ROW + SMALL_ROW + SECTION_GAP + SMALL_ROW;
+   } else {
+      // The scope label, its three radio rows and the rule preview.
+      sections += SECTION_GAP + SMALL_ROW + 3.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
+   }
+   sections
       + SECTION_GAP
       + COUNTDOWN_HEIGHT
       + SECTION_GAP
-      + BUTTON_HEIGHT;
-   sections + 2.0 * f32::from(PANEL_MARGIN) + PANEL_CHROME + PANEL_TOP_GAP
+      + BUTTON_HEIGHT
+      + 2.0 * f32::from(PANEL_MARGIN)
+      + PANEL_CHROME
+      + PANEL_TOP_GAP
 }
 
 /// The process name, with the right-aligned owner ids when the daemon attributed it.
@@ -504,6 +645,18 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
          ui.label(RichText::new(endpoint).size(20.0).strong().monospace());
          ui.label(RichText::new("no hostname was learned for this address").small().weak());
       }
+   }
+}
+
+/// Lists a group's destinations under the header, capped at [`DEST_LINES`] with a
+/// `· +N more` remainder.
+///
+/// One line per destination, so an answer's reach is visible instead of implied. The cap
+/// keeps a large group from pushing the fixed panel past [`HEIGHT`]; the remainder line
+/// still states how many destinations are not named.
+fn destination_list(ui: &mut Ui, prompt: &PromptRequest) {
+   for line in destination_lines(prompt) {
+      ui.label(RichText::new(line).small().weak());
    }
 }
 
@@ -687,9 +840,42 @@ mod tests {
             domain_candidates: Vec::new(),
          },
          timeout_secs: 30,
+         dests: Vec::new(),
          domain_scope_available: available,
          pending: 0,
       }
+   }
+
+   /// A destination view for a group, named by `domain` and otherwise independent.
+   fn dest_view(app: &str, domain: &str, last_octet: u8) -> ConnectionView {
+      ConnectionView {
+         app_name: app.to_owned(),
+         exe: None,
+         pid: Some(4242),
+         uid: Some(1000),
+         family: Family::V4,
+         proto: L4Proto::Tcp,
+         remote_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 184, last_octet)),
+         remote_port: 443,
+         local_port: 51_000,
+         domain: (!domain.is_empty()).then(|| domain.to_owned()),
+         domain_candidates: Vec::new(),
+      }
+   }
+
+   /// The six-destination group the brief asks the panel to describe.
+   fn group_of_six() -> PromptRequest {
+      let mut request = prompt(Some("accounts.google.com"), true);
+      request.connection = dest_view("brave", "accounts.google.com", 74);
+      request.dests = vec![
+         request.connection.clone(),
+         dest_view("brave", "ssl.gstatic.com", 75),
+         dest_view("brave", "", 76),
+         dest_view("brave", "www.google.com", 77),
+         dest_view("brave", "fonts.gstatic.com", 78),
+         dest_view("brave", "play.google.com", 79),
+      ];
+      request
    }
 
    /// The same prompt, but with no owner: the daemon's `Attribution::Unknown` view.
@@ -967,6 +1153,81 @@ mod tests {
       );
    }
 
+   /// The required example: a six-destination group says what the click grants.
+   ///
+   /// The button names the count and the sentence under it names the app and the reach;
+   /// neither claims a rule for anywhere, which the daemon's group answer never writes.
+   #[test]
+   fn a_group_states_what_the_click_grants() {
+      let request = group_of_six();
+      let mut state = AlertState::new();
+      state.duration = Duration::Forever;
+
+      assert_eq!(allow_label(&request), "Allow 6 destinations");
+      assert_eq!(
+         rule_preview(&request, &state, Action::Allow),
+         "allow brave → these 6 destinations · forever"
+      );
+      assert!(
+         !has_scope_picker(&request),
+         "a group must not offer a per-destination scope picker"
+      );
+   }
+
+   /// The required example: one destination renders exactly as before, picker included.
+   #[test]
+   fn a_single_destination_keeps_the_plain_labels() {
+      let request = prompt(Some("www.google.com"), true);
+      let state = AlertState::new();
+
+      assert_eq!(allow_label(&request), "Allow");
+      assert!(
+         has_scope_picker(&request),
+         "a single destination keeps the scope picker"
+      );
+      assert_eq!(
+         rule_preview(&request, &state, Action::Allow),
+         "allow firefox → anywhere · until restart"
+      );
+      assert!(
+         destination_lines(&request).is_empty(),
+         "one destination needs no list under the header"
+      );
+   }
+
+   /// The required example: four named lines and a remainder, never more.
+   #[test]
+   fn the_list_is_capped_with_a_remainder() {
+      let lines = destination_lines(&group_of_six());
+      assert_eq!(
+         lines,
+         vec![
+            "· accounts.google.com",
+            "· ssl.gstatic.com",
+            "· 142.250.184.76:443",
+            "· www.google.com",
+            "· +2 more",
+         ]
+      );
+   }
+
+   /// The required example: an older daemon's payload is a single destination.
+   #[test]
+   fn an_empty_dests_field_falls_back_to_the_first_destination() {
+      let mut request = prompt(Some("accounts.google.com"), true);
+      request.connection = dest_view("brave", "accounts.google.com", 74);
+      assert!(request.dests.is_empty());
+
+      assert_eq!(destinations(&request).len(), 1);
+      assert_eq!(allow_label(&request), "Allow");
+      assert!(has_scope_picker(&request));
+      assert!(destination_lines(&request).is_empty());
+      assert_eq!(
+         rule_preview(&request, &AlertState::new(), Action::Allow),
+         "allow brave → anywhere · until restart"
+      );
+   }
+
    #[test]
    fn tmp_measure_sections() {
       let ctx = egui::Context::default();
@@ -1076,6 +1337,8 @@ mod tests {
    ///
    /// [`layout_height_estimate`] counts every section but not this spare margin, so a
    /// section added without growing [`HEIGHT`] fails here instead of clipping the app row.
+   /// A group is measured too: its destination list must stay inside the same fixed window
+   /// as the scope picker it replaces.
    #[test]
    fn layout_estimate_leaves_headroom_in_the_host_window() {
       const MARGIN: f32 = 24.0;
@@ -1083,6 +1346,15 @@ mod tests {
       assert!(
          HEIGHT > estimate + MARGIN,
          "layout estimate {estimate} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+      );
+      let group = layout_height(true);
+      assert!(
+         group <= estimate,
+         "the grouped stack {group} must fit the budget {estimate} it shares with the picker"
+      );
+      assert!(
+         HEIGHT > group + MARGIN,
+         "grouped stack {group} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
       );
    }
 
