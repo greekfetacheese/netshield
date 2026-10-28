@@ -80,6 +80,13 @@ pub struct AttributeStats {
    pub scan_budget_exhausted: u64,
    /// Flows `/proc` could not resolve that the kernel's send registry attributed instead.
    pub registry_hits: u64,
+   /// Answers the send registry refused because `/proc` contradicted them: the pid was gone, or it
+   /// belonged to another uid. Non-zero here means the probe is recording flows that attribution
+   /// then rejects, which is a bug in this crate rather than a coverage limit.
+   pub registry_refusals: u64,
+   /// Lookups the registry was asked for and had nothing to say: no record within the TTL. This is
+   /// the real coverage number — the flows a `sendmmsg` or a connected-`send` hook would catch.
+   pub registry_misses: u64,
 }
 
 /// A flow that was attributed, keyed by protocol and both endpoints.
@@ -544,9 +551,13 @@ impl Attributor {
    ) -> Option<Attribution> {
       let senders = self.senders.as_ref()?;
       let uid = uid?;
-      let pid = senders.recent_sender(uid, remote)?;
+      let Some(pid) = senders.recent_sender(uid, remote) else {
+         self.stats.registry_misses += 1;
+         return None;
+      };
       let owner = read_pid_uid(pid);
       if owner != Some(uid) {
+         self.stats.registry_refusals += 1;
          debug!(
             "send registry named pid {pid} for {remote:?}, but the packet's uid is {uid} and \
              /proc says that pid is {owner:?}"
@@ -631,8 +642,16 @@ impl Attributor {
    }
 
    /// Returns the per-lookup counters.
+   ///
+   /// The registry's own counters replace the local ones when it keeps them, so the numbers
+   /// are read at summary time rather than sampled from the last lookup.
    pub fn stats(&self) -> AttributeStats {
-      self.stats
+      let mut stats = self.stats;
+      if let Some((hits, misses)) = self.senders.as_ref().and_then(|senders| senders.stats()) {
+         stats.registry_hits = hits;
+         stats.registry_misses = misses;
+      }
+      stats
    }
 
    /// The reason to report when no owner was found, and how final that is.
@@ -1563,7 +1582,7 @@ mod tests {
    }
 
    #[test]
-   fn a_send_registry_hit_attributes_the_flow() {
+   fn a_hit_counts_as_neither() {
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: Some(std::process::id()),
@@ -1594,10 +1613,12 @@ mod tests {
          "the registry must have been asked"
       );
       assert_eq!(attributor.stats().registry_hits, 1);
+      assert_eq!(attributor.stats().registry_misses, 0);
+      assert_eq!(attributor.stats().registry_refusals, 0);
    }
 
    #[test]
-   fn a_registry_answer_from_another_uid_is_refused() {
+   fn a_refused_answer_is_counted_separately_from_a_miss() {
       let asked = Arc::new(AtomicUsize::new(0));
       // pid 1 is root on a native host; inside a user-namespace sandbox (where `cargo test`
       // may run) it is our own uid, so the packet names a uid pid 1 does not have either way.
@@ -1633,10 +1654,12 @@ mod tests {
          "the registry must have been asked before its answer was refused"
       );
       assert_eq!(attributor.stats().registry_hits, 0);
+      assert_eq!(attributor.stats().registry_refusals, 1);
+      assert_eq!(attributor.stats().registry_misses, 0);
    }
 
    #[test]
-   fn a_registry_miss_still_reports_the_flow_closed() {
+   fn an_empty_registry_answer_counts_as_a_miss() {
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: None,
@@ -1655,6 +1678,8 @@ mod tests {
       );
       assert_eq!(asked.load(Ordering::Relaxed), 1);
       assert_eq!(attributor.stats().registry_hits, 0);
+      assert_eq!(attributor.stats().registry_misses, 1);
+      assert_eq!(attributor.stats().registry_refusals, 0);
    }
 
    #[test]

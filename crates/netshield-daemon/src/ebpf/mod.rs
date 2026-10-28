@@ -17,7 +17,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 /// Where a pid for a recent send can come from.
 ///
@@ -26,11 +26,19 @@ use log::{info, warn};
 pub trait SenderLookup: Send + Sync {
    /// The pid that sent to `remote` from `uid` recently, if the kernel recorded it.
    fn recent_sender(&self, uid: u32, remote: (IpAddr, u16)) -> Option<u32>;
+   /// (lookups answered, lookups with nothing to say), when the implementation counts them.
+   fn stats(&self) -> Option<(u64, u64)> {
+      None
+   }
 }
 
 impl SenderLookup for SendRegistry {
    fn recent_sender(&self, uid: u32, remote: (IpAddr, u16)) -> Option<u32> {
       SendRegistry::recent_sender(self, uid, remote)
+   }
+
+   fn stats(&self) -> Option<(u64, u64)> {
+      Some(SendRegistry::stats(self))
    }
 }
 
@@ -430,7 +438,16 @@ impl SendRegistry {
             (&mut val as *mut FlowVal).cast(),
          )
       };
-      if looked_up.is_ok() && is_fresh(val.ts_ns, now_ns()) {
+      if looked_up.is_ok() {
+         let now = now_ns();
+         if !is_fresh(val.ts_ns, now) {
+            debug!(
+               "send registry's record for {remote:?} from uid {uid} is {} ms old",
+               now.wrapping_sub(val.ts_ns) / 1_000_000
+            );
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+         }
          // The high half of `bpf_get_current_pid_tgid` is the thread group id: the process. The low
          // half is the tid, and `/proc/<tid>` cannot be read from another process, so a worker
          // thread's send would be recorded with an id that nothing outside its thread group can
@@ -441,6 +458,7 @@ impl SendRegistry {
             return Some(pid);
          }
       }
+      debug!("send registry has no record for {remote:?} from uid {uid}");
       self.misses.fetch_add(1, Ordering::Relaxed);
       None
    }
