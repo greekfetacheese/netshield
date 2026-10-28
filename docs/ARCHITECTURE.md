@@ -165,6 +165,26 @@ attributed to *unknown*, is shown as such in the prompt, and is governed by an e
 `unknown` matcher rather than being silently allowed. Silent allow is not an option: a
 firewall that fails open on lookup failure is a decoration.
 
+Two cases are decided without a prompt, because a prompt could not change anything:
+
+- **The socket is already gone.** When the kernel named a UID and a *complete* scan of the
+  socket table and the descriptor table found no owner, the application has closed the
+  descriptor: nothing is waiting for a reply, and no later scan can find an owner. A scan that
+  ran out of budget or could not read a descriptor directory is not that case, and still
+  prompts. Such flows are **dropped** by default
+  (`unattributable_closed_flow: drop`), logged once per address and shown as denied in the
+  connection log. `allow` exists for applications that send one datagram and close it
+  immediately; `prompt` restores the old behaviour. An explicit `unknown` allow rule still wins,
+  because the rule engine decides first — this default only applies when no rule matches.
+- **Multicast destinations** (`224.0.0.0/4`, `ff02::/16`). mDNS binds its shared port with
+  `SO_REUSEPORT`, so the row that exists belongs to another UID's socket and the flow is
+  unattributable in principle; multicast cannot leave the link, so it is allowed once and logged
+  once per application rather than prompted for.
+
+Both defaults exist because the alternative was measured: Chromium opens and closes speculative
+sockets (QUIC racing losers, cancelled preconnects) inside the ~5 ms attribution window, so the
+old behaviour produced an `unknown` prompt for traffic that had already been abandoned.
+
 This attribution path has a hard limit that no amount of `/proc` polling removes: it can
 only attribute a socket that is still present when the scan runs, and it can only use the
 UID when the kernel supplied one with the packet (`uid: null` in the connection events
