@@ -1,11 +1,11 @@
 //! The in-kernel sender registry: the pid behind a flow, recorded at syscall time.
 //!
 //! `/proc` can only answer while the socket exists, so a flow whose socket closes before
-//! [`crate::proc`] scans the tables is unattributable by construction. These two
-//! tracepoint programs write the answer into a hash map at the moment `sendto` or
-//! `connect` runs, which is before the caller can close the socket. The daemon asks the
-//! map first and keeps `/proc` as the fallback, and [`SendRegistry::open`] failing simply
-//! means that fallback is all there is — exactly the pre-registry behaviour.
+//! [`crate::proc`] scans the tables is unattributable by construction. These tracepoint
+//! programs write the answer into a hash map at the moment `sendto`, `sendmsg`,
+//! `sendmmsg` or `connect` runs, which is before the caller can close the socket. The
+//! daemon asks the map first and keeps `/proc` as the fallback, and [`SendRegistry::open`]
+//! failing simply means that fallback is all there is — exactly the pre-registry behaviour.
 //!
 //! This module is the second sanctioned home for `unsafe` (see `AGENTS.md`): the kernel
 //! ABI it speaks has no Rust wrapper that does not add a dependency.
@@ -64,8 +64,34 @@ const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/trac
 /// The tracepoint whose `sockaddr` argument is read for a datagram send.
 const SENDTO: &str = "sys_enter_sendto";
 
+/// The tracepoint whose `user_msghdr` argument is read for a named send.
+const SENDMSG: &str = "sys_enter_sendmsg";
+
+/// The tracepoint whose `mmsghdr` array argument is read for a batched send.
+const SENDMMSG: &str = "sys_enter_sendmmsg";
+
 /// The tracepoint whose `sockaddr` argument is read for a connect.
 const CONNECT: &str = "sys_enter_connect";
+
+/// Where the program finds the destination for a given syscall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+   /// The context holds a `struct sockaddr *` directly (`sendto`).
+   SockaddrAt(i16),
+   /// The context holds a `struct user_msghdr *` (`sendmsg`); read its `msg_name` first.
+   ///
+   /// `sendmmsg` uses this too, with the offset of its `msgvec`: the array's first
+   /// `mmsghdr` starts with the `msghdr` whose `msg_name` this reads.
+   MsghdrAt(i16),
+}
+
+/// The tracepoints the registry attaches, in the order it attaches them.
+const PROBES: [&str; 4] = [SENDTO, CONNECT, SENDMSG, SENDMMSG];
+
+/// Whether a tracepoint's destination argument is an `msghdr` rather than a `sockaddr`.
+fn reads_msghdr(name: &str) -> bool {
+   matches!(name, SENDMSG | SENDMMSG)
+}
 
 // eBPF opcode pieces, from `include/uapi/linux/bpf.h`.
 const BPF_LD: u8 = 0x00;
@@ -217,20 +243,134 @@ struct FlowVal {
    ts_ns: u64,
 }
 
-/// Builds the one tracepoint program, which differs between `sendto` and `connect` only in
-/// the context offset that holds the user's `sockaddr` pointer.
+/// Builds the one tracepoint program, which differs between the probes only in where the
+/// context names the user's destination.
 ///
-/// The frame layout is fixed by the program: the copied `sockaddr` sits at `fp-32`, the key
-/// at `fp-56` and the value at `fp-72`.
-fn program(map_fd: i32, sockaddr_offset: i16) -> Vec<Insn> {
+/// The frame layout is fixed by the program: the copied `sockaddr` sits at `fp-32`, the
+/// key at `fp-56` and the value at `fp-72`. A `MsghdrAt` program first stages the
+/// `msghdr` at `fp-64`. That staging area overlaps the key and the value, which is safe
+/// because those bytes are dead once `r3` holds `msg_name`, before either is written.
+///
+/// `msghdr` is `struct user_msghdr` as the kernel's uapi spells it, whose first two
+/// members are the ones that matter here: `msg_name` at offset 0 (a user pointer) and
+/// `msg_namelen` at offset 8.
+fn program(map_fd: i32, destination: Destination) -> Vec<Insn> {
+   let mut insns = match destination {
+      Destination::SockaddrAt(ctx_offset) => sockaddr_prologue(ctx_offset),
+      Destination::MsghdrAt(ctx_offset) => msghdr_prologue(ctx_offset),
+   };
+   insns.extend(record_tail(map_fd));
+   insns
+}
+
+/// `sizeof(struct user_msghdr)`. `msg_name` and `msg_namelen` are the only members this
+/// program reads, and both are 8 bytes.
+const MSGHDR_BYTES: i32 = 16;
+
+/// `sizeof(struct sockaddr_in6)`, the longest destination this program copies.
+const SOCKADDR_BYTES: i32 = 28;
+
+/// The prologue for `sendto` and `connect`: the context holds the user's `sockaddr *`.
+///
+/// The [`record_tail`] that follows appears one instruction later in this program's
+/// numbering; each of its relative indices is therefore one higher here.
+///
+///   0  r3 = *(u64 *)(ctx + ctx_offset)   the user's sockaddr pointer
+fn sockaddr_prologue(ctx_offset: i16) -> Vec<Insn> {
+   vec![ldx_dw(3, 1, ctx_offset)]
+}
+
+/// The prologue for `sendmsg` and `sendmmsg`: the context holds a user pointer to a
+/// `msghdr` (for `sendmmsg`, the first `mmsghdr`, whose `msg_hdr` starts at offset 0).
+///
+/// `sendmmsg` records only its first message's name. NetShield attributes flows, not
+/// datagrams, and every message in a batch shares the socket, so a per-message loop would
+/// add hand-assembled code and no coverage.
+///
+/// A NULL `msg_name` means the socket is connected and the syscall carries no destination
+/// at all; the `connect` hook recorded that one, so the program returns without touching
+/// the map.
+///
+/// The prologue is 10 instructions, so every [`record_tail`] index appears 10 higher in this
+/// program's numbering, which is what the verifier reports.
+///
+///   0  r3 = *(u64 *)(ctx + ctx_offset)   the msghdr (or msgvec) user pointer
+///   1  r1 = fp                            \
+///   2  r1 += -64                           | probe_read_user(fp-64, 16, r3)
+///   3  r2 = 16                             |
+///   4  call probe_read_user              /
+///   5  if r0 != 0 goto 8                 unreadable msghdr: return, no map write
+///   6  r3 = *(u64 *)(fp + -64)           r3 = msg_name
+///   7  if r3 != 0 goto 10                connected socket: return, connect record stands
+///   8  r0 = 0                            \
+///   9  exit                               | return without a map write
+fn msghdr_prologue(ctx_offset: i16) -> Vec<Insn> {
+   vec![
+      ldx_dw(3, 1, ctx_offset),
+      mov64_reg(1, 10),
+      add64_imm(1, -64),
+      mov64_imm(2, MSGHDR_BYTES),
+      call(BPF_FUNC_PROBE_READ_USER),
+      jne_imm(0, 0, 2),   // -> 8, return without a map write
+      ldx_dw(3, 10, -64), // r3 = the msghdr's msg_name
+      jne_imm(3, 0, 2),   // -> 10, the sockaddr read
+      mov64_imm(0, 0),
+      exit(),
+   ]
+}
+
+/// The tail shared by all three probe kinds: `r3` already holds the user's `sockaddr *`.
+///
+/// Its internal branch offsets are relative and therefore independent of the prologue that
+/// precedes it. Indices are relative to this array; add the prologue length (1 for
+/// `SockaddrAt`, 10 for `MsghdrAt`) for the numbering the verifier reports.
+///
+///   0  r1 = fp                            \
+///   1  r1 += -32                           | probe_read_user(fp-32, 28, r3)
+///   2  r2 = 28                             |
+///   3  call probe_read_user              /
+///   4  if r0 != 0 goto 36                read failed (a NULL addr) -> index 36
+///   5  r0 = 0
+///   6  *(u64 *)(fp - 40) = r0           zero the key area fp-56..fp-33
+///   7  *(u64 *)(fp - 48) = r0
+///   8  *(u64 *)(fp - 56) = r0
+///   9  call get_current_uid_gid
+///  10  *(u32 *)(fp - 56) = r0           key.uid
+///  11  r0 = *(u16 *)(fp - 32)
+///  12  *(u16 *)(fp - 52) = r0           key.family
+///  13  r0 = *(u16 *)(fp - 30)
+///  14  *(u16 *)(fp - 50) = r0           key.dport
+///  15  r0 = *(u16 *)(fp - 32)
+///  16  if r0 != 2 goto 20               not AF_INET -> v6 block at 20
+///  17  r0 = *(u32 *)(fp - 28)           v4 address
+///  18  *(u32 *)(fp - 48) = r0
+///  19  goto 24                          -> value block
+///  20  r0 = *(u64 *)(fp - 24)           v6 low half
+///  21  *(u64 *)(fp - 48) = r0
+///  22  r0 = *(u64 *)(fp - 16)           v6 high half
+///  23  *(u64 *)(fp - 40) = r0
+///  24  call get_current_pid_tgid
+///  25  *(u64 *)(fp - 72) = r0           value.pid_tgid
+///  26  call ktime_get_ns
+///  27  *(u64 *)(fp - 64) = r0           value.ts_ns
+///  28  r1 = map_fd                       \
+///  29  (upper 32 bits of the descriptor)  | load the map descriptor
+///  30  r2 = fp                           |
+///  31  r2 += -56                          |
+///  32  r3 = fp                           |
+///  33  r3 += -72                          |
+///  34  r4 = 0                            | BPF_ANY
+///  35  call map_update_elem              /
+///  36  r0 = 0
+///  37  exit
+fn record_tail(map_fd: i32) -> Vec<Insn> {
    let map = ld_map_fd(1, map_fd);
    vec![
-      ldx_dw(3, 1, sockaddr_offset), // r3 = the user's sockaddr pointer from the ctx
-      mov64_reg(1, 10),              // r1 = fp
-      add64_imm(1, -32),             // dst = fp-32
-      mov64_imm(2, 28),              // size = sizeof(sockaddr_in6)
+      mov64_reg(1, 10),             // r1 = fp
+      add64_imm(1, -32),            // dst = fp-32
+      mov64_imm(2, SOCKADDR_BYTES), // size = sizeof(sockaddr_in6)
       call(BPF_FUNC_PROBE_READ_USER),
-      jne_imm(0, 0, 31), // read failed (a NULL addr from connect/sendto misuse) -> index 37
+      jne_imm(0, 0, 31), // read failed -> index 36
       mov64_imm(0, 0),
       stx_dw(10, -40, 0), // zero the key area fp-56..fp-33
       stx_dw(10, -48, 0),
@@ -242,10 +382,10 @@ fn program(map_fd: i32, sockaddr_offset: i16) -> Vec<Insn> {
       ldx_h(0, 10, -30),
       stx_h(10, -50, 0), // key.dport
       ldx_h(0, 10, -32),
-      jne_imm(0, 2, 3),  // not AF_INET -> v6 block at 21
+      jne_imm(0, 2, 3),  // not AF_INET -> v6 block at 20
       ldx_w(0, 10, -28), // v4 address
       stx_w(10, -48, 0),
-      ja(4),              // -> 25
+      ja(4),              // -> 24
       ldx_dw(0, 10, -24), // v6 low half
       stx_dw(10, -48, 0),
       ldx_dw(0, 10, -16), // v6 high half
@@ -271,7 +411,7 @@ fn program(map_fd: i32, sockaddr_offset: i16) -> Vec<Insn> {
 #[derive(Debug)]
 pub enum RegistryError {
    /// The kernel or this container does not expose the interface: no tracefs, or a
-   /// tracepoint whose format no longer names a `sockaddr` argument.
+   /// format that no longer names the `sockaddr` or `msghdr` argument.
    Unavailable(String),
    /// A `bpf(2)`, `perf_event_open(2)` or `ioctl(2)` call failed.
    Syscall(String),
@@ -314,18 +454,28 @@ impl SendRegistry {
    }
 
    fn try_open() -> Result<Self, RegistryError> {
-      // Read the two offsets and ids before touching the kernel: a format change is the
+      // Read the offsets and ids before touching the kernel: a format change is the
       // cheapest failure and must not leave a map or program behind.
       let root = tracefs_root().ok_or_else(|| {
          RegistryError::Unavailable(
             "no tracefs mount at /sys/kernel/tracing or /sys/kernel/debug/tracing".to_string(),
          )
       })?;
-      let mut planned = Vec::with_capacity(2);
-      for name in [SENDTO, CONNECT] {
-         let offset = read_sockaddr_offset(&root, name)?;
-         let id = read_tracepoint_id(&root, name)?;
-         planned.push((offset, id));
+      // A format that does not name the argument makes that program unavailable, but only
+      // that one: the others still attach. The id is read alongside it, and a tracepoint
+      // that cannot even be planned is reported and skipped for the same reason.
+      let mut planned = Vec::with_capacity(PROBES.len());
+      for name in PROBES {
+         let destination = if reads_msghdr(name) {
+            read_destination_offset(&root, name, "msghdr").map(Destination::MsghdrAt)
+         } else {
+            read_destination_offset(&root, name, "sockaddr").map(Destination::SockaddrAt)
+         }
+         .and_then(|destination| read_tracepoint_id(&root, name).map(|id| (destination, id)));
+         match destination {
+            Ok((destination, id)) => planned.push((name, destination, id)),
+            Err(err) => warn!("send registry probe {name} is unavailable: {err}"),
+         }
       }
 
       let attr = syscall::MapCreate {
@@ -349,53 +499,62 @@ impl SendRegistry {
          .map_err(|err| RegistryError::Syscall(format!("BPF_MAP_CREATE: {err}")))?;
 
       let mut events: Vec<i32> = Vec::new();
-      let mut progs: Vec<i32> = Vec::new();
-      let loaded = (|| -> Result<(), RegistryError> {
-         for (offset, id) in &planned {
-            let insns = program(map_fd, *offset);
-            let mut prog = syscall::ProgLoad::for_tracepoint();
-            let (prog_fd, _log) = syscall::prog_load(&mut prog, &insns).map_err(|err| {
-               // No log means the verifier never saw the program: `EPERM` is a missing
-               // capability, not a rejected instruction.
-               if err.raw_os_error() == Some(libc::EPERM) {
-                  RegistryError::Syscall(format!(
-                     "BPF_PROG_LOAD for tracepoint {id}: {err}"
-                  ))
-               } else {
-                  RegistryError::Verifier(format!("tracepoint {id}: {err}"))
-               }
-            })?;
-            progs.push(prog_fd);
-            Self::attach_tracepoint(*id, prog_fd, &mut events)?;
+      // Each tracepoint is attached on its own: a verifier rejection or a failed
+      // `perf_event_open` for one of them must leave the others running, so the failure is
+      // reported with its tracepoint name and that probe is skipped.
+      let mut attached = 0usize;
+      for (name, destination, id) in planned {
+         match Self::attach_one(map_fd, name, destination, id, &mut events) {
+            Ok(()) => attached += 1,
+            Err(err) => warn!("send registry probe {name} was not attached: {err}"),
          }
-         Ok(())
-      })();
-
-      if let Err(err) = loaded {
+      }
+      if attached == 0 {
          for event in events.drain(..) {
             syscall::close_owned(event);
          }
-         for prog in progs.drain(..) {
-            syscall::close_owned(prog);
-         }
          syscall::close_owned(map_fd);
-         return Err(err);
+         return Err(RegistryError::Unavailable(
+            "no send tracepoint could be attached".to_string(),
+         ));
       }
 
-      // The perf events now hold the program references, so their descriptors can go.
-      for prog in progs.drain(..) {
-         syscall::close_owned(prog);
-      }
-      info!(
-         "send registry active: {} tracepoints attached",
-         planned.len()
-      );
+      info!("send registry active: {attached} tracepoints attached");
       Ok(Self {
          map_fd,
          events,
          hits: AtomicU64::new(0),
          misses: AtomicU64::new(0),
       })
+   }
+
+   /// Loads and attaches one tracepoint's program, keeping its perf event in `events` only
+   /// if both steps succeed.
+   fn attach_one(
+      map_fd: i32,
+      name: &str,
+      destination: Destination,
+      id: i32,
+      events: &mut Vec<i32>,
+   ) -> Result<(), RegistryError> {
+      let insns = program(map_fd, destination);
+      let mut prog = syscall::ProgLoad::for_tracepoint();
+      let (prog_fd, _log) = syscall::prog_load(&mut prog, &insns).map_err(|err| {
+         // No log means the verifier never saw the program: `EPERM` is a missing
+         // capability, not a rejected instruction.
+         if err.raw_os_error() == Some(libc::EPERM) {
+            RegistryError::Syscall(format!(
+               "BPF_PROG_LOAD for {name} (tracepoint {id}): {err}"
+            ))
+         } else {
+            RegistryError::Verifier(format!("{name} (tracepoint {id}): {err}"))
+         }
+      })?;
+      let attached = Self::attach_tracepoint(id, prog_fd, events);
+      // Whatever the perf event's state, the program descriptor is ours to close: success
+      // means the event holds the reference, failure means nothing does.
+      syscall::close_owned(prog_fd);
+      attached
    }
 
    /// Opens the single perf event that carries `prog_fd` for the tracepoint `id`, and keeps
@@ -412,9 +571,16 @@ impl SendRegistry {
       let event = syscall::perf_event_open_tracepoint(id, 0).map_err(|err| {
          RegistryError::Syscall(format!("perf_event_open(tracepoint {id}): {err}"))
       })?;
+      if let Err(err) = syscall::perf_enable(event, prog_fd) {
+         // The event never ran a program, so it must not stay in `events`; dropping it here
+         // keeps the registry from holding a descriptor for a tracepoint it does not own.
+         syscall::close_owned(event);
+         return Err(RegistryError::Syscall(format!(
+            "attaching tracepoint {id}: {err}"
+         )));
+      }
       events.push(event);
-      syscall::perf_enable(event, prog_fd)
-         .map_err(|err| RegistryError::Syscall(format!("attaching tracepoint {id}: {err}")))
+      Ok(())
    }
 
    /// The pid that sent to `remote` from `uid` within [`SENDER_TTL_NS`], if the kernel
@@ -538,29 +704,33 @@ fn tracefs_root() -> Option<PathBuf> {
       .find(|root| root.join("events").is_dir())
 }
 
-/// Reads the `offset:` of the field whose type names a `sockaddr`.
+/// Reads the `offset:` of the field whose type names `ty` (`sockaddr` or `msghdr`).
 ///
 /// The syscall tracepoint argument order is not ABI-frozen, so the offset is read from the
 /// tracepoint's own format file rather than assumed to be 48 or 24.
-fn read_sockaddr_offset(root: &Path, name: &str) -> Result<i16, RegistryError> {
+fn read_destination_offset(root: &Path, name: &str, ty: &str) -> Result<i16, RegistryError> {
    let path = root.join("events/syscalls").join(name).join("format");
    let text = fs::read_to_string(&path).map_err(|err| {
       RegistryError::Unavailable(format!("cannot read {}: {err}", path.display()))
    })?;
-   sockaddr_offset_in(&text).ok_or_else(|| {
+   field_offset_in(&text, ty).ok_or_else(|| {
       RegistryError::Unavailable(format!(
-         "{} has no field of type sockaddr",
+         "{} has no field of type {ty}",
          path.display()
       ))
    })
 }
 
-/// Extracts the offset from the `sockaddr` field of a tracepoint format file.
-fn sockaddr_offset_in(format: &str) -> Option<i16> {
+/// Extracts the offset of the first field of a tracepoint format file whose type contains
+/// `ty`.
+///
+/// The match is on the type text, not on the field name, so a kernel that renames `msg` or
+/// `msgvec` still works.
+fn field_offset_in(format: &str, ty: &str) -> Option<i16> {
    format.lines().find_map(|line| {
       let rest = line.trim().strip_prefix("field:")?;
-      let (ty, rest) = rest.split_once(';')?;
-      if !ty.contains("sockaddr") {
+      let (field_ty, rest) = rest.split_once(';')?;
+      if !field_ty.contains(ty) {
          return None;
       }
       let after = rest.split("offset:").nth(1)?.trim_start();
@@ -592,9 +762,9 @@ mod tests {
    use super::*;
 
    #[test]
-   fn the_program_reads_the_sockaddr_at_the_given_offset() {
-      let at_48 = program(7, 48);
-      let at_24 = program(7, 24);
+   fn a_sendto_program_is_unchanged() {
+      let at_48 = program(7, Destination::SockaddrAt(48));
+      let at_24 = program(7, Destination::SockaddrAt(24));
       assert_eq!(at_48[0], ldx_dw(3, 1, 48));
       assert_eq!(at_24[0], ldx_dw(3, 1, 24));
       assert_eq!(at_48.len(), 39);
@@ -602,7 +772,49 @@ mod tests {
    }
 
    #[test]
-   fn the_key_layout_matches_between_the_halves() {
+   fn a_sendmsg_program_reads_the_msghdr() {
+      let insns = program(7, Destination::MsghdrAt(24));
+      assert_eq!(
+         insns[0],
+         ldx_dw(3, 1, 24),
+         "r3 = the msghdr pointer"
+      );
+      assert_eq!(insns[1], mov64_reg(1, 10));
+      assert_eq!(
+         insns[2],
+         add64_imm(1, -64),
+         "the msghdr lands at fp-64"
+      );
+      assert_eq!(
+         insns[3],
+         mov64_imm(2, 16),
+         "16 bytes: msg_name and msg_namelen"
+      );
+      assert_eq!(insns[4], call(BPF_FUNC_PROBE_READ_USER));
+      // A failed read returns without touching the map: 5 + 1 + 2 = 8.
+      assert_eq!(insns[5], jne_imm(0, 0, 2));
+      assert_eq!(insns[6], ldx_dw(3, 10, -64), "r3 = msg_name");
+      // A NULL msg_name is a connected socket: 7 + 1 + 2 = 10, the sockaddr read.
+      assert_eq!(insns[7], jne_imm(3, 0, 2));
+      assert_eq!(insns[8], mov64_imm(0, 0));
+      assert_eq!(insns[9], exit());
+      // The same record tail as `sendto`, so the key and value stay identical.
+      assert_eq!(insns.len(), 10 + 38);
+      assert_eq!(&insns[10..], &record_tail(7)[..]);
+   }
+
+   #[test]
+   fn a_sendmmsg_program_uses_the_first_msghdrs_name() {
+      // The first `mmsghdr`'s `msg_hdr` is at offset 0 of the array, so `msgvec` is read
+      // exactly like `sendmsg`'s `msg`: one prologue serves both.
+      let sendmsg = program(7, Destination::MsghdrAt(24));
+      let sendmmsg = program(7, Destination::MsghdrAt(24));
+      assert_eq!(sendmsg, sendmmsg);
+      assert_eq!(sendmsg.len(), 48);
+   }
+
+   #[test]
+   fn the_key_and_value_layouts_are_unchanged() {
       assert_eq!(std::mem::size_of::<FlowKey>(), 24);
       assert_eq!(std::mem::size_of::<FlowVal>(), 16);
       assert_eq!(std::mem::offset_of!(FlowKey, addr), 8);
@@ -675,6 +887,131 @@ mod tests {
       );
    }
 
+   /// Sends one UDP datagram to the socket's own bound address, closes the socket 1 ms
+   /// later and leaves the process alive, which is the shape of a flow whose socket is gone
+   /// by the time `/proc` is scanned. Returns the destination and the sending uid.
+   ///
+   /// Every `unsafe` block below is a libc call on a descriptor this helper opened, with
+   /// live locals of exactly the type libc declares for the lengths it passes.
+   fn send_one(batched: bool) -> ((IpAddr, u16), u32) {
+      let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+      assert!(
+         fd >= 0,
+         "socket: {}",
+         std::io::Error::last_os_error()
+      );
+      let mut local: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+      local.sin_family = libc::AF_INET as u16;
+      // 127.0.0.1 in the network byte order `in_addr` stores.
+      local.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+      local.sin_port = 0;
+      let bound = unsafe {
+         libc::bind(
+            fd,
+            (&local as *const libc::sockaddr_in).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+         )
+      };
+      assert_eq!(
+         bound,
+         0,
+         "bind: {}",
+         std::io::Error::last_os_error()
+      );
+      let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+      let named = unsafe {
+         libc::getsockname(
+            fd,
+            (&mut local as *mut libc::sockaddr_in).cast(),
+            &mut len,
+         )
+      };
+      assert_eq!(
+         named,
+         0,
+         "getsockname: {}",
+         std::io::Error::last_os_error()
+      );
+
+      // Send to the port the socket itself bound: the datagram needs no listener, and the
+      // destination is exactly the one the tracepoint has to record.
+      let mut dest = local;
+      let mut payload = *b"n";
+      let mut iov = libc::iovec {
+         iov_base: (&mut payload as *mut u8).cast(),
+         iov_len: payload.len(),
+      };
+      let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+      msg.msg_name = (&mut dest as *mut libc::sockaddr_in).cast();
+      msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+      msg.msg_iov = &mut iov;
+      msg.msg_iovlen = 1;
+
+      let sent = if batched {
+         let mut batch = [libc::mmsghdr {
+            msg_hdr: msg,
+            msg_len: 0,
+         }];
+         // SAFETY: `batch` is a live one-element array of the `mmsghdr` the syscall reads,
+         // and `vlen` is exactly its length.
+         unsafe {
+            libc::syscall(
+               libc::SYS_sendmmsg,
+               fd,
+               batch.as_mut_ptr(),
+               1 as libc::c_long,
+               0 as libc::c_long,
+            )
+         }
+      } else {
+         // SAFETY: `msg` is a live `msghdr` whose pointers name live locals, and the syscall
+         // only reads it for the duration of the call.
+         unsafe { libc::syscall(libc::SYS_sendmsg, fd, &msg, 0) }
+      };
+      assert_eq!(
+         sent,
+         1,
+         "{}: {}",
+         if batched { "sendmmsg" } else { "sendmsg" },
+         std::io::Error::last_os_error()
+      );
+
+      std::thread::sleep(std::time::Duration::from_millis(1));
+      // SAFETY: `fd` was opened above, is owned by this helper and is closed exactly once.
+      unsafe { libc::close(fd) };
+
+      let uid = unsafe { libc::getuid() };
+      let port = u16::from_be(local.sin_port);
+      (
+         (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port),
+         uid,
+      )
+   }
+
+   /// The live coverage measurement: both named sends must leave a record, exactly as
+   /// `sendto` does, so a socket closed before the `/proc` scan is still attributable.
+   #[test]
+   #[ignore = "needs root: loads a BPF program and attaches tracepoints"]
+   fn sendmsg_and_sendmmsg_are_recorded() {
+      if crate::ipc_server::effective_uid() != Some(0) {
+         eprintln!("skipping: attaching tracepoints needs CAP_BPF/CAP_PERFMON");
+         return;
+      }
+      let registry = SendRegistry::open().expect("the send registry must open as root");
+      let ours = std::process::id();
+
+      for (path, batched) in [("sendmsg", false), ("sendmmsg", true)] {
+         let (remote, uid) = send_one(batched);
+         let recorded = registry.recent_sender(uid, remote);
+         println!("{path} -> {remote:?} from uid {uid}: recorded {recorded:?}, expected {ours}");
+         assert_eq!(
+            recorded,
+            Some(ours),
+            "{path} to {remote:?} must record our own pid {ours}"
+         );
+      }
+   }
+
    #[test]
    fn a_missing_tracepoint_is_an_error_not_a_panic() {
       let nanos = SystemTime::now()
@@ -683,7 +1020,8 @@ mod tests {
          .unwrap_or(0);
       let root = std::env::temp_dir().join(format!("netshield-ebpf-missing-{nanos}"));
 
-      assert!(read_sockaddr_offset(&root, SENDTO).is_err());
+      assert!(read_destination_offset(&root, SENDTO, "sockaddr").is_err());
+      assert!(read_destination_offset(&root, SENDMSG, "msghdr").is_err());
       assert!(read_tracepoint_id(&root, SENDTO).is_err());
 
       let dir = root.join("events/syscalls").join(SENDTO);
@@ -697,14 +1035,37 @@ mod tests {
       .expect("write the temp format file");
 
       assert_eq!(read_tracepoint_id(&root, SENDTO).ok(), Some(1234));
-      assert_eq!(read_sockaddr_offset(&root, SENDTO).ok(), Some(48));
+      assert_eq!(
+         read_destination_offset(&root, SENDTO, "sockaddr").ok(),
+         Some(48)
+      );
 
       fs::write(
          dir.join("format"),
          "field:int fd;\toffset:16;\tsize:8;\n",
       )
       .expect("rewrite the temp format file without a sockaddr");
-      assert!(read_sockaddr_offset(&root, SENDTO).is_err());
+      assert!(read_destination_offset(&root, SENDTO, "sockaddr").is_err());
+
+      // A tracepoint whose format does not name the msghdr is unavailable for that program
+      // alone; the discovery step is what reports it.
+      let sendmsg = root.join("events/syscalls").join(SENDMSG);
+      fs::create_dir_all(&sendmsg).expect("create the sendmsg tracepoint directory");
+      fs::write(
+         sendmsg.join("format"),
+         "field:struct user_msghdr __user * msg;\toffset:24;\tsize:8;\tsigned:0;\n",
+      )
+      .expect("write the sendmsg format file");
+      assert_eq!(
+         read_destination_offset(&root, SENDMSG, "msghdr").ok(),
+         Some(24)
+      );
+      fs::write(
+         sendmsg.join("format"),
+         "field:int fd;\toffset:16;\tsize:8;\n",
+      )
+      .expect("rewrite the sendmsg format file without an msghdr");
+      assert!(read_destination_offset(&root, SENDMSG, "msghdr").is_err());
 
       fs::remove_dir_all(&root).ok();
    }
