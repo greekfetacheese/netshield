@@ -1240,13 +1240,9 @@ fn rule_label(id: Option<&RuleId>, rules: &[Rule]) -> String {
    }
 }
 
-/// The trailing count on a group line: `1 connection`, else the bare number.
+/// The trailing count on a group line.
 fn count_label(count: usize) -> String {
-   if count == 1 {
-      "1 connection".to_owned()
-   } else {
-      count.to_string()
-   }
+   count.to_string()
 }
 
 /// One connection line's full text, untruncated: the endpoint, the protocol and the verdict.
