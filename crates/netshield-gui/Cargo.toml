@@ -19,3 +19,13 @@ egui-lucide = "0.2"
 netshield-core = { path = "../netshield-core" }
 serde_json = { workspace = true }
 log = { workspace = true }
+
+# The `ksni` backend (pure-Rust D-Bus StatusNotifierItem) on Linux/BSD: the crate default,
+# `libappindicator`, needs GTK3 and libayatana-appindicator at build time, wants a GTK main
+# loop egui does not run, and emits no click events. Elsewhere the backends come from
+# non-optional target dependencies, so the default feature is off there too.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
