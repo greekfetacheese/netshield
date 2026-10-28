@@ -557,26 +557,80 @@ impl App {
          });
    }
 
-   /// Sidebar footer: connection state, policy mode and queued prompts.
-   fn status_line(&self, ui: &mut egui::Ui) {
-      let (dot, state) = if self.connected {
-         ("●", "connected")
-      } else if self.mock {
-         ("○", "mock")
-      } else {
-         ("●", "offline")
-      };
-      let mut text = format!("{dot} {state}");
-      if !self.mock {
-         text.push_str(match self.mode {
-            Mode::Alert => " · alert",
-            Mode::Silent => " · silent",
+   /// The top bar: the product name, the mode switch and the daemon state.
+   ///
+   /// The switch collects an intent into a local because the panel closure borrows `self`;
+   /// the intent is applied after the closure, exactly as the Settings page used to.
+   fn toolbar(&mut self, ui: &mut egui::Ui) {
+      let mut requested: Option<Mode> = None;
+
+      egui::Panel::top("toolbar").exact_size(42.0).show(ui, |ui| {
+         ui.horizontal_centered(|ui| {
+            ui.add_space(12.0);
+            ui.add(egui_elements::Label::new(
+               egui::RichText::new("NetShield").strong().size(15.0),
+               None,
+            ));
+            ui.with_layout(
+               egui::Layout::right_to_left(egui::Align::Center),
+               |ui| {
+                  ui.add_space(12.0);
+                  let mut ask = self.mode == Mode::Alert;
+                  let switch = elegance::Switch::new(&mut ask, "Ask before connecting");
+                  if ui.add_enabled(!self.mock, switch).changed() {
+                     requested = Some(if ask { Mode::Alert } else { Mode::Silent });
+                  }
+                  ui.add_space(14.0);
+                  let (state, label) = if self.connected {
+                     (elegance::IndicatorState::On, "connected")
+                  } else if self.mock {
+                     (elegance::IndicatorState::Connecting, "mock")
+                  } else {
+                     (elegance::IndicatorState::Off, "offline")
+                  };
+                  ui.add(elegance::Indicator::new(state).size(9.0));
+                  ui.add(egui_elements::Label::new(
+                     egui::RichText::new(label).weak().small(),
+                     None,
+                  ));
+               },
+            );
          });
+      });
+
+      if let Some(mode) = requested {
+         if let Some(client) = &self.ipc {
+            client.send(&Request::SetMode { mode });
+         }
+         // Move the switch at once instead of waiting a round trip for the daemon.
+         self.mode = mode;
+         log::info!("operation mode -> {mode:?}");
       }
+   }
+
+   /// Sidebar footer: connection state and queued prompts.
+   ///
+   /// The mode is not repeated here: the top bar's switch is the one place that says it,
+   /// and two copies invite them to disagree.
+   fn status_line(&self, ui: &mut egui::Ui) {
+      let (state, label) = if self.connected {
+         (elegance::IndicatorState::On, "connected")
+      } else if self.mock {
+         (elegance::IndicatorState::Connecting, "mock")
+      } else {
+         (elegance::IndicatorState::Off, "offline")
+      };
+      let mut text = label.to_owned();
       if !self.pending.is_empty() {
          text.push_str(&format!(" · {} waiting", self.pending.len()));
       }
-      ui.label(egui::RichText::new(text).weak().small());
+      ui.horizontal(|ui| {
+         ui.add(elegance::Indicator::new(state).size(9.0));
+         ui.add(egui_elements::Label::new(
+            egui::RichText::new(text).weak().small(),
+            None,
+         ));
+      });
    }
 
    /// Sends the intents the Rules page collected, then re-lists so the table reflects
@@ -616,15 +670,7 @@ impl App {
             let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
             self.apply_actions(actions);
          }
-         Page::Settings => {
-            if let Some(mode) = ui::settings::show(ui, self.mode) {
-               if let Some(client) = &self.ipc {
-                  client.send(&Request::SetMode { mode });
-               }
-               // Move the radio at once instead of waiting a round trip for the daemon.
-               self.mode = mode;
-            }
-         }
+         Page::Settings => ui::settings::show(ui, self.mode),
          Page::Status => ui::status::show(ui, self.status.as_ref(), unix_now()),
       }
    }
@@ -662,20 +708,26 @@ impl eframe::App for App {
          return;
       }
 
-      egui::Panel::left("nav").exact_size(180.0).show(ui, |ui| {
-         ui.add_space(8.0);
+      self.toolbar(ui);
+      self.banner(ui);
+
+      egui::Panel::left("nav").exact_size(176.0).show(ui, |ui| {
+         ui.add_space(6.0);
+         ui.spacing_mut().item_spacing.y = 2.0;
+         ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
          for page in Page::ALL {
-            if ui.selectable_label(self.page == page, page.name()).clicked() {
+            let selected = self.page == page;
+            let button = egui_elements::Button::selectable(selected, page.name())
+               .min_size(egui::vec2(ui.available_width(), 26.0));
+            if ui.add(button).clicked() {
                self.page = page;
             }
          }
          ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.add_space(8.0);
+            ui.add_space(4.0);
             self.status_line(ui);
          });
       });
-
-      self.banner(ui);
 
       egui::CentralPanel::default().show(ui, |ui| {
          self.page_content(ui);
