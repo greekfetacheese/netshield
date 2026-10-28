@@ -102,8 +102,10 @@ pub struct App {
    next_refresh: Instant,
    rules: Vec<Rule>,
    confirm: ui::rules::Confirm,
-   /// Which applications are collapsed on the Connections page.
-   connections_collapsed: ui::connections::Collapsed,
+   /// Which applications are expanded on the Connections page.
+   connections_expanded: ui::connections::Expanded,
+   /// Which applications are showing all their connections past the child cap.
+   connections_showing_all: ui::connections::ShowingAll,
    /// Derived Connections lines, reused across frames until the log or rules change.
    connections_cache: ui::connections::LinesCache,
    /// The row whose details the Connections page shows in its right-hand pane.
@@ -228,7 +230,8 @@ impl App {
          next_refresh: Instant::now() + REFRESH_EVERY,
          rules: Vec::new(),
          confirm: ui::rules::Confirm::default(),
-         connections_collapsed: ui::connections::Collapsed::default(),
+         connections_expanded: ui::connections::Expanded::default(),
+         connections_showing_all: ui::connections::ShowingAll::default(),
          connections_cache: ui::connections::LinesCache::default(),
          connections_selection: ui::connections::Selection::default(),
          editor: ui::rules::Editor::default(),
@@ -743,7 +746,8 @@ impl App {
             ui,
             &self.log,
             &self.rules,
-            &mut self.connections_collapsed,
+            &mut self.connections_expanded,
+            &mut self.connections_showing_all,
             &mut self.connections_cache,
             &mut self.connections_selection,
          ),
