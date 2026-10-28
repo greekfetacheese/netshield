@@ -21,8 +21,13 @@ UMask=0077
 # It needs CHOWN because it hands the control socket to the GUI user (chown to
 # allowed_uid) after bind: without it the chown fails with EPERM, the socket stays
 # root:root and the unprivileged GUI cannot connect.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN
+# It needs BPF and PERFMON for the send registry: loading a BPF program (bpf(2)) and
+# attaching it to a tracepoint (perf_event_open(2)) are denied without them even for root,
+# because a hardened unit drops them from the bounding set. The failure is silent by
+# design (attribution falls back to /proc), so the only symptom would be attribution that
+# keeps losing sockets it could have caught.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_BPF CAP_PERFMON
 NoNewPrivileges=yes
 
 # 0711 gives every local user traversal into the directory without listing it; the
