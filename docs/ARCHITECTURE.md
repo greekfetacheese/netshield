@@ -185,6 +185,16 @@ Both defaults exist because the alternative was measured: Chromium opens and clo
 sockets (QUIC racing losers, cancelled preconnects) inside the ~5 ms attribution window, so the
 old behaviour produced an `unknown` prompt for traffic that had already been abandoned.
 
+On the same machine the daemon also loads a small BPF program on the `sys_enter_sendto` and
+`sys_enter_connect` tracepoints. It records `(uid, destination) -> (pid, timestamp)` into a hash
+map at syscall time — which is before the socket can be closed — so a flow whose socket is already
+gone can still be attributed. It is a fallback and never an override: it is consulted only after the
+`/proc` scan fails, its answer is refused unless `/proc` agrees that the pid exists and is owned by
+the packet's UID, and the whole probe is optional. No tracefs, no `CAP_BPF`, or a tracepoint whose
+format no longer names its `sockaddr` argument means the daemon runs on `/proc` alone, which is what
+it did before. Batching syscalls (`sendmmsg`) and `send` on an already-connected socket are not
+recorded yet; those flows keep the `/proc` behaviour.
+
 This attribution path has a hard limit that no amount of `/proc` polling removes: it can
 only attribute a socket that is still present when the scan runs, and it can only use the
 UID when the kernel supplied one with the packet (`uid: null` in the connection events

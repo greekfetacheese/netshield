@@ -24,6 +24,8 @@ use std::time::{Duration as StdDuration, Instant, SystemTime};
 use log::{debug, warn};
 use netshield_core::{Attribution, Family, L4Proto, ProcessInfo};
 
+use crate::ebpf::SenderLookup;
+
 /// How long an inode→pid, pid→fd or flow→owner answer may be reused.
 ///
 /// Short on purpose: inodes and port tuples are recycled as soon as a socket closes, so a
@@ -76,6 +78,8 @@ pub struct AttributeStats {
    pub misses: u64,
    /// Lookups that stopped because a scan budget was exceeded.
    pub scan_budget_exhausted: u64,
+   /// Flows `/proc` could not resolve that the kernel's send registry attributed instead.
+   pub registry_hits: u64,
 }
 
 /// A flow that was attributed, keyed by protocol and both endpoints.
@@ -214,6 +218,8 @@ pub struct Attributor {
    scan_incomplete: bool,
    /// When the budget warning was last emitted, so a busy scan cannot flood the journal.
    last_budget_warn: Option<Instant>,
+   /// The kernel's record of recent senders, when the probe could be attached.
+   senders: Option<Box<dyn SenderLookup>>,
 }
 
 /// A cached inode→pid answer, with the owner recorded for the UID cross-check.
@@ -286,7 +292,15 @@ impl Attributor {
          stats: AttributeStats::default(),
          scan_incomplete: false,
          last_budget_warn: None,
+         senders: None,
       }
+   }
+
+   /// The same attributor, with the kernel's send registry as a fallback for flows whose socket
+   /// is gone before `/proc` can be scanned.
+   pub fn with_senders(mut self, senders: Box<dyn SenderLookup>) -> Self {
+      self.senders = Some(senders);
+      self
    }
 
    /// Attributes the socket owning this outbound flow.
@@ -403,12 +417,16 @@ impl Attributor {
             candidates: count,
             ..context
          };
-         return self.unknown(
-            &context,
-            Some(self.missing_kind(uid)),
-            reason,
-            now,
-         );
+         let missing = self.missing_kind(uid);
+         if missing == Missing::SocketGone
+            && let Some(attribution) = self.attribute_from_senders(flow, local, remote, uid, now)
+         {
+            return Attributed {
+               attribution,
+               missing: None,
+            };
+         }
+         return self.unknown(&context, Some(missing), reason, now);
       }
       let context = FailureContext {
          candidates: Some(candidates.len()),
@@ -459,9 +477,18 @@ impl Attributor {
             );
          }
          CandidateOwner::Missing => {
+            let missing = self.missing_kind(uid);
+            if missing == Missing::SocketGone
+               && let Some(attribution) = self.attribute_from_senders(flow, local, remote, uid, now)
+            {
+               return Attributed {
+                  attribution,
+                  missing: None,
+               };
+            }
             return self.unknown(
                &context,
-               Some(self.missing_kind(uid)),
+               Some(missing),
                "no /proc fd link holds the inode",
                now,
             );
@@ -498,6 +525,44 @@ impl Attributor {
          attribution: Attribution::Process(process),
          missing: None,
       }
+   }
+
+   /// Attributes a flow the scan could not resolve, from the kernel's record of recent senders.
+   ///
+   /// This is the fallback for a socket that was closed before the scan ran: the record is taken
+   /// at syscall time, so it exists for a socket that does not. It never overrides `/proc` — it is
+   /// only asked after the scan failed — and it refuses an answer that `/proc` contradicts: the
+   /// pid must still exist, must still be owned by the packet's uid, and its identity is read from
+   /// `/proc` like any other, so a recycled pid cannot inherit another application's policy.
+   fn attribute_from_senders(
+      &mut self,
+      flow: FlowKey,
+      local: (IpAddr, u16),
+      remote: (IpAddr, u16),
+      uid: Option<u32>,
+      now: Instant,
+   ) -> Option<Attribution> {
+      let senders = self.senders.as_ref()?;
+      let uid = uid?;
+      let pid = senders.recent_sender(uid, remote)?;
+      if read_pid_uid(pid) != Some(uid) {
+         debug!("send registry named pid {pid} for {remote:?} but /proc disagrees on its uid");
+         return None;
+      }
+      let process = self.process_identity(pid, uid)?;
+      self.remember_success(
+         flow,
+         FlowCacheEntry { pid, uid, at: now },
+         (Some(uid), flow.0, remote.1),
+      );
+      self.stats.registry_hits += 1;
+      debug!(
+         "attributed {} -> {}:{} to pid {pid} from the send registry",
+         endpoint_label(local),
+         endpoint_label(remote),
+         remote.1
+      );
+      Some(Attribution::Process(process))
    }
 
    /// Resolves a pid's identity, preferring the connector cache.
@@ -1413,6 +1478,7 @@ fn endpoint_label((addr, port): (IpAddr, u16)) -> String {
 mod tests {
    use super::*;
    use std::net::UdpSocket;
+   use std::sync::atomic::{AtomicUsize, Ordering};
 
    /// `/proc/net/tcp` captured on the development machine (kernel 7.0.0-38-generic,
    /// Ubuntu) with two listening sockets, plus the matching `/proc/net/tcp6` loopback
@@ -1469,6 +1535,180 @@ mod tests {
       fs::metadata(format!("{PROC}/{}", std::process::id()))
          .expect("read our own /proc entry")
          .uid()
+   }
+
+   /// A registry that answers with whatever the test says, and counts how often it was asked.
+   struct FakeSenders {
+      answer: Option<u32>,
+      asked: Arc<AtomicUsize>,
+   }
+
+   impl SenderLookup for FakeSenders {
+      fn recent_sender(&self, _uid: u32, _remote: (IpAddr, u16)) -> Option<u32> {
+         self.asked.fetch_add(1, Ordering::Relaxed);
+         self.answer
+      }
+   }
+
+   /// The flow the existing closed-flow test uses: no socket ever bound this local port.
+   fn closed_flow() -> ((IpAddr, u16), (IpAddr, u16)) {
+      (
+         (IpAddr::V4(Ipv4Addr::LOCALHOST), 65_000),
+         v4([192, 0, 2, 1], 6553),
+      )
+   }
+
+   #[test]
+   fn a_send_registry_hit_attributes_the_flow() {
+      let asked = Arc::new(AtomicUsize::new(0));
+      let senders = FakeSenders {
+         answer: Some(std::process::id()),
+         asked: Arc::clone(&asked),
+      };
+      let mut attributor = Attributor::new().with_senders(Box::new(senders));
+      let (local, remote) = closed_flow();
+
+      let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(own_uid()));
+
+      assert_eq!(
+         attributed.missing, None,
+         "a registry hit leaves no missing reason"
+      );
+      match &attributed.attribution {
+         Attribution::Process(process) => {
+            assert_eq!(process.pid, std::process::id());
+            assert_eq!(process.uid, own_uid());
+         }
+         Attribution::Unknown => panic!(
+            "the registry named our pid but the flow stayed unknown; stats {:?}",
+            attributor.stats()
+         ),
+      }
+      assert_eq!(
+         asked.load(Ordering::Relaxed),
+         1,
+         "the registry must have been asked"
+      );
+      assert_eq!(attributor.stats().registry_hits, 1);
+   }
+
+   #[test]
+   fn a_registry_answer_from_another_uid_is_refused() {
+      let asked = Arc::new(AtomicUsize::new(0));
+      // pid 1 is root on a native host; inside a user-namespace sandbox (where `cargo test`
+      // may run) it is our own uid, so the packet names a uid pid 1 does not have either way.
+      let pid = 1;
+      let owner = read_pid_uid(pid).expect("pid 1 has a readable /proc entry");
+      let packet_uid = if owner == own_uid() {
+         own_uid().wrapping_add(1)
+      } else {
+         own_uid()
+      };
+      let senders = FakeSenders {
+         answer: Some(pid),
+         asked: Arc::clone(&asked),
+      };
+      let mut attributor = Attributor::new().with_senders(Box::new(senders));
+      let (local, remote) = closed_flow();
+
+      let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(packet_uid));
+
+      assert_eq!(
+         attributed.attribution,
+         Attribution::Unknown,
+         "a pid owned by another uid is not this packet's sender"
+      );
+      assert_eq!(
+         attributed.missing,
+         Some(Missing::SocketGone),
+         "refusing the registry answer leaves the closed-flow decision unchanged"
+      );
+      assert_eq!(
+         asked.load(Ordering::Relaxed),
+         1,
+         "the registry must have been asked before its answer was refused"
+      );
+      assert_eq!(attributor.stats().registry_hits, 0);
+   }
+
+   #[test]
+   fn a_registry_miss_still_reports_the_flow_closed() {
+      let asked = Arc::new(AtomicUsize::new(0));
+      let senders = FakeSenders {
+         answer: None,
+         asked: Arc::clone(&asked),
+      };
+      let mut attributor = Attributor::new().with_senders(Box::new(senders));
+      let (local, remote) = closed_flow();
+
+      let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(own_uid()));
+
+      assert_eq!(attributed.attribution, Attribution::Unknown);
+      assert_eq!(
+         attributed.missing,
+         Some(Missing::SocketGone),
+         "a registry with nothing must not change the closed-flow decision"
+      );
+      assert_eq!(asked.load(Ordering::Relaxed), 1);
+      assert_eq!(attributor.stats().registry_hits, 0);
+   }
+
+   #[test]
+   fn the_registry_is_never_asked_when_proc_succeeds() {
+      let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+      socket.connect("127.0.0.1:9").expect("connect the datagram socket");
+      let local = socket.local_addr().expect("local address");
+      let peer = socket.peer_addr().expect("peer address");
+      let uid = own_uid();
+      let asked = Arc::new(AtomicUsize::new(0));
+      let senders = FakeSenders {
+         // If this were ever consulted, the flow would be attributed to pid 1 instead of us.
+         answer: Some(1),
+         asked: Arc::clone(&asked),
+      };
+      let mut attributor = Attributor::new().with_senders(Box::new(senders));
+
+      let attributed = attributor.attribute(
+         (local.ip(), local.port()),
+         (peer.ip(), peer.port()),
+         L4Proto::Udp,
+         Some(uid),
+      );
+
+      assert_eq!(
+         asked.load(Ordering::Relaxed),
+         0,
+         "/proc answered first"
+      );
+      match &attributed.attribution {
+         Attribution::Process(process) => assert_eq!(process.pid, std::process::id()),
+         Attribution::Unknown => panic!("the live socket must resolve through /proc"),
+      }
+      assert_eq!(attributor.stats().registry_hits, 0);
+   }
+
+   #[test]
+   fn a_registry_answer_is_not_used_for_a_uid_less_flow() {
+      let asked = Arc::new(AtomicUsize::new(0));
+      let senders = FakeSenders {
+         answer: Some(std::process::id()),
+         asked: Arc::clone(&asked),
+      };
+      let mut attributor = Attributor::new().with_senders(Box::new(senders));
+      let (local, remote) = closed_flow();
+
+      let attributed = attributor.attribute(local, remote, L4Proto::Udp, None);
+
+      assert_eq!(
+         asked.load(Ordering::Relaxed),
+         0,
+         "a flow the kernel gave no uid has no registry key to look up"
+      );
+      assert_eq!(attributed.attribution, Attribution::Unknown);
+      // No hard-coded variant: this asserts whatever the complete-scan/no-uid rule says.
+      let expected = Attributor::new().attribute(local, remote, L4Proto::Udp, None);
+      assert_eq!(attributed.missing, expected.missing);
+      assert_eq!(attributor.stats().registry_hits, 0);
    }
 
    /// The exact-match lookup as TCP uses it; the existing fixtures exercise this path.

@@ -19,6 +19,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::{info, warn};
 
+/// Where a pid for a recent send can come from.
+///
+/// A trait only so `Attributor`'s tests can answer without root, a tracefs mount and a kernel
+/// that will load a BPF program.
+pub trait SenderLookup: Send + Sync {
+   /// The pid that sent to `remote` from `uid` recently, if the kernel recorded it.
+   fn recent_sender(&self, uid: u32, remote: (IpAddr, u16)) -> Option<u32>;
+}
+
+impl SenderLookup for SendRegistry {
+   fn recent_sender(&self, uid: u32, remote: (IpAddr, u16)) -> Option<u32> {
+      SendRegistry::recent_sender(self, uid, remote)
+   }
+}
+
+// `Attributor` derives `Debug`; the probe's internal descriptors and counters are not useful
+// in a debug line, and keeping the trait object printable costs nothing.
+impl std::fmt::Debug for dyn SenderLookup {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str("SenderLookup")
+   }
+}
+
 /// How long a record may be believed. The daemon asks right after the packet is queued, so
 /// the record is normally microseconds old; the window only exists because a clock is
 /// cheaper to consult than a syscall.
