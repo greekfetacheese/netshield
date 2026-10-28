@@ -151,8 +151,15 @@ impl ConnectionView {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ScopeChoice {
    AnyConnection,
-   Domain { host: String, subdomains: bool },
+   Domain {
+      host: String,
+      subdomains: bool,
+   },
    Address,
+   /// Every destination the prompt listed, each scoped to itself. This is what a group means
+   /// when the user says "only these destinations"; it must never be inferred from the number
+   /// of destinations.
+   TheseDestinations,
 }
 
 /// A question the daemon puts to the user.
@@ -480,6 +487,20 @@ mod tests {
       assert_eq!(
          serde_json::to_value(&scope).expect("serialisable scope"),
          serde_json::json!({ "kind": "address" })
+      );
+   }
+
+   #[test]
+   fn scope_choice_these_destinations_serializes_without_a_value() {
+      let scope = ScopeChoice::TheseDestinations;
+      let bytes = encode_line(&scope).expect("serialisable scope");
+      assert_eq!(
+         serde_json::to_value(&scope).expect("serialisable scope"),
+         serde_json::json!({ "kind": "these_destinations" })
+      );
+      assert_eq!(
+         decode_line::<ScopeChoice>(&bytes).expect("decodable scope"),
+         scope
       );
    }
 

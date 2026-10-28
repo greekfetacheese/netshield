@@ -46,7 +46,7 @@ use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
-use crate::policy::{Decision, Policy};
+use crate::policy::{Applied, Decision, Policy};
 use crate::proc::{Attributor, Missing, ProcessCache};
 use crate::store::{RuleStore, StoreError};
 
@@ -907,10 +907,10 @@ impl Daemon {
    /// Answers one prompt.
    ///
    /// The answer covers exactly the destinations the prompt listed. `Once` grants each of
-   /// them once; a timed answer creates one rule *per destination*, never a rule for
-   /// anywhere, so the click grants what was on screen. A single-destination prompt keeps
-   /// honouring the requested `ScopeChoice` verbatim, which is what makes a group of one
-   /// behave like the prompt it replaces.
+   /// them once; a timed answer creates the rules [`rules_for`] derives from the requested
+   /// scope, which is the user's choice and never a consequence of how many destinations
+   /// the prompt listed. A rule equivalent to one already present is refreshed instead of
+   /// added a second time.
    fn decide(&mut self, _client: u64, decide: DecideRequest) {
       let Some(record) = self.pending.get(decide.prompt_id).cloned() else {
          // A GUI click can arrive after the prompt expired; the user believes a rule was
@@ -944,37 +944,30 @@ impl Daemon {
          [dest] => dest_label(&dest.connection),
          dests => format!("{} destinations", dests.len()),
       };
-      let (first, per_dest_scope) = match record.dests.as_slice() {
-         [dest] => (&dest.connection, false),
-         [dest, ..] => (&dest.connection, true),
+      let Some(first) = record.first() else {
          // A prompt is never empty; answering nothing creates no rule either.
-         [] => {
-            warn!(
-               "prompt {} has no destination; discarding the decision",
-               record.id
-            );
-            return;
-         }
+         warn!(
+            "prompt {} has no destination; discarding the decision",
+            record.id
+         );
+         return;
       };
-      let app_kind = match &first.process {
+      let app_kind = match &first.connection.process {
          Attribution::Process(process) if process.exe.is_some() => "exe",
          Attribution::Unknown => "unknown",
          Attribution::Process(_) => "any",
       };
-      let rule_dest = if per_dest_scope {
-         format!("{} destinations", record.dests.len())
-      } else {
-         match &decide.scope {
-            ScopeChoice::AnyConnection => "any".to_owned(),
-            ScopeChoice::Domain {
-               host,
-               subdomains: true,
-            } => format!("{host} (+subdomains)"),
-            ScopeChoice::Domain { host, .. } => host.clone(),
-            ScopeChoice::Address => first.remote.addr.to_string(),
-         }
+      let rule_dest = match &decide.scope {
+         ScopeChoice::AnyConnection => "any".to_owned(),
+         ScopeChoice::Domain {
+            host,
+            subdomains: true,
+         } => format!("{host} (+subdomains)"),
+         ScopeChoice::Domain { host, .. } => host.clone(),
+         ScopeChoice::Address => first.connection.remote.addr.to_string(),
+         ScopeChoice::TheseDestinations => format!("{} destinations", record.dests.len()),
       };
-      let mechanism = match decide.duration {
+      let (mechanism, created, updated) = match decide.duration {
          RuleDuration::Once => {
             for dest in &record.dests {
                self.policy.grant(
@@ -983,37 +976,38 @@ impl Daemon {
                   now.saturating_add(crate::policy::GRANT_TTL_SECS),
                );
             }
-            format!("created a once flow grant for {app}")
+            (
+               format!("created a once flow grant for {app}"),
+               0, // a grant is not a rule
+               0,
+            )
          }
          RuleDuration::Session => {
-            let rules = rules_for(&record, &decide, now);
-            for rule in rules {
-               self.policy.upsert_rule(rule);
-            }
+            let (created, updated) = self.apply_rules(&record, &decide, now);
             self.publish_rules();
-            format!("created an in-memory {app_kind} rule for {app}")
+            (
+               format!("created an in-memory {app_kind} rule for {app}"),
+               created,
+               updated,
+            )
          }
          RuleDuration::Forever => {
-            let rules = rules_for(&record, &decide, now);
-            for rule in rules {
-               self.policy.upsert_rule(rule.clone());
-               if let Err(err) = self.store.upsert(rule) {
-                  error!("could not persist a forever rule: {err}");
-               }
-            }
+            let (created, updated) = self.apply_rules(&record, &decide, now);
             self.publish_rules();
-            format!("created and persisted a forever {app_kind} rule for {app}")
+            (
+               format!("created and persisted a forever {app_kind} rule for {app}"),
+               created,
+               updated,
+            )
          }
       };
-      let scope = match per_dest_scope {
-         true => format!(
-            "one rule per destination ({} listed)",
-            record.dests.len()
-         ),
-         false => scope_label(&decide.scope),
-      };
+      let scope = scope_label(&decide.scope);
       let line = decision_line(record.id, &app, &dest, &decide, &scope);
       info!("{line}");
+      info!(
+         "answer for prompt {}: {created} rules created, {updated} refreshed",
+         record.id
+      );
 
       let Some(resolved) = self.pending.resolve(record.id, Instant::now()) else {
          // A `None` here means the prompt was already settled; answering its packets twice
@@ -1055,6 +1049,33 @@ impl Daemon {
          self.announce_prompt(&next);
       }
       self.publish_status();
+   }
+
+   /// Applies the rules a prompt's answer implies, refreshing equivalents instead of
+   /// duplicating them, and persists each rule whose duration is `Forever`.
+   ///
+   /// Returns how many rules were created and how many already-present rules were
+   /// refreshed, so the decision log can say which happened.
+   fn apply_rules(
+      &mut self,
+      record: &PromptRecord,
+      decide: &DecideRequest,
+      now: u64,
+   ) -> (usize, usize) {
+      let mut created = 0;
+      let mut updated = 0;
+      for rule in rules_for(record, decide, now) {
+         let forever = rule.duration == RuleDuration::Forever;
+         let (rule, applied) = self.policy.apply(rule);
+         match applied {
+            Applied::Created => created += 1,
+            Applied::Refreshed => updated += 1,
+         }
+         if forever && let Err(err) = self.store.upsert(rule) {
+            error!("could not persist a forever rule: {err}");
+         }
+      }
+      (created, updated)
    }
 
    /// Answers the head and the queued prompts that the current policy already decides, so
@@ -1603,6 +1624,7 @@ fn scope_label(scope: &ScopeChoice) -> String {
          subdomains: true,
       } => format!("domain {host} (+subdomains)"),
       ScopeChoice::Address => "this address".to_owned(),
+      ScopeChoice::TheseDestinations => "these destinations".to_owned(),
    }
 }
 
@@ -1707,36 +1729,42 @@ fn would_block(err: &std::io::Error) -> bool {
    )
 }
 
-/// Builds the rules a prompt's answer creates: exactly one per destination listed.
+/// Builds the rules a prompt's answer creates.
 ///
-/// A group ignores `ScopeChoice` and scopes each rule to its own destination — the domain
-/// when the connection has one, the single address otherwise — because a click on a list of
-/// destinations grants those destinations, not the whole internet. A single-destination
-/// prompt is not a group in the user's eyes and keeps honouring the requested scope, so it
-/// behaves exactly like the prompt this feature replaces.
+/// The scope decides the rule, never the number of destinations the prompt happened to
+/// list: `AnyConnection` is one rule for the app whatever was on screen, `Domain` and
+/// `Address` are one rule at that scope, and `TheseDestinations` is one rule per listed
+/// destination, each scoped to itself. Only an explicit `TheseDestinations` may produce a
+/// per-destination answer, and only an explicit `AnyConnection` may produce
+/// `DestMatcher::Any`.
 fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rule> {
-   if let [dest] = record.dests.as_slice() {
-      return vec![rule_for(&dest.connection, decide, now)];
+   match &decide.scope {
+      ScopeChoice::TheseDestinations => record
+         .dests
+         .iter()
+         .map(|dest| {
+            let scope = group_scope(&dest.connection);
+            rule_for(
+               &dest.connection,
+               &DecideRequest {
+                  scope,
+                  ..decide.clone()
+               },
+               now,
+            )
+         })
+         .collect(),
+      // A group that sends `Domain` or `Address` is honoured as one rule: the client asked
+      // for it explicitly, and a single-destination prompt must keep its old shape.
+      _ => match record.first() {
+         Some(dest) => vec![rule_for(&dest.connection, decide, now)],
+         None => Vec::new(),
+      },
    }
-   record
-      .dests
-      .iter()
-      .map(|dest| {
-         let scope = group_scope(&dest.connection);
-         rule_for(
-            &dest.connection,
-            &DecideRequest {
-               scope,
-               ..decide.clone()
-            },
-            now,
-         )
-      })
-      .collect()
 }
 
-/// The scope a group rule uses for one destination: its learned domain when it has one,
-/// otherwise the one address it actually reached.
+/// The scope one destination of a `TheseDestinations` answer uses: its learned domain when
+/// it has one, otherwise the one address it actually reached.
 fn group_scope(connection: &Connection) -> ScopeChoice {
    match &connection.domain {
       Some(host) => ScopeChoice::Domain {
@@ -1756,7 +1784,17 @@ fn rule_for(connection: &Connection, decide: &DecideRequest, now: u64) -> Rule {
       },
       Attribution::Unknown => AppMatcher::Unknown,
    };
-   let dest = match &decide.scope {
+   let scope = ScopeRequest {
+      action: decide.action,
+      duration: decide.duration,
+      dest: dest_matcher(connection, &decide.scope),
+   };
+   rule_from_scope(RuleId::new_unique(), app, &scope, now)
+}
+
+/// The destination matcher a scope asks for, relative to `connection`.
+fn dest_matcher(connection: &Connection, scope: &ScopeChoice) -> DestMatcher {
+   match scope {
       ScopeChoice::AnyConnection => DestMatcher::Any,
       ScopeChoice::Domain { host, subdomains } => DestMatcher::Domain {
          host: host.to_ascii_lowercase(),
@@ -1775,13 +1813,10 @@ fn rule_for(connection: &Connection, decide: &DecideRequest, now: u64) -> Rule {
             DestMatcher::Any
          }
       },
-   };
-   let scope = ScopeRequest {
-      action: decide.action,
-      duration: decide.duration,
-      dest,
-   };
-   rule_from_scope(RuleId::new_unique(), app, &scope, now)
+      // `rules_for` expands this scope into one call per destination; a direct call scopes
+      // to the destination itself.
+      ScopeChoice::TheseDestinations => dest_matcher(connection, &group_scope(connection)),
+   }
 }
 
 /// The network containing exactly `addr`: prefix 32 for IPv4, 128 for IPv6.
@@ -2209,6 +2244,10 @@ mod tests {
          "domain i.ytimg.com (+subdomains)"
       );
       assert_eq!(scope_label(&ScopeChoice::Address), "this address");
+      assert_eq!(
+         scope_label(&ScopeChoice::TheseDestinations),
+         "these destinations"
+      );
       assert_eq!(
          scope_label(&ScopeChoice::Domain {
             host: "I.YTIMG.COM".to_owned(),
@@ -3496,30 +3535,81 @@ mod tests {
       assert_eq!(pending.len(), 2);
    }
 
-   /// A forever allow on a two-destination group yields exactly one rule per destination,
-   /// each scoped to its destination and attributed to the group's executable — never one
-   /// rule for anywhere.
-   #[test]
-   fn a_group_rule_is_one_per_destination() {
+   /// A six-destination group for one app, its first destination carrying a learned name.
+   fn six_destination_group() -> (u64, PromptRecord) {
       let start = Instant::now();
+      let timeout = Duration::from_secs(30);
       let mut pending = PendingPrompts::new();
       let mut first = app_conn("/usr/lib/firefox/firefox", "198.51.100.20", 443);
       first.domain = Some("api.github.com".to_owned());
-      let mut second = app_conn("/usr/lib/firefox/firefox", "198.51.100.21", 8443);
-      second.domain = None;
-      let id = pending.open(first, 10, Duration::from_secs(30), start).id();
-      pending.open(second, 20, Duration::from_secs(30), start);
+      let id = pending.open(first, 10, timeout, start).id();
+      for (index, remote) in [
+         "198.51.100.21",
+         "198.51.100.22",
+         "198.51.100.23",
+         "198.51.100.24",
+         "198.51.100.25",
+      ]
+      .into_iter()
+      .enumerate()
+      {
+         pending.open(
+            app_conn("/usr/lib/firefox/firefox", remote, 443),
+            11 + index as u32,
+            timeout,
+            start,
+         );
+      }
       let record = pending.resolve(id, start).expect("open").record;
+      (id, record)
+   }
 
+   /// `AnyConnection` on a group is the user asking for this app on any destination: exactly
+   /// one such rule, regardless of how many destinations the prompt listed.
+   #[test]
+   fn any_connection_on_a_group_is_one_rule() {
+      let (id, record) = six_destination_group();
       let decide = DecideRequest {
          prompt_id: id,
          action: Action::Allow,
          duration: RuleDuration::Forever,
          scope: ScopeChoice::AnyConnection,
       };
+
       let rules = rules_for(&record, &decide, 100);
 
-      assert_eq!(rules.len(), 2, "one rule per destination");
+      assert_eq!(
+         rules.len(),
+         1,
+         "a group must not multiply an any-scope answer"
+      );
+      assert_eq!(
+         rules[0].app,
+         AppMatcher::Exe(PathBuf::from("/usr/lib/firefox/firefox")),
+         "the rule is scoped to the group's executable"
+      );
+      assert_eq!(
+         rules[0].dest,
+         DestMatcher::Any,
+         "the user's any-connection scope is the rule's destination"
+      );
+   }
+
+   /// `TheseDestinations` is the old group behaviour made explicit: one rule per listed
+   /// destination, each scoped to itself, named destination to its own domain.
+   #[test]
+   fn these_destinations_on_a_group_is_one_rule_each() {
+      let (id, record) = six_destination_group();
+      let decide = DecideRequest {
+         prompt_id: id,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope: ScopeChoice::TheseDestinations,
+      };
+
+      let rules = rules_for(&record, &decide, 100);
+
+      assert_eq!(rules.len(), 6, "one rule per destination listed");
       assert!(
          rules
             .iter()
@@ -3528,7 +3618,7 @@ mod tests {
       );
       assert!(
          rules.iter().all(|rule| !matches!(rule.dest, DestMatcher::Any)),
-         "a group must never widen to anywhere"
+         "these-destinations must never widen to anywhere"
       );
       assert_eq!(
          rules[0].dest,
@@ -3536,69 +3626,177 @@ mod tests {
             host: "api.github.com".to_owned(),
             subdomains: false,
          },
-         "a named destination is scoped to its domain"
+         "a named destination is scoped to its own domain"
       );
-      assert!(
-         matches!(&rules[1].dest, DestMatcher::Ip(net) if net.contains("198.51.100.21".parse().expect("addr"))),
-         "an unnamed destination is scoped to its one address, got {:?}",
-         rules[1].dest
-      );
-      assert!(
-         rules
-            .iter()
-            .all(|rule| rule.action == Action::Allow && rule.duration == RuleDuration::Forever),
-         "the requested action and duration are kept"
-      );
+      for (rule, dest) in rules[1..].iter().zip(record.dests[1..].iter()) {
+         let DestMatcher::Ip(net) = &rule.dest else {
+            panic!(
+               "an unnamed destination must be scoped to its own address, got {:?}",
+               rule.dest
+            );
+         };
+         assert!(
+            net.contains(dest.connection.remote.addr),
+            "{net:?} must cover its own destination {}",
+            dest.connection.remote.addr
+         );
+         assert_eq!(
+            dest.connection.remote.addr, net.addr,
+            "the rule covers exactly its destination, not a wider network"
+         );
+      }
    }
 
-   /// A single destination is not a group: the requested scope is honoured exactly, so the
-   /// prompt behaves byte-for-byte like the one this feature replaces.
+   /// One destination keeps the exact shape it had before this branch, for every scope.
    #[test]
-   fn a_single_destination_prompt_still_honours_its_scope() {
+   fn a_single_destination_still_honours_every_scope() {
       let start = Instant::now();
       let mut connection = app_conn("/usr/lib/firefox/firefox", "198.51.100.20", 443);
       connection.domain = Some("api.github.com".to_owned());
       let mut pending = PendingPrompts::new();
       let id = pending.open(connection, 10, Duration::from_secs(30), start).id();
       let record = pending.resolve(id, start).expect("open").record;
+      let decide = |scope| DecideRequest {
+         prompt_id: id,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope,
+      };
 
-      let any = DecideRequest {
+      for (scope, expected) in [
+         (ScopeChoice::AnyConnection, DestMatcher::Any),
+         (
+            ScopeChoice::Domain {
+               host: "example.com".to_owned(),
+               subdomains: true,
+            },
+            DestMatcher::Domain {
+               host: "example.com".to_owned(),
+               subdomains: true,
+            },
+         ),
+         (
+            ScopeChoice::Address,
+            DestMatcher::Ip("198.51.100.20/32".parse().expect("the destination's own address")),
+         ),
+         (
+            ScopeChoice::TheseDestinations,
+            DestMatcher::Domain {
+               host: "api.github.com".to_owned(),
+               subdomains: false,
+            },
+         ),
+      ] {
+         let rules = rules_for(&record, &decide(scope.clone()), 100);
+         assert_eq!(
+            rules.len(),
+            1,
+            "scope {scope:?} is one rule for one destination"
+         );
+         assert_eq!(rules[0].dest, expected, "scope {scope:?}");
+         assert_eq!(
+            rules[0].app,
+            AppMatcher::Exe(PathBuf::from("/usr/lib/firefox/firefox"))
+         );
+      }
+   }
+
+   /// Answering the same group with the same scope twice refreshes the one rule instead of
+   /// adding a second, and the second answer reports an update.
+   #[test]
+   fn an_identical_rule_is_refreshed_not_duplicated() {
+      let (id, record) = six_destination_group();
+      let decide = DecideRequest {
          prompt_id: id,
          action: Action::Allow,
          duration: RuleDuration::Forever,
          scope: ScopeChoice::AnyConnection,
       };
-      assert_eq!(
-         rules_for(&record, &any, 100)[0].dest,
-         DestMatcher::Any,
-         "the broad scope is still offered for one destination"
-      );
+      let mut policy = prompting_policy();
 
-      let domain = DecideRequest {
-         scope: ScopeChoice::Domain {
-            host: "example.com".to_owned(),
-            subdomains: true,
-         },
-         ..any.clone()
-      };
-      assert_eq!(
-         rules_for(&record, &domain, 100)[0].dest,
-         DestMatcher::Domain {
-            host: "example.com".to_owned(),
-            subdomains: true,
-         }
-      );
+      let first = rules_for(&record, &decide, 100);
+      assert_eq!(first.len(), 1);
+      assert_eq!(policy.apply(first[0].clone()).1, Applied::Created);
 
-      let address = DecideRequest {
-         scope: ScopeChoice::Address,
-         ..any
+      let second = rules_for(&record, &decide, 200);
+      let (stored, applied) = policy.apply(second[0].clone());
+
+      assert_eq!(
+         applied,
+         Applied::Refreshed,
+         "the second answer is an update"
+      );
+      assert_eq!(
+         policy.ruleset().len(),
+         1,
+         "no second rule is added"
+      );
+      assert_eq!(
+         stored.id, first[0].id,
+         "the incumbent keeps its id"
+      );
+      assert_eq!(stored.created_at, 100);
+      assert_eq!(
+         stored.updated_at, 200,
+         "the refresh stamps the rule"
+      );
+   }
+
+   /// A disabled equivalent is re-enabled by the next answer rather than shadowed by a new
+   /// rule the user would have to find and toggle.
+   #[test]
+   fn a_disabled_identical_rule_is_re_enabled() {
+      let (id, record) = six_destination_group();
+      let decide = DecideRequest {
+         prompt_id: id,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope: ScopeChoice::AnyConnection,
       };
+      let mut policy = prompting_policy();
+      let mut disabled = rules_for(&record, &decide, 100).remove(0);
+      disabled.enabled = false;
+      policy.upsert_rule(disabled);
+
+      let (stored, applied) = policy.apply(rules_for(&record, &decide, 200).remove(0));
+
+      assert_eq!(applied, Applied::Refreshed);
+      assert_eq!(policy.ruleset().len(), 1);
       assert!(
-         matches!(
-            &rules_for(&record, &address, 100)[0].dest,
-            DestMatcher::Ip(net) if net.contains("198.51.100.20".parse().expect("addr"))
-         ),
-         "the address scope still scopes to this connection's address"
+         stored.enabled,
+         "the refreshed rule is enabled again"
+      );
+      assert_eq!(stored.updated_at, 200);
+   }
+
+   /// The same app answered for another address is a different destination, not a
+   /// duplicate: the rule list must grow.
+   #[test]
+   fn a_different_destination_is_a_new_rule() {
+      let decide = || DecideRequest {
+         prompt_id: 1,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope: ScopeChoice::Address,
+      };
+      let mut policy = prompting_policy();
+      let first = rule_for(
+         &app_conn("/usr/lib/firefox/firefox", "198.51.100.20", 443),
+         &decide(),
+         100,
+      );
+      let second = rule_for(
+         &app_conn("/usr/lib/firefox/firefox", "198.51.100.21", 443),
+         &decide(),
+         200,
+      );
+
+      assert_eq!(policy.apply(first).1, Applied::Created);
+      assert_eq!(policy.apply(second).1, Applied::Created);
+      assert_eq!(
+         policy.ruleset().len(),
+         2,
+         "another address is another rule"
       );
    }
 
