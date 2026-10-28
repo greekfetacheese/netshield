@@ -2108,8 +2108,8 @@ mod tests {
    }
 
    #[test]
-   fn a_single_connection_reads_as_a_word() {
-      assert_eq!(count_label(1), "1 connection");
+   fn a_count_reads_as_a_bare_number() {
+      assert_eq!(count_label(1), "1");
       assert_eq!(count_label(12), "12");
    }
 
