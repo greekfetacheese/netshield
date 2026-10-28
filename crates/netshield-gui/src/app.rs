@@ -391,17 +391,41 @@ impl App {
       self.connected = connected;
    }
 
-   /// Queues one prompt, ignoring an id that is already queued.
+   /// Queues one prompt, replacing an earlier copy of the same id.
    ///
    /// The prompt is also presented to the alert model, which starts its countdown. The
    /// daemon only activates one prompt at a time, so a later one replaces the active alert.
    /// [`with_destinations`] fills the destination list before the prompt is stored, so the
    /// whole group the answer covers survives in the queue as well as in the alert.
+   ///
+   /// The daemon re-broadcasts the same id as destinations join its group, and the newer
+   /// copy is the truth: it replaces the pending entry in place, keeping its queue position
+   /// and the user's selection, but only when it names strictly more destinations, because
+   /// a reordered or duplicated broadcast must not shrink the list. The displayed prompt
+   /// earns a repaint; it must not raise or focus the window again.
    fn enqueue_prompt(&mut self, prompt: PromptRequest) {
-      if self.pending.iter().any(|queued| queued.id == prompt.id) {
+      let prompt = with_destinations(prompt);
+      if let Some(index) = self.pending.iter().position(|queued| queued.id == prompt.id) {
+         if prompt.dests.len() <= self.pending[index].dests.len() {
+            return;
+         }
+         log::info!(
+            "prompt {} grew to {} destinations",
+            prompt.id,
+            prompt.dests.len()
+         );
+         if self.model().prompt().map(|open| open.id) == Some(prompt.id) {
+            // Same id, so the selection and the raise guard are kept: the window is
+            // already up, and only its contents changed. The repaint is what makes the
+            // new destinations and labels visible before the next scheduled frame.
+            self.model().replace_prompt(prompt.clone());
+            if let Some(ctx) = self.ui_waker.lock().ok().and_then(|slot| slot.clone()) {
+               ctx.request_repaint();
+            }
+         }
+         self.pending[index] = prompt;
          return;
       }
-      let prompt = with_destinations(prompt);
       log::info!(
          "prompt {} presented for {}",
          prompt.id,
@@ -1011,6 +1035,87 @@ mod tests {
       assert_eq!(app.pending.len(), 1);
       assert_eq!(app.alerts.len(), 1);
       assert_eq!(app.prompt_deadlines.len(), 1);
+   }
+
+   /// A prompt with `count` destinations, all of the same connection.
+   fn group(id: u64, count: usize) -> PromptRequest {
+      let mut request = prompt(id);
+      request.dests = vec![destination("accounts.google.com"); count];
+      request
+   }
+
+   /// The daemon re-broadcasts a prompt as destinations join its group; the newer copy is
+   /// the truth and must replace the earlier one in place, including in the alert.
+   #[test]
+   fn a_prompt_that_grows_replaces_its_earlier_copy() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 1));
+      app.enqueue_prompt(group(7, 6));
+
+      assert_eq!(
+         app.pending.len(),
+         1,
+         "the growth is not a second prompt"
+      );
+      assert_eq!(
+         app.pending[0].id, 7,
+         "and it keeps its queue position"
+      );
+      assert_eq!(
+         app.pending[0].dests.len(),
+         6,
+         "the queue shows every destination of the grown group"
+      );
+      assert_eq!(
+         app.model().prompt().map(|open| open.dests.len()),
+         Some(6),
+         "the alert the window paints is the newer copy"
+      );
+      assert_eq!(
+         app.prompt_deadlines.len(),
+         1,
+         "the deadline bookkeeping is not duplicated"
+      );
+      assert_eq!(app.alerts.len(), 1);
+   }
+
+   /// A reordered or duplicated broadcast must not shrink a group the user is answering.
+   #[test]
+   fn a_repeat_that_would_shrink_is_ignored() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 6));
+      app.enqueue_prompt(group(7, 1));
+
+      assert_eq!(app.pending.len(), 1);
+      assert_eq!(
+         app.pending[0].dests.len(),
+         6,
+         "the six-destination list survives a shorter repeat"
+      );
+      assert_eq!(
+         app.model().prompt().map(|open| open.dests.len()),
+         Some(6)
+      );
+   }
+
+   #[test]
+   fn a_new_prompt_still_appends() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 1));
+      app.enqueue_prompt(group(8, 1));
+
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 7);
+      assert_eq!(app.pending[1].id, 8);
+
+      // A growth of the older prompt lands where that prompt already was: the queue the
+      // user sees does not reorder, and the newest prompt stays the active one.
+      app.enqueue_prompt(group(7, 6));
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 7);
+      assert_eq!(app.pending[0].dests.len(), 6);
+      assert_eq!(app.pending[1].id, 8);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(8));
    }
 
    #[test]

@@ -231,6 +231,18 @@ impl AlertModel {
       self.prompt = Some(prompt);
    }
 
+   /// Replaces the active prompt's payload with a newer copy of the same id.
+   ///
+   /// The daemon re-broadcasts a prompt as destinations join its group, so only the
+   /// destination list changed. The selection and the countdown belong to the answer the
+   /// user is composing and must survive the update; a different id is ignored because
+   /// presenting and closing are the paths for a new prompt.
+   pub fn replace_prompt(&mut self, prompt: PromptRequest) {
+      if self.prompt.as_ref().is_some_and(|open| open.id == prompt.id) {
+         self.prompt = Some(prompt);
+      }
+   }
+
    /// The active prompt, if any.
    pub fn prompt(&self) -> Option<&PromptRequest> {
       self.prompt.as_ref()
@@ -1431,6 +1443,57 @@ mod tests {
       assert_eq!(model.state_mut().duration, Duration::Session);
       assert_eq!(model.state_mut().scope, Scope::Any);
       assert_eq!(model.remaining_secs(start), Some(10.0));
+   }
+
+   /// The daemon re-broadcasts a prompt as destinations join its group: the newer payload
+   /// must reach the panel while the user's selection and countdown stay put.
+   #[test]
+   fn replacing_a_prompt_keeps_the_selection_and_shows_the_grown_group() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      let single = prompt(Some("accounts.google.com"), true);
+      assert_eq!(allow_label(&single), "Allow");
+      model.present(single, std::time::Duration::from_secs(30), now);
+      model.state_mut().duration = Duration::Forever;
+
+      model.replace_prompt(group_of_six());
+
+      let presented = model.prompt().cloned().expect("the alert still has its prompt");
+      assert_eq!(presented.dests.len(), 6);
+      assert_eq!(
+         model.state_mut().duration,
+         Duration::Forever,
+         "a growth must not reset what the user picked"
+      );
+      assert_eq!(
+         model.remaining_secs(now),
+         Some(30.0),
+         "a growth must not restart the countdown"
+      );
+      assert_eq!(allow_label(&presented), "Allow 6 destinations");
+      assert_eq!(
+         rule_preview(&presented, model.state_mut(), Action::Allow),
+         "allow brave → these 6 destinations · forever"
+      );
+   }
+
+   /// A payload for another id belongs to `present` and `clear`, never to a replacement.
+   #[test]
+   fn replacing_a_prompt_ignores_a_different_id() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      let single = prompt(Some("accounts.google.com"), true);
+      model.present(
+         single.clone(),
+         std::time::Duration::from_secs(30),
+         now,
+      );
+
+      let mut next = group_of_six();
+      next.id = 8;
+      model.replace_prompt(next);
+
+      assert_eq!(model.prompt(), Some(&single));
    }
 
    #[test]
