@@ -26,11 +26,13 @@ const HEADER_HEIGHT: f32 = 18.0;
 /// Whitespace between two columns.
 const COLUMN_GAP: f32 = 12.0;
 
-/// How far a connection line is indented past the list's left edge.
+/// How far a connection line is indented past the list's left edge: the child row's text
+/// starts here, past the chevron gutter.
 const INDENT: f32 = 18.0;
 
-/// Where a group's name starts, past the painted chevron.
-const GROUP_NAME_X: f32 = 22.0;
+/// Where a group's name starts, past the painted chevron: four pixels right of [`INDENT`],
+/// so the parent's name sits just above the child text it owns.
+const GROUP_NAME_X: f32 = INDENT + 4.0;
 
 /// Width of the chevron's click target at the start of a group line.
 const CHEVRON_HIT: f32 = 22.0;
@@ -74,16 +76,43 @@ const DASH: &str = "—";
 /// The sentence the pane uses when no rule decided a denied connection.
 const PROMPT_RULE: &str = "no rule — decided by the prompt";
 
-/// Which applications are collapsed. Keyed by the row's `app` label.
+/// Which applications are expanded. Keyed by the row's `app` label.
+///
+/// The set holds the *open* apps, so a never-seen app is collapsed: the page starts with
+/// every group folded and opens only what the user clicked.
 #[derive(Default)]
-pub struct Collapsed(HashSet<String>);
+pub struct Expanded(HashSet<String>);
 
-impl Collapsed {
-   /// Flips one application between collapsed and open.
+impl Expanded {
+   /// Flips one application between open and collapsed.
    fn toggle(&mut self, app: &str) {
       if !self.0.remove(app) {
          self.0.insert(app.to_owned());
       }
+   }
+
+   /// Whether the application is open, i.e. its connections are drawn.
+   fn contains(&self, app: &str) -> bool {
+      self.0.contains(app)
+   }
+}
+
+/// Which applications are showing every connection rather than the first [`MAX_CHILDREN`].
+///
+/// Kept beside [`Expanded`]: a group only draws its children while open, and this set only
+/// widens the cap for the ones the user clicked through.
+#[derive(Default)]
+pub struct ShowingAll(HashSet<String>);
+
+impl ShowingAll {
+   /// Opens one application's full history past the child cap.
+   fn insert(&mut self, app: &str) {
+      self.0.insert(app.to_owned());
+   }
+
+   /// Forgets that one application was showing all, so it falls back to the child cap.
+   fn remove(&mut self, app: &str) {
+      self.0.remove(app);
    }
 
    fn contains(&self, app: &str) -> bool {
@@ -91,7 +120,7 @@ impl Collapsed {
    }
 }
 
-/// What the detail pane shows. Owned by `App` beside [`Collapsed`] and [`LinesCache`].
+/// What the detail pane shows. Owned by `App` beside [`Expanded`] and [`LinesCache`].
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
    #[default]
@@ -103,28 +132,37 @@ pub enum Selection {
    },
 }
 
-/// Cached derived lines, rebuilt only when the log, the rules or the collapse set change.
+/// Cached derived lines, rebuilt only when the log, the rules or the group state changes.
 #[derive(Default)]
 pub struct LinesCache {
    version: u64,
    rule_count: usize,
-   collapsed: HashSet<String>,
+   expanded: HashSet<String>,
+   showing_all: HashSet<String>,
    lines: Vec<Line>,
 }
 
 impl LinesCache {
    /// Rebuilds the lines when any input moved; an unchanged frame reuses the old vector.
-   fn refresh(&mut self, log: &ConnectionLog, rules: &[Rule], collapsed: &Collapsed) {
+   fn refresh(
+      &mut self,
+      log: &ConnectionLog,
+      rules: &[Rule],
+      expanded: &Expanded,
+      showing_all: &ShowingAll,
+   ) {
       let unchanged = self.version == log.version()
          && self.rule_count == rules.len()
-         && self.collapsed == collapsed.0;
+         && self.expanded == expanded.0
+         && self.showing_all == showing_all.0;
       if unchanged {
          return;
       }
-      self.lines = build_lines(log, rules, collapsed);
+      self.lines = build_lines(log, rules, expanded, showing_all);
       self.version = log.version();
       self.rule_count = rules.len();
-      self.collapsed = collapsed.0.clone();
+      self.expanded = expanded.0.clone();
+      self.showing_all = showing_all.0.clone();
    }
 }
 
@@ -171,11 +209,12 @@ pub fn show(
    ui: &mut Ui,
    log: &ConnectionLog,
    rules: &[Rule],
-   collapsed: &mut Collapsed,
+   expanded: &mut Expanded,
+   showing_all: &mut ShowingAll,
    cache: &mut LinesCache,
    selection: &mut Selection,
 ) {
-   cache.refresh(log, rules, collapsed);
+   cache.refresh(log, rules, expanded, showing_all);
 
    let apps = cache.lines.iter().filter(|line| matches!(line, Line::Group { .. })).count();
    heading(ui, log, apps);
@@ -207,18 +246,23 @@ pub fn show(
       |ui, range| {
          for index in range {
             let line = &cache.lines[index];
-            let sense = match line {
-               Line::More { .. } => Sense::hover(),
-               _ => Sense::click(),
-            };
-            let (rect, response) =
-               ui.allocate_exact_size(vec2(ui.available_width(), LINE_HEIGHT), sense);
+            let (rect, response) = ui.allocate_exact_size(
+               vec2(ui.available_width(), LINE_HEIGHT),
+               Sense::click(),
+            );
             match line {
                Line::Group { app, .. } => {
                   if response.clicked()
                      && let Some(pointer) = response.interact_pointer_pos()
                   {
-                     click_group(app, rect, pointer, collapsed, selection);
+                     click_group(
+                        app,
+                        rect,
+                        pointer,
+                        expanded,
+                        showing_all,
+                        selection,
+                     );
                      // The cache still holds the pre-click lines; one more frame turns the
                      // toggle into the rows it opens or hides.
                      ui.ctx().request_repaint();
@@ -228,7 +272,7 @@ pub fn show(
                      &response,
                      &columns,
                      line,
-                     collapsed.contains(app),
+                     expanded.contains(app),
                      *selection == Selection::App(app.clone()),
                      now,
                   );
@@ -247,7 +291,15 @@ pub fn show(
                   );
                   conn_row(ui, rect, &columns, conn, selected, now);
                }
-               Line::More { remaining } => more_row(ui, rect, &columns, *remaining),
+               Line::More { remaining } => {
+                  if response.clicked()
+                     && let Some(more) = more_app(&cache.lines, index)
+                  {
+                     showing_all.insert(more);
+                     ui.ctx().request_repaint();
+                  }
+                  more_row(ui, response, &columns, *remaining);
+               }
             }
          }
       },
@@ -333,8 +385,8 @@ fn header_row(ui: &mut Ui, columns: &Columns) {
    let font = FontId::proportional(11.0);
    let color = ui.visuals().weak_text_color();
    cells.text(
-      0.0,
-      columns.connection,
+      GROUP_NAME_X,
+      (columns.connection - GROUP_NAME_X).max(0.0),
       "Connection",
       &font,
       color,
@@ -360,7 +412,7 @@ fn group_row(
    response: &Response,
    columns: &Columns,
    line: &Line,
-   collapsed: bool,
+   expanded: bool,
    selected: bool,
    now: u64,
 ) {
@@ -394,17 +446,17 @@ fn group_row(
    // The disclosure triangle is painted, not glyph-rendered: the bundled font is not
    // guaranteed to carry a chevron.
    let tip = pos2(rect.left() + 11.0, center_y);
-   let points = if collapsed {
-      vec![
-         pos2(tip.x - 3.0, tip.y - 4.5),
-         pos2(tip.x - 3.0, tip.y + 4.5),
-         pos2(tip.x + 3.0, tip.y),
-      ]
-   } else {
+   let points = if expanded {
       vec![
          pos2(tip.x - 4.5, tip.y - 3.0),
          pos2(tip.x + 4.5, tip.y - 3.0),
          pos2(tip.x, tip.y + 3.0),
+      ]
+   } else {
+      vec![
+         pos2(tip.x - 3.0, tip.y - 4.5),
+         pos2(tip.x - 3.0, tip.y + 4.5),
+         pos2(tip.x + 3.0, tip.y),
       ]
    };
    painter.add(Shape::convex_polygon(points, weak, Stroke::NONE));
@@ -522,8 +574,15 @@ fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: b
    activity_pill(painter, columns, rect, conn.at, now, visuals);
 }
 
-/// The `N more…` line: weak and indented like the connection lines it stands in for.
-fn more_row(ui: &mut Ui, rect: Rect, columns: &Columns, remaining: usize) {
+/// The `N more…` line: weak and indented like the connection lines it stands in for. Like a
+/// row it highlights under the pointer, and a click opens the rest of the group.
+fn more_row(ui: &mut Ui, response: Response, columns: &Columns, remaining: usize) {
+   let rect = response.rect;
+   if response.hovered() {
+      let fill = ui.visuals().widgets.hovered.weak_bg_fill;
+      ui.painter().rect_filled(rect, 0.0, fill);
+   }
+   response.on_hover_cursor(egui::CursorIcon::PointingHand);
    let cells = Cells {
       painter: ui.painter(),
       rect,
@@ -538,6 +597,29 @@ fn more_row(ui: &mut Ui, rect: Rect, columns: &Columns, remaining: usize) {
    );
 }
 
+/// The app whose `N more…` row is at `index`: the nearest group above it, since the list is
+/// flattened group-first.
+fn more_app(lines: &[Line], index: usize) -> Option<&str> {
+   lines[..index].iter().rev().find_map(|line| match line {
+      Line::Group { app, .. } => Some(app.as_str()),
+      _ => None,
+   })
+}
+
+/// The Activity pill's rectangle for one row.
+///
+/// `columns` holds row-relative offsets, so the pill's centre is measured from `row.left()`;
+/// using the raw offset would paint it at absolute screen x and land it over the Rule column.
+fn pill_rect(row: Rect, columns: &Columns) -> Rect {
+   Rect::from_center_size(
+      pos2(
+         row.left() + columns.activity_x + ACTIVITY_WIDTH / 2.0,
+         row.center().y,
+      ),
+      vec2(ACTIVITY_WIDTH, ACTIVITY_HEIGHT),
+   )
+}
+
 /// A right-aligned relative-time pill in the Activity column.
 fn activity_pill(
    painter: &egui::Painter,
@@ -549,13 +631,7 @@ fn activity_pill(
 ) {
    let label = relative(at, now);
    let fresh = label == "now";
-   let pill = Rect::from_center_size(
-      pos2(
-         columns.activity_x + ACTIVITY_WIDTH / 2.0,
-         rect.center().y,
-      ),
-      vec2(ACTIVITY_WIDTH, ACTIVITY_HEIGHT),
-   );
+   let pill = pill_rect(rect, columns);
    let (fill, ink) = if fresh {
       (ALLOWED, NOW_INK)
    } else {
@@ -594,11 +670,15 @@ fn unix_now() -> u64 {
 
 /// Applies a click on a group line: the chevron toggles the group, the rest selects the
 /// application. They are deliberately separate, as in the reference.
+///
+/// Collapsing also forgets the `showing all` entry, so reopening the group starts from
+/// [`MAX_CHILDREN`] again rather than jumping straight to the full history.
 fn click_group(
    app: &str,
    rect: Rect,
    pointer: egui::Pos2,
-   collapsed: &mut Collapsed,
+   expanded: &mut Expanded,
+   showing_all: &mut ShowingAll,
    selection: &mut Selection,
 ) {
    let chevron = Rect::from_min_max(
@@ -606,7 +686,10 @@ fn click_group(
       pos2(rect.left() + CHEVRON_HIT, rect.bottom()),
    );
    if chevron.contains(pointer) {
-      collapsed.toggle(app);
+      expanded.toggle(app);
+      if !expanded.contains(app) {
+         showing_all.remove(app);
+      }
    } else {
       *selection = Selection::App(app.to_owned());
    }
@@ -733,7 +816,15 @@ fn detail_pane(ui: &mut Ui, lines: &[Line], selection: &mut Selection) {
 /// The log is scanned newest-first, so each group collects its rows in that order. Groups
 /// are then sorted on their newest event rather than on arrival alone: `at` is what the
 /// page promises to order by, and a burst can reach the log slightly out of order.
-fn build_lines(log: &ConnectionLog, rules: &[Rule], collapsed: &Collapsed) -> Vec<Line> {
+///
+/// Only apps in `expanded` emit children; a group showing all skips the [`MAX_CHILDREN`]
+/// cap and therefore has no `More` row.
+fn build_lines(
+   log: &ConnectionLog,
+   rules: &[Rule],
+   expanded: &Expanded,
+   showing_all: &ShowingAll,
+) -> Vec<Line> {
    #[cfg(test)]
    tests::bump_builds();
 
@@ -764,15 +855,20 @@ fn build_lines(log: &ConnectionLog, rules: &[Rule], collapsed: &Collapsed) -> Ve
          denied: rows.iter().any(|row| !row.allowed),
          exe: newest.and_then(|row| row.exe.clone()),
       });
-      if collapsed.contains(app) {
+      if !expanded.contains(app) {
          continue;
       }
-      for row in rows.iter().take(MAX_CHILDREN) {
+      let shown = if showing_all.contains(app) {
+         rows.len()
+      } else {
+         MAX_CHILDREN.min(rows.len())
+      };
+      for row in rows.iter().take(shown) {
          lines.push(Line::Conn(conn(row, rules)));
       }
-      if rows.len() > MAX_CHILDREN {
+      if rows.len() > shown {
          lines.push(Line::More {
-            remaining: rows.len() - MAX_CHILDREN,
+            remaining: rows.len() - shown,
          });
       }
    }
@@ -900,6 +996,64 @@ mod tests {
       BUILDS.with(Cell::get)
    }
 
+   /// The expansion set for the named apps, i.e. the ones whose children should be drawn.
+   fn expanded_set(apps: &[&str]) -> Expanded {
+      let mut expanded = Expanded::default();
+      for app in apps {
+         expanded.toggle(app);
+      }
+      expanded
+   }
+
+   /// The `showing all` set for the named apps.
+   fn showing_all_set(apps: &[&str]) -> ShowingAll {
+      let mut showing_all = ShowingAll::default();
+      for app in apps {
+         showing_all.insert(app);
+      }
+      showing_all
+   }
+
+   #[test]
+   fn the_activity_pill_sits_in_the_activity_column() {
+      let columns = Columns::new(900.0);
+      let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
+
+      let pill = pill_rect(row, &columns);
+
+      // The offsets are row-relative: measure the pill from the row's left edge, not from
+      // the screen's. This is the assertion the pre-fix code failed.
+      assert!(
+         (pill.left() - (row.left() + columns.activity_x)).abs() < 0.01,
+         "the pill starts at the Activity column: {pill:?}"
+      );
+      assert!(
+         (pill.right() - (row.right() - ROW_PAD)).abs() < 0.01,
+         "the pill ends at the row's right padding: {pill:?}"
+      );
+      assert!(
+         pill.left() >= row.left() && pill.right() <= row.right(),
+         "the pill stays inside the row"
+      );
+      assert!(
+         pill.top() >= row.top() && pill.bottom() <= row.bottom(),
+         "the pill stays inside the row vertically"
+      );
+   }
+
+   #[test]
+   fn a_never_seen_app_is_collapsed() {
+      let lines = build_lines(
+         &log(&[(10, "firefox", "a.example")]),
+         &[],
+         &Expanded::default(),
+         &ShowingAll::default(),
+      );
+
+      assert_eq!(lines.len(), 1, "only the group line is emitted");
+      assert!(matches!(lines[0], Line::Group { .. }));
+   }
+
    #[test]
    fn groups_are_ordered_by_their_newest_connection() {
       let log = log(&[
@@ -908,7 +1062,12 @@ mod tests {
          (30, "firefox", "c.example"),
       ]);
 
-      let lines = build_lines(&log, &[], &Collapsed::default());
+      let lines = build_lines(
+         &log,
+         &[],
+         &expanded_set(&["firefox", "curl"]),
+         &ShowingAll::default(),
+      );
 
       assert_eq!(group(&lines, 0), ("firefox", 2, 30));
       assert_eq!(conn(&lines, 1).dest, "c.example");
@@ -918,14 +1077,14 @@ mod tests {
    }
 
    #[test]
-   fn a_collapsed_app_hides_its_connections_until_expanded() {
+   fn an_expanded_app_shows_its_connections_until_collapsed() {
       let log = log(&[(20, "firefox", "a.example"), (10, "curl", "b.example")]);
-      let mut collapsed = Collapsed::default();
-      let open = build_lines(&log, &[], &collapsed);
+      let mut expanded = expanded_set(&["firefox", "curl"]);
+      let open = build_lines(&log, &[], &expanded, &ShowingAll::default());
       assert_eq!(open.len(), 4);
 
-      collapsed.toggle("firefox");
-      let shut = build_lines(&log, &[], &collapsed);
+      expanded.toggle("firefox");
+      let shut = build_lines(&log, &[], &expanded, &ShowingAll::default());
       assert_eq!(shut.len(), 3);
       assert_eq!(group(&shut, 0), ("firefox", 1, 20));
       assert_eq!(group(&shut, 1), ("curl", 1, 10));
@@ -934,8 +1093,8 @@ mod tests {
          "curl's own row follows"
       );
 
-      collapsed.toggle("firefox");
-      let reopened = build_lines(&log, &[], &collapsed);
+      expanded.toggle("firefox");
+      let reopened = build_lines(&log, &[], &expanded, &ShowingAll::default());
       assert_eq!(reopened.len(), open.len());
       assert_eq!(conn(&reopened, 1).dest, "a.example");
    }
@@ -972,7 +1131,12 @@ mod tests {
       history.push(&older);
       history.push(&newer);
 
-      let lines = build_lines(&history, &rules, &Collapsed::default());
+      let lines = build_lines(
+         &history,
+         &rules,
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
       let Line::Group { rule, denied, .. } = &lines[0] else {
          panic!("expected a group first");
       };
@@ -988,7 +1152,8 @@ mod tests {
       let clean = build_lines(
          &log(&[(30, "curl", "b.example")]),
          &rules,
-         &Collapsed::default(),
+         &expanded_set(&["curl"]),
+         &ShowingAll::default(),
       );
       let Line::Group { denied, .. } = &clean[0] else {
          panic!("expected a group first");
@@ -1002,7 +1167,12 @@ mod tests {
    #[test]
    fn a_group_shows_eight_connections_then_the_remainder() {
       let eight: Vec<(u64, &str, &str)> = (0..8).map(|at| (at, "firefox", "a.example")).collect();
-      let lines = build_lines(&log(&eight), &[], &Collapsed::default());
+      let lines = build_lines(
+         &log(&eight),
+         &[],
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
       assert_eq!(
          lines.len(),
          9,
@@ -1011,7 +1181,12 @@ mod tests {
       assert!(matches!(lines[8], Line::Conn(_)));
 
       let nine: Vec<(u64, &str, &str)> = (0..9).map(|at| (at, "firefox", "a.example")).collect();
-      let lines = build_lines(&log(&nine), &[], &Collapsed::default());
+      let lines = build_lines(
+         &log(&nine),
+         &[],
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
       assert_eq!(
          lines.len(),
          10,
@@ -1020,7 +1195,12 @@ mod tests {
       assert!(matches!(lines[9], Line::More { remaining: 1 }));
 
       let ten: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
-      let lines = build_lines(&log(&ten), &[], &Collapsed::default());
+      let lines = build_lines(
+         &log(&ten),
+         &[],
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
       assert!(
          matches!(lines[9], Line::More { remaining: 2 }),
          "the remainder is the count past the cap"
@@ -1028,21 +1208,78 @@ mod tests {
    }
 
    #[test]
+   fn eleven_connections_are_capped_with_an_exact_remainder() {
+      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(
+         &log(&events),
+         &[],
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
+
+      // The group, `MAX_CHILDREN` connections, then one `More` line with the leftover.
+      assert_eq!(lines.len(), 1 + MAX_CHILDREN + 1);
+      assert!(matches!(lines[0], Line::Group { .. }));
+      for (offset, line) in lines[1..=MAX_CHILDREN].iter().enumerate() {
+         assert!(
+            matches!(line, Line::Conn(_)),
+            "child {offset} is a connection line"
+         );
+      }
+      assert_eq!(
+         lines[MAX_CHILDREN + 1],
+         Line::More { remaining: 3 }
+      );
+      assert_eq!(
+         more_app(&lines, MAX_CHILDREN + 1),
+         Some("firefox"),
+         "the More row resolves to the group above it"
+      );
+   }
+
+   #[test]
+   fn showing_all_reveals_every_connection_and_no_more_line() {
+      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(
+         &log(&events),
+         &[],
+         &expanded_set(&["firefox"]),
+         &showing_all_set(&["firefox"]),
+      );
+
+      assert_eq!(
+         lines.len(),
+         12,
+         "the group plus all eleven connections"
+      );
+      assert!(
+         !lines.iter().any(|line| matches!(line, Line::More { .. })),
+         "a group showing all has no overflow row"
+      );
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         11
+      );
+   }
+
+   #[test]
    fn clicking_a_group_selects_it_and_only_the_chevron_collapses() {
       let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
-      let mut collapsed = Collapsed::default();
+      let mut expanded = Expanded::default();
+      let mut showing_all = ShowingAll::default();
       let mut selection = Selection::default();
 
       click_group(
          "firefox",
          rect,
          pos2(120.0, 12.0),
-         &mut collapsed,
+         &mut expanded,
+         &mut showing_all,
          &mut selection,
       );
       assert_eq!(selection, Selection::App("firefox".to_owned()));
       assert!(
-         !collapsed.contains("firefox"),
+         !expanded.contains("firefox"),
          "clicking the name must not collapse the group"
       );
 
@@ -1050,17 +1287,41 @@ mod tests {
          "firefox",
          rect,
          pos2(6.0, 12.0),
-         &mut collapsed,
+         &mut expanded,
+         &mut showing_all,
          &mut selection,
       );
       assert!(
-         collapsed.contains("firefox"),
+         expanded.contains("firefox"),
          "the chevron toggles the group"
       );
       assert_eq!(
          selection,
          Selection::App("firefox".to_owned()),
          "the chevron leaves the selection alone"
+      );
+   }
+
+   #[test]
+   fn collapsing_a_group_forgets_that_it_was_showing_all() {
+      let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
+      let mut expanded = expanded_set(&["firefox"]);
+      let mut showing_all = showing_all_set(&["firefox"]);
+      let mut selection = Selection::default();
+
+      // The chevron collapses the open group and drops its `showing all` entry.
+      click_group(
+         "firefox",
+         rect,
+         pos2(6.0, 12.0),
+         &mut expanded,
+         &mut showing_all,
+         &mut selection,
+      );
+      assert!(!expanded.contains("firefox"));
+      assert!(
+         !showing_all.contains("firefox"),
+         "reopening starts from MAX_CHILDREN again"
       );
    }
 
@@ -1095,26 +1356,36 @@ mod tests {
       matched.matched_rule = Some(rules[0].id.clone());
       let mut log = ConnectionLog::new(8);
       log.push(&matched);
-      let lines = build_lines(&log, &rules, &Collapsed::default());
+      let lines = build_lines(
+         &log,
+         &rules,
+         &expanded_set(&["firefox"]),
+         &ShowingAll::default(),
+      );
       assert_eq!(conn(&lines, 1).rule, "allow anywhere");
    }
 
    #[test]
    fn the_cache_rebuilds_only_when_an_input_changes() {
       let mut log = log(&[(10, "firefox", "a.example")]);
-      let mut collapsed = Collapsed::default();
+      let mut expanded = Expanded::default();
+      let mut showing_all = ShowingAll::default();
       let mut cache = LinesCache::default();
 
       let before = builds();
-      cache.refresh(&log, &[], &collapsed);
-      assert_eq!(cache.lines.len(), 2);
+      cache.refresh(&log, &[], &expanded, &showing_all);
+      assert_eq!(
+         cache.lines.len(),
+         1,
+         "a never-seen app is collapsed"
+      );
       assert_eq!(
          builds(),
          before + 1,
          "the first frame builds the lines"
       );
 
-      cache.refresh(&log, &[], &collapsed);
+      cache.refresh(&log, &[], &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 1,
@@ -1122,17 +1393,25 @@ mod tests {
       );
 
       log.push(&event(20, "curl", "b.example"));
-      cache.refresh(&log, &[], &collapsed);
+      cache.refresh(&log, &[], &expanded, &showing_all);
       assert_eq!(builds(), before + 2, "a new row rebuilds");
-      assert_eq!(cache.lines.len(), 4);
+      assert_eq!(cache.lines.len(), 2, "both groups stay collapsed");
 
-      collapsed.toggle("firefox");
-      cache.refresh(&log, &[], &collapsed);
-      assert_eq!(builds(), before + 3, "collapsing rebuilds");
+      expanded.toggle("firefox");
+      cache.refresh(&log, &[], &expanded, &showing_all);
+      assert_eq!(builds(), before + 3, "expanding rebuilds");
       assert_eq!(cache.lines.len(), 3);
 
+      showing_all.insert("firefox");
+      cache.refresh(&log, &[], &expanded, &showing_all);
+      assert_eq!(
+         builds(),
+         before + 4,
+         "turning on showing all rebuilds the list"
+      );
+
       let rules = vec![rule(DestMatcher::Any, Action::Allow)];
-      cache.refresh(&log, &rules, &collapsed);
-      assert_eq!(builds(), before + 4, "a rule list rebuilds too");
+      cache.refresh(&log, &rules, &expanded, &showing_all);
+      assert_eq!(builds(), before + 5, "a rule list rebuilds too");
    }
 }
