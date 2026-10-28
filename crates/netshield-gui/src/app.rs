@@ -40,6 +40,10 @@ const PROMPT_REPAINT_EVERY: Duration = Duration::from_millis(500);
 /// Red used by the offline banner; loud on purpose.
 const BANNER_RED: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x1F, 0x1F);
 
+/// The width of the navigation panel. Narrow on purpose: the Connections list is the page
+/// that needs the pixels, and the four labels are short.
+const NAV_WIDTH: f32 = 140.0;
+
 /// The slot the socket thread reads to wake the UI.
 ///
 /// Empty until the first pass, because `App::new` runs before eframe hands the app a
@@ -804,7 +808,7 @@ impl eframe::App for App {
       self.toolbar(ui);
       self.banner(ui);
 
-      egui::Panel::left("nav").exact_size(176.0).show(ui, |ui| {
+      egui::Panel::left("nav").exact_size(NAV_WIDTH).show(ui, |ui| {
          ui.add_space(6.0);
          ui.spacing_mut().item_spacing.y = 2.0;
          ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
