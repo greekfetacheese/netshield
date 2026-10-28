@@ -19,7 +19,12 @@ which phase is current.
 4. **No `unsafe` outside `netshield-daemon/src/netlink/`** (and the `/proc` reads if a
    raw syscall is genuinely required), with one sanctioned exception: the `libc::chown`
    call in `crates/netshield-daemon/src/ipc_server.rs::chown_socket`, which hands the
-   control socket to `allowed_uid`. Every `unsafe` block carries a comment naming its
+   control socket to `allowed_uid`. Raw kernel interfaces that have no C library — the
+   BPF probe loader in `crates/netshield-daemon/src/ebpf/` — are the second exception:
+   `bpf(2)`, `perf_event_open(2)` and the instruction encoding have no safe wrapper without
+   a new dependency, which this project does not take. The module must fail closed: any
+   error from loading or attaching means the daemon runs with `/proc` attribution alone,
+   exactly as before. Every `unsafe` block carries a comment naming its
    invariant, and the module keeps its inputs bounds-checked before it is reached.
 5. **Never `cargo fmt` workspace-wide.** Format touched files only:
    `rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true <file>`
