@@ -69,7 +69,7 @@ const ACTIVITY_HEIGHT: f32 = 18.0;
 const CONNECTION_MIN: f32 = 140.0;
 
 /// The width of the right-hand detail pane while a row is selected.
-const DETAIL_WIDTH: f32 = 260.0;
+const DETAIL_WIDTH: f32 = 208.0;
 
 /// How many connection lines one group shows before the `N more…` line.
 const MAX_CHILDREN: usize = 8;
@@ -385,14 +385,20 @@ pub fn show(
                      Selection::Conn { app, at, addr }
                         if app == &conn.app && *at == conn.at && addr == &conn.addr
                   );
-                  conn_row(ui, rect, &columns, conn, selected, now);
+                  conn_row(ui, &response, &columns, conn, selected, now);
                }
                Line::More { remaining, node } => {
                   if response.clicked() {
                      showing_all.insert(node.clone());
                      ui.ctx().request_repaint();
                   }
-                  more_row(ui, response, &columns, *remaining);
+                  more_row(
+                     ui,
+                     response,
+                     &columns,
+                     *remaining,
+                     more_row_x(node),
+                  );
                }
             }
          }
@@ -470,6 +476,27 @@ impl Cells<'_> {
 /// less the name's start and the room the verdict dot needs.
 fn name_width_limit(columns: &Columns, name_x: f32) -> f32 {
    (columns.connection - name_x - DOT_SPACE).max(0.0)
+}
+
+/// Shows `text` while `response` is hovered, but only when it did not fit in `width`.
+///
+/// Every column truncates with an ellipsis, so the full value has to live somewhere: the
+/// hint is drawn only when the row is hovered *and* the text is genuinely clipped, which
+/// keeps a value that fits from nagging the pointer.
+fn truncation_hint(
+   response: &Response,
+   painter: &egui::Painter,
+   width: f32,
+   text: &str,
+   font: &FontId,
+) {
+   if !response.hovered() {
+      return;
+   }
+   let needed = painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
+   if needed > width {
+      response.clone().on_hover_text(text.to_owned());
+   }
 }
 
 /// The verdict dot's rectangle on a group line.
@@ -666,8 +693,9 @@ fn group_row(
    let small = FontId::proportional(11.0);
 
    // The name is the row's own weight; the count trails it as a weak small label.
+   let name_limit = name_width_limit(columns, line.name_x);
    let mut name = LayoutJob {
-      wrap: TextWrapping::truncate_at_width(name_width_limit(columns, line.name_x)),
+      wrap: TextWrapping::truncate_at_width(name_limit),
       ..LayoutJob::default()
    };
    name.append(
@@ -675,13 +703,9 @@ fn group_row(
       0.0,
       TextFormat::simple(line.name_font.clone(), line.name_colour),
    );
-   let count_label = if line.count == 1 {
-      "1 connection".to_owned()
-   } else {
-      line.count.to_string()
-   };
+   let count = count_label(line.count);
    name.append(
-      &count_label,
+      &count,
       8.0,
       TextFormat::simple(small.clone(), weak),
    );
@@ -695,19 +719,28 @@ fn group_row(
       galley,
       line.name_colour,
    );
+   truncation_hint(
+      response,
+      painter,
+      name_limit,
+      &format!("{} {}", line.name, count),
+      &line.name_font,
+   );
 
    let dot_colour = if line.denied { DENIED } else { ALLOWED };
    let dot = dot_rect(rect, line.name_x, name_width);
    painter.circle_filled(dot.center(), 3.5, dot_colour);
    let cells = Cells { painter, rect };
+   let rule_width = (columns.rule).max(0.0);
    cells.text(
       columns.rule_x,
-      (columns.rule).max(0.0),
+      rule_width,
       line.rule,
       &body,
       visuals.text_color(),
       false,
    );
+   truncation_hint(response, painter, rule_width, line.rule, &body);
 
    activity_pill(painter, columns, rect, line.last_at, now, visuals);
 }
@@ -717,7 +750,15 @@ fn group_row(
 ///
 /// The destination line above already names the host, so the row starts at `addr:port`; the
 /// first `domain_candidates` name stays on [`Conn`] for a later tooltip.
-fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: bool, now: u64) {
+fn conn_row(
+   ui: &mut Ui,
+   response: &Response,
+   columns: &Columns,
+   conn: &Conn,
+   selected: bool,
+   now: u64,
+) {
+   let rect = response.rect;
    let visuals = ui.visuals();
    if selected {
       ui.painter().rect_filled(rect, 0.0, visuals.selection.bg_fill);
@@ -728,8 +769,9 @@ fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: b
    let painter = ui.painter();
    let body = FontId::proportional(13.0);
 
+   let width = (columns.connection - CONN_TEXT_X).max(0.0);
    let mut job = LayoutJob {
-      wrap: TextWrapping::truncate_at_width((columns.connection - CONN_TEXT_X).max(0.0)),
+      wrap: TextWrapping::truncate_at_width(width),
       ..LayoutJob::default()
    };
    job.append(
@@ -742,16 +784,11 @@ fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: b
       0.0,
       TextFormat::simple(body.clone(), weak),
    );
-   let verdict = if conn.allowed { "ALLOWED" } else { "DENIED" };
-   let verdict = if conn.via_prompt {
-      format!("{verdict} (prompt)")
-   } else {
-      verdict.to_owned()
-   };
+   let verdict = verdict_label(conn);
    job.append(
       &format!(" · {verdict}"),
       0.0,
-      TextFormat::simple(body, verdict_colour),
+      TextFormat::simple(body.clone(), verdict_colour),
    );
    let galley = painter.layout_job(job);
    painter.galley(
@@ -762,13 +799,30 @@ fn conn_row(ui: &mut Ui, rect: Rect, columns: &Columns, conn: &Conn, selected: b
       galley,
       base,
    );
+   truncation_hint(
+      response,
+      painter,
+      width,
+      &conn_line_text(conn),
+      &body,
+   );
 
    activity_pill(painter, columns, rect, conn.at, now, visuals);
 }
 
+/// Where an `N more…` row sits: level with the children it stands in for, so a hidden
+/// destination's marker lines up with the destinations and a hidden connection's with the
+/// connections.
+fn more_row_x(node: &Node) -> f32 {
+   match node {
+      Node::App(_) => DEST_NAME_X,
+      Node::Dest { .. } => CONN_TEXT_X,
+   }
+}
+
 /// The `N more…` line: weak and indented like the child lines it stands in for. Like a row
 /// it highlights under the pointer, and a click opens the rest of its node.
-fn more_row(ui: &mut Ui, response: Response, columns: &Columns, remaining: usize) {
+fn more_row(ui: &mut Ui, response: Response, columns: &Columns, remaining: usize, name_x: f32) {
    let rect = response.rect;
    if response.hovered() {
       let fill = ui.visuals().widgets.hovered.weak_bg_fill;
@@ -780,8 +834,8 @@ fn more_row(ui: &mut Ui, response: Response, columns: &Columns, remaining: usize
       rect,
    };
    cells.text(
-      CONN_TEXT_X,
-      (columns.connection - CONN_TEXT_X).max(0.0),
+      name_x,
+      (columns.connection - name_x).max(0.0),
       &format!("{remaining} more…"),
       &FontId::proportional(13.0),
       ui.visuals().weak_text_color(),
@@ -982,21 +1036,22 @@ fn detail_pane(ui: &mut Ui, lines: &[Line], selection: &mut Selection) {
       .exact_size(DETAIL_WIDTH)
       .resizable(false)
       .show(ui, |ui| {
-         ui.add_space(8.0);
+         ui.add_space(6.0);
          ui.label(RichText::new("CONNECTION DETAILS").small().strong());
          ui.add_space(8.0);
          egui::Grid::new("connection_details_fields")
             .num_columns(2)
-            .spacing([12.0, 4.0])
+            .spacing([8.0, 3.0])
             .show(ui, |ui| {
                if let Some(dest) = detail.dest {
                   ui.label(RichText::new("Destination:").weak());
-                  ui.add(egui::Label::new(dest).truncate());
+                  ui.add(egui::Label::new(dest).truncate()).on_hover_text(dest);
                   ui.end_row();
                }
 
                ui.label(RichText::new("Process:").weak());
-               ui.add(egui::Label::new(detail.process.unwrap_or("not identified")).truncate());
+               let process = detail.process.unwrap_or("not identified");
+               ui.add(egui::Label::new(process).truncate()).on_hover_text(process);
                ui.end_row();
 
                ui.label(RichText::new("Connections:").weak());
@@ -1016,9 +1071,9 @@ fn detail_pane(ui: &mut Ui, lines: &[Line], selection: &mut Selection) {
                }
             });
 
-         ui.add_space(12.0);
+         ui.add_space(10.0);
          ui.label(RichText::new("MATCHING RULE").small().strong());
-         ui.add_space(6.0);
+         ui.add_space(4.0);
          ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(12.0, 12.0), Sense::hover());
             let dot = if detail.denied { DENIED } else { ALLOWED };
@@ -1182,6 +1237,35 @@ fn rule_label(id: Option<&RuleId>, rules: &[Rule]) -> String {
          dest_label(&rule.dest)
       ),
       None => DASH.to_owned(),
+   }
+}
+
+/// The trailing count on a group line: `1 connection`, else the bare number.
+fn count_label(count: usize) -> String {
+   if count == 1 {
+      "1 connection".to_owned()
+   } else {
+      count.to_string()
+   }
+}
+
+/// One connection line's full text, untruncated: the endpoint, the protocol and the verdict.
+fn conn_line_text(conn: &Conn) -> String {
+   format!(
+      "{} · {} · {}",
+      conn.addr,
+      conn.proto,
+      verdict_label(conn)
+   )
+}
+
+/// `ALLOWED`, `ALLOWED (prompt)`, `DENIED`, or `DENIED (prompt)`.
+fn verdict_label(conn: &Conn) -> String {
+   let verdict = if conn.allowed { "ALLOWED" } else { "DENIED" };
+   if conn.via_prompt {
+      format!("{verdict} (prompt)")
+   } else {
+      verdict.to_owned()
    }
 }
 
@@ -2024,6 +2108,72 @@ mod tests {
          dot.center().y,
          row.center().y,
          "the dot is vertically centred"
+      );
+   }
+
+   #[test]
+   fn a_single_connection_reads_as_a_word() {
+      assert_eq!(count_label(1), "1 connection");
+      assert_eq!(count_label(12), "12");
+   }
+
+   #[test]
+   fn a_connection_line_names_its_endpoint_and_verdict() {
+      let mut allowed = event(10, "firefox", "a.example");
+      allowed.connection.remote_ip = "140.82.121.6".parse().unwrap();
+      let mut history = ConnectionLog::new(8);
+      history.push(&allowed);
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      let allowed = conn(&lines, 2);
+      assert_eq!(
+         conn_line_text(allowed),
+         "140.82.121.6:443 · tcp · ALLOWED"
+      );
+
+      let mut prompted = event(10, "firefox", "a.example");
+      prompted.connection.remote_ip = "140.82.121.6".parse().unwrap();
+      prompted.via_prompt = true;
+      let mut history = ConnectionLog::new(8);
+      history.push(&prompted);
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      assert!(
+         conn_line_text(conn(&lines, 2)).ends_with("ALLOWED (prompt)"),
+         "a prompted allow names the prompt"
+      );
+
+      let mut denied = event(10, "firefox", "a.example");
+      denied.connection.remote_ip = "140.82.121.6".parse().unwrap();
+      denied.allowed = false;
+      let mut history = ConnectionLog::new(8);
+      history.push(&denied);
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      assert!(
+         conn_line_text(conn(&lines, 2)).ends_with("DENIED"),
+         "a denied connection names its verdict"
+      );
+   }
+
+   #[test]
+   fn an_overflow_row_sits_level_with_its_children() {
+      assert_eq!(more_row_x(&Node::app("firefox")), DEST_NAME_X);
+      assert_eq!(
+         more_row_x(&Node::dest("firefox", "a.example")),
+         CONN_TEXT_X
       );
    }
 
