@@ -775,7 +775,11 @@ fn group_row(
    } else {
       IndicatorState::On
    };
-   ui.put(indicator, Indicator::new(state).size(DOT_SIZE));
+   // A child ui, not `ui.put`: placing a widget with `put` moves the row's own cursor to
+   // the widget's bottom, so every following row would start inside this one and the list
+   // would lose its `LINE_HEIGHT` pitch.
+   let mut light = ui.new_child(egui::UiBuilder::new().max_rect(indicator));
+   light.add(Indicator::new(state).size(DOT_SIZE));
    let cells = Cells {
       painter: &painter,
       rect,
