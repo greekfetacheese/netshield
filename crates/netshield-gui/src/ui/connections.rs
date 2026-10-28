@@ -24,8 +24,12 @@ const LINE_HEIGHT: f32 = 24.0;
 /// The column-header line above the list.
 const HEADER_HEIGHT: f32 = 18.0;
 
-/// Whitespace between two columns.
+/// Whitespace between the Rule and Activity columns; Activity holds short labels.
 const COLUMN_GAP: f32 = 12.0;
+
+/// Whitespace between the Connection and Rule columns: names and rule labels are both long,
+/// so the boundary needs to read as a boundary rather than as another space inside a cell.
+const CONNECTION_GAP: f32 = 32.0;
 
 /// The chevron's tip on an application line: the centre of its click band.
 const APP_CHEVRON_X: f32 = 11.0;
@@ -440,7 +444,7 @@ impl Columns {
       let activity_x = (width - ROW_PAD - ACTIVITY_WIDTH).max(0.0);
       let rule_x = (activity_x - COLUMN_GAP - RULE_WIDTH).max(CONN_TEXT_X + CONNECTION_MIN);
       let rule = (activity_x - COLUMN_GAP - rule_x).max(0.0);
-      let connection = (rule_x - COLUMN_GAP).max(0.0);
+      let connection = (rule_x - CONNECTION_GAP).max(0.0);
       Self {
          connection,
          rule,
@@ -2248,6 +2252,26 @@ mod tests {
       assert!(
          limit + DEST_NAME_X + DOT_SPACE == columns.connection,
          "a destination's galley stops short of its indicator too"
+      );
+   }
+
+   #[test]
+   fn the_columns_keep_their_own_gaps() {
+      let columns = Columns::new(900.0);
+
+      assert_eq!(
+         columns.rule_x - columns.connection,
+         CONNECTION_GAP,
+         "the Connection column stops one wide gap short of Rule"
+      );
+      assert_eq!(
+         columns.rule, RULE_WIDTH,
+         "the Rule column keeps its width"
+      );
+      assert_eq!(
+         columns.activity_x - (columns.rule_x + columns.rule),
+         COLUMN_GAP,
+         "Rule and Activity stay a normal gap apart"
       );
    }
 }

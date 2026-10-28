@@ -146,7 +146,7 @@ fn main() -> eframe::Result {
    } else {
       egui::ViewportBuilder::default()
          .with_title("NetShield")
-         .with_inner_size([980.0, 640.0])
+         .with_inner_size([1130.0, 640.0])
          .with_min_inner_size([760.0, 480.0])
    };
    let options = eframe::NativeOptions {
