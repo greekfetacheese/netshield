@@ -101,6 +101,33 @@ pub struct CachedIdentity {
    pub starttime: u64,
 }
 
+/// Why a flow has no owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Missing {
+   /// The kernel named a uid and a complete scan of the socket table and the descriptor
+   /// table found no owner: the socket was closed before the scan ran. Nothing is waiting
+   /// for a reply, and no later scan can find its owner.
+   SocketGone,
+   /// A row existed but no process of the packet's uid held it, or the descriptor scan came
+   /// up short. The socket may still be alive, so this is a transient failure.
+   NotOurs,
+}
+
+/// The outcome of one attribution attempt: the owner, and — when there is none — why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attributed {
+   pub attribution: Attribution,
+   /// Set when `attribution` is `Attribution::Unknown`.
+   pub missing: Option<Missing>,
+}
+
+impl Attributed {
+   /// Whether the flow has no owner.
+   pub fn is_unknown(&self) -> bool {
+      self.attribution == Attribution::Unknown
+   }
+}
+
 /// Identities learned from the proc connector, so a process that exits mid-scan still resolves.
 #[derive(Debug, Default)]
 pub struct ProcessCache {
@@ -176,9 +203,15 @@ pub struct Attributor {
    inode_to_pid: HashMap<u32, InodeCacheEntry>,
    pid_fds: HashMap<u32, FdCacheEntry>,
    flow_owners: HashMap<FlowKey, FlowCacheEntry>,
-   flow_misses: HashMap<FlowKey, Instant>,
+   flow_misses: HashMap<FlowKey, MissMarker>,
    miss_streaks: HashMap<MissKey, MissStreak>,
    stats: AttributeStats,
+   /// Whether the last scan could not see every descriptor it needed to.
+   ///
+   /// Set by a budget cut-off or an unreadable descriptor directory, cleared at the start of
+   /// every lookup. It is what separates "nobody holds this socket" — a closed socket — from
+   /// "we ran out of room to look", which must never be reported as a closed flow.
+   scan_incomplete: bool,
    /// When the budget warning was last emitted, so a busy scan cannot flood the journal.
    last_budget_warn: Option<Instant>,
 }
@@ -205,6 +238,17 @@ struct FlowCacheEntry {
    pid: u32,
    uid: u32,
    at: Instant,
+}
+
+/// A flow's negative marker: when it last failed and why.
+///
+/// The kind is kept so a cached miss can still answer the question the decision asks — a
+/// socket that was already gone stays gone for the lifetime of the marker, so the cheaper
+/// repeated miss must not silently downgrade it to a transient failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MissMarker {
+   at: Instant,
+   missing: Option<Missing>,
 }
 
 /// Consecutive misses for one flow class and when it was last warned about.
@@ -240,6 +284,7 @@ impl Attributor {
          flow_misses: HashMap::new(),
          miss_streaks: HashMap::new(),
          stats: AttributeStats::default(),
+         scan_incomplete: false,
          last_budget_warn: None,
       }
    }
@@ -256,14 +301,17 @@ impl Attributor {
       remote: (IpAddr, u16),
       proto: L4Proto,
       uid: Option<u32>,
-   ) -> Attribution {
+   ) -> Attributed {
       let now = Instant::now();
       let flow = (proto, local, remote);
       if let Some((pid, owner_uid)) = self.cached_flow(flow, uid, now) {
          return match self.process_identity(pid, owner_uid) {
             Some(process) => {
                self.stats.hits += 1;
-               Attribution::Process(process)
+               Attributed {
+                  attribution: Attribution::Process(process),
+                  missing: None,
+               }
             }
             // The cached owner is gone, so the positive answer is stale: drop it and let
             // this call go through the `/proc` path instead of trusting it.
@@ -273,11 +321,11 @@ impl Attributor {
             }
          };
       }
-      if self.flow_miss_active(flow, now) {
+      if let Some(missing) = self.flow_miss_active(flow, now) {
          // The same flow just failed to resolve; its packet burst must cost one scan, not
          // one per packet. This never becomes an answer, only a cheaper miss.
          self.record_miss(proto, remote, uid, now);
-         return Attribution::Unknown;
+         return self.unknown_marker(missing);
       }
       self.lookup(local, remote, proto, uid, now)
    }
@@ -290,7 +338,8 @@ impl Attributor {
       proto: L4Proto,
       uid: Option<u32>,
       now: Instant,
-   ) -> Attribution {
+   ) -> Attributed {
+      self.scan_incomplete = false;
       let flow = (proto, local, remote);
       let context = FailureContext {
          local,
@@ -301,11 +350,12 @@ impl Attributor {
          candidates: None,
       };
       let Some(family) = family_of(local.0) else {
-         return self.unknown(&context, "local address has no family", now);
+         return self.unknown(&context, None, "local address has no family", now);
       };
       if family_of(remote.0) != Some(family) {
          return self.unknown(
             &context,
+            None,
             "flow endpoints mix address families",
             now,
          );
@@ -322,7 +372,10 @@ impl Attributor {
          // Not a flow class worth a warning: v1 never prompts for ICMP, so there is no
          // unknown decision to make visible.
          self.stats.misses += 1;
-         return Attribution::Unknown;
+         return Attributed {
+            attribution: Attribution::Unknown,
+            missing: None,
+         };
       };
       let context = FailureContext {
          table: Some(table),
@@ -334,6 +387,7 @@ impl Attributor {
          Err(error) => {
             return self.unknown(
                &context,
+               Some(Missing::NotOurs),
                &format!("cannot read /proc/net/{table}: {error}"),
                now,
             );
@@ -349,7 +403,12 @@ impl Attributor {
             candidates: count,
             ..context
          };
-         return self.unknown(&context, reason, now);
+         return self.unknown(
+            &context,
+            Some(self.missing_kind(uid)),
+            reason,
+            now,
+         );
       }
       let context = FailureContext {
          candidates: Some(candidates.len()),
@@ -383,6 +442,7 @@ impl Attributor {
             );
             return self.unknown(
                &context,
+               Some(Missing::NotOurs),
                &format!(
                   "socket inode {inode} is owned by uid {owner_uid}, not the packet uid \
                    {packet_uid}"
@@ -393,18 +453,25 @@ impl Attributor {
          CandidateOwner::Ambiguous => {
             return self.unknown(
                &context,
+               Some(Missing::NotOurs),
                "several unconnected UDP sockets share the local port and the packet has no uid",
                now,
             );
          }
          CandidateOwner::Missing => {
-            return self.unknown(&context, "no /proc fd link holds the inode", now);
+            return self.unknown(
+               &context,
+               Some(self.missing_kind(uid)),
+               "no /proc fd link holds the inode",
+               now,
+            );
          }
       };
 
       let Some(process) = self.process_identity(pid, process_uid) else {
          return self.unknown(
             &context,
+            Some(Missing::NotOurs),
             &format!("cannot read /proc/{pid} identity for inode {inode}"),
             now,
          );
@@ -427,7 +494,10 @@ impl Attributor {
          (uid, proto, remote.1),
       );
       self.stats.hits += 1;
-      Attribution::Process(process)
+      Attributed {
+         attribution: Attribution::Process(process),
+         missing: None,
+      }
    }
 
    /// Resolves a pid's identity, preferring the connector cache.
@@ -496,6 +566,19 @@ impl Attributor {
       self.stats
    }
 
+   /// The reason to report when no owner was found, and how final that is.
+   ///
+   /// A complete scan that found nothing, for a packet the kernel gave a uid, means the socket
+   /// is gone: the application closed it before the daemon looked, which is what Chromium's
+   /// speculative sockets do. Anything less certain stays `NotOurs` and still prompts.
+   fn missing_kind(&self, uid: Option<u32>) -> Missing {
+      if uid.is_some() && !self.scan_incomplete {
+         Missing::SocketGone
+      } else {
+         Missing::NotOurs
+      }
+   }
+
    /// Returns a fresh flow→owner answer, or `None` when it is stale or disagrees with the
    /// packet's uid.
    fn cached_flow(&mut self, flow: FlowKey, uid: Option<u32>, now: Instant) -> Option<(u32, u32)> {
@@ -542,29 +625,28 @@ impl Attributor {
       self.flow_owners.insert(flow, entry);
    }
 
-   /// Whether this flow failed recently enough that re-scanning it would be waste.
-   fn flow_miss_active(&mut self, flow: FlowKey, now: Instant) -> bool {
-      let Some(at) = self.flow_misses.get(&flow).copied() else {
-         return false;
-      };
-      if now.saturating_duration_since(at) >= NEGATIVE_TTL {
+   /// Why this flow failed recently enough that re-scanning it would be waste.
+   fn flow_miss_active(&mut self, flow: FlowKey, now: Instant) -> Option<Option<Missing>> {
+      let marker = *self.flow_misses.get(&flow)?;
+      if now.saturating_duration_since(marker.at) >= NEGATIVE_TTL {
          self.flow_misses.remove(&flow);
-         return false;
+         return None;
       }
-      true
+      Some(marker.missing)
    }
 
-   /// Marks a flow so its next packet in the next second does not rescan `/proc`.
-   fn mark_flow_miss(&mut self, flow: FlowKey, now: Instant) {
+   /// Marks a flow so its next packet in the next second does not rescan `/proc`, keeping
+   /// the reason the first scan failed.
+   fn mark_flow_miss(&mut self, flow: FlowKey, missing: Option<Missing>, now: Instant) {
       if self.flow_misses.len() >= MAX_FLOWS {
          self
             .flow_misses
-            .retain(|_, at| now.saturating_duration_since(*at) < NEGATIVE_TTL);
+            .retain(|_, marker| now.saturating_duration_since(marker.at) < NEGATIVE_TTL);
          if self.flow_misses.len() >= MAX_FLOWS {
             self.flow_misses.clear();
          }
       }
-      self.flow_misses.insert(flow, now);
+      self.flow_misses.insert(flow, MissMarker { at: now, missing });
    }
 
    /// Counts one miss and emits the operator warning when a flow class has failed often
@@ -670,6 +752,10 @@ impl Attributor {
          return None;
       }
 
+      // Whether any descriptor directory was actually read. A scan that ruled out no
+      // process of the packet's uid proved nothing about that uid, so it is not complete
+      // even though it examined everything it was willing to look at.
+      let mut examined = false;
       for pid in pids {
          if let Some((found, owner)) = self.cached_fd_lookup(pid, inode, uid)
             && found
@@ -690,12 +776,18 @@ impl Attributor {
             continue;
          }
 
+         examined = true;
          let (inodes, over_budget) = match read_inodes(pid) {
             Ok(inodes) => (inodes, false),
             // The fresh entries were still inspected, so a socket among them is a real
             // hit; the warning below records that the rest of the directory went unseen.
             Err(ScanError::Budget(inodes)) => (inodes, true),
-            Err(ScanError::Unreadable) => continue,
+            Err(ScanError::Unreadable) => {
+               // The directory could not be read, so this pid's descriptors were never
+               // ruled out: the scan is not complete and must not call a flow closed.
+               self.scan_incomplete = true;
+               continue;
+            }
          };
          if over_budget {
             self.budget_exhausted(&format!(
@@ -722,6 +814,12 @@ impl Attributor {
             return None;
          }
       }
+      if !examined && uid.is_some() {
+         // No readable process of the packet's uid was found at all, so no descriptor was
+         // ruled out: this is a uid mismatch to keep prompting, not a closed socket. The
+         // descriptor scan of the owner would still have run had such a process existed.
+         self.scan_incomplete = true;
+      }
       None
    }
 
@@ -747,6 +845,7 @@ impl Attributor {
    /// Counts and rate-limits a budget-exhaustion warning.
    fn budget_exhausted(&mut self, reason: &str) {
       self.stats.scan_budget_exhausted += 1;
+      self.scan_incomplete = true;
       let now = Instant::now();
       let due = self
          .last_budget_warn
@@ -758,9 +857,19 @@ impl Attributor {
    }
 
    /// Records a miss, marks the flow negative and logs why attribution failed.
-   fn unknown(&mut self, context: &FailureContext<'_>, reason: &str, now: Instant) -> Attribution {
+   ///
+   /// `kind` is the decision's only way to tell a socket that is already gone from a scan
+   /// that merely failed; `None` means v1 does not prompt for this flow at all.
+   fn unknown(
+      &mut self,
+      context: &FailureContext<'_>,
+      kind: Option<Missing>,
+      reason: &str,
+      now: Instant,
+   ) -> Attributed {
       self.mark_flow_miss(
          (context.proto, context.local, context.remote),
+         kind,
          now,
       );
       self.record_miss(context.proto, context.remote, context.uid, now);
@@ -768,7 +877,18 @@ impl Attributor {
          "attribution failed: {}",
          failure_message(context, reason)
       );
-      Attribution::Unknown
+      Attributed {
+         attribution: Attribution::Unknown,
+         missing: kind,
+      }
+   }
+
+   /// An unknown answer reconstructed from a still-fresh negative flow marker.
+   fn unknown_marker(&self, missing: Option<Missing>) -> Attributed {
+      Attributed {
+         attribution: Attribution::Unknown,
+         missing,
+      }
    }
 }
 
@@ -1713,8 +1833,33 @@ mod tests {
          L4Proto::Icmp,
          Some(1000),
       );
-      assert_eq!(attribution, Attribution::Unknown);
+      assert!(attribution.is_unknown());
+      assert_eq!(attribution.attribution, Attribution::Unknown);
+      assert_eq!(
+         attribution.missing, None,
+         "ICMP is not an unattributable socket flow"
+      );
       assert_eq!(attributor.stats().misses, 1);
+   }
+
+   #[test]
+   fn a_flow_with_no_socket_row_is_reported_as_gone() {
+      // Nothing in this process ever bound local port 65000, so the socket table has no
+      // row for the flow: the descriptor was closed before the scan ran.
+      let mut attributor = Attributor::new();
+      let attributed = attributor.attribute(
+         (IpAddr::V4(Ipv4Addr::LOCALHOST), 65_000),
+         v4([192, 0, 2, 1], 6553),
+         L4Proto::Udp,
+         Some(own_uid()),
+      );
+      assert!(attributed.is_unknown());
+      assert_eq!(
+         attributed.missing,
+         Some(Missing::SocketGone),
+         "no row means the socket is gone, not that a scan merely failed"
+      );
+      assert_eq!(attributed.attribution, Attribution::Unknown);
    }
 
    #[test]
@@ -1733,7 +1878,11 @@ mod tests {
          Some(uid),
       );
 
-      match &attribution {
+      assert_eq!(
+         attribution.missing, None,
+         "an attributed flow has no missing reason"
+      );
+      match &attribution.attribution {
          Attribution::Process(process) => {
             assert_eq!(
                process.pid,
@@ -1773,11 +1922,17 @@ mod tests {
          L4Proto::Udp,
          Some(own_uid().wrapping_add(1)),
       );
-      assert_eq!(attribution, Attribution::Unknown);
+      assert!(attribution.is_unknown());
+      assert_eq!(
+         attribution.missing,
+         Some(Missing::NotOurs),
+         "the row exists but belongs to another uid"
+      );
       assert_eq!(attributor.stats().misses, 1);
    }
 
    #[test]
+
    fn unattributable_tuple_is_unknown_and_counts_a_miss() {
       let mut attributor = Attributor::new();
       let attribution = attributor.attribute(
@@ -1786,7 +1941,12 @@ mod tests {
          L4Proto::Tcp,
          Some(own_uid()),
       );
-      assert_eq!(attribution, Attribution::Unknown);
+      assert!(attribution.is_unknown());
+      assert_eq!(
+         attribution.missing,
+         Some(Missing::SocketGone),
+         "the table has no row for this flow"
+      );
       assert_eq!(attributor.stats().misses, 1);
       assert_eq!(attributor.stats().hits, 0);
       assert_eq!(attributor.stats().scan_budget_exhausted, 0);
@@ -1909,7 +2069,10 @@ mod tests {
          L4Proto::Udp,
          Some(uid),
       );
-      assert!(matches!(first, Attribution::Process(_)));
+      assert!(matches!(
+         first.attribution,
+         Attribution::Process(_)
+      ));
       drop(socket);
 
       // The socket is gone, so the table/scan path would now miss; the flow cache must
@@ -1967,10 +2130,17 @@ mod tests {
       let mut attributor = Attributor::new();
       let flow = flow(50_002, 53);
       let start = Instant::now();
-      attributor.mark_flow_miss(flow, start);
+      attributor.mark_flow_miss(flow, Some(Missing::SocketGone), start);
 
-      assert!(attributor.flow_miss_active(flow, start + StdDuration::from_millis(500)));
-      assert!(!attributor.flow_miss_active(flow, start + NEGATIVE_TTL));
+      assert_eq!(
+         attributor.flow_miss_active(flow, start + StdDuration::from_millis(500)),
+         Some(Some(Missing::SocketGone)),
+         "a negative entry keeps the reason the scan failed"
+      );
+      assert_eq!(
+         attributor.flow_miss_active(flow, start + NEGATIVE_TTL),
+         None
+      );
       assert!(!attributor.flow_misses.contains_key(&flow));
    }
 
@@ -1980,7 +2150,7 @@ mod tests {
       let flow = flow(50_003, 53);
       let class = (Some(1000), L4Proto::Udp, 53);
       let start = Instant::now();
-      attributor.mark_flow_miss(flow, start);
+      attributor.mark_flow_miss(flow, None, start);
       attributor.record_miss(L4Proto::Udp, flow.2, Some(1000), start);
       assert_eq!(attributor.miss_streaks[&class].consecutive, 1);
 
@@ -2067,6 +2237,79 @@ mod tests {
       assert_eq!(
          reads, 1,
          "one pid is read at most once per lookup"
+      );
+   }
+
+   #[test]
+   fn a_complete_scan_with_no_owner_is_a_closed_flow() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(vec![pid], 4242, Some(uid), |_| Ok(Vec::new()));
+      assert_eq!(owner, None, "no descriptor holds the inode");
+      assert_eq!(
+         attributor.missing_kind(Some(1000)),
+         Missing::SocketGone,
+         "a complete scan that finds nobody means the socket is gone"
+      );
+   }
+
+   #[test]
+   fn an_incomplete_scan_is_not_a_closed_flow() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      // An unreadable descriptor directory means this pid was never ruled out, so the
+      // scan is incomplete even though it found no owner.
+      let owner = attributor.scan_pids_for_inode(vec![pid], 4242, Some(uid), |_| {
+         Err(ScanError::Unreadable)
+      });
+      assert_eq!(owner, None);
+      assert!(
+         attributor.scan_incomplete,
+         "the unreadable pid marks the scan"
+      );
+      assert_eq!(
+         attributor.missing_kind(Some(1000)),
+         Missing::NotOurs,
+         "a scan that could not look everywhere must still prompt"
+      );
+   }
+
+   #[test]
+   fn a_uid_less_flow_is_never_a_closed_flow() {
+      let pid = std::process::id();
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(vec![pid], 4242, None, |_| Ok(Vec::new()));
+      assert_eq!(owner, None);
+      assert!(
+         !attributor.scan_incomplete,
+         "the scan itself was complete"
+      );
+      assert_eq!(
+         attributor.missing_kind(None),
+         Missing::NotOurs,
+         "forwarded and socket-less traffic keeps prompting"
+      );
+   }
+
+   #[test]
+   fn a_new_lookup_clears_the_incomplete_flag() {
+      let mut attributor = Attributor::new();
+      attributor.budget_exhausted("test budget");
+      assert!(attributor.scan_incomplete);
+      // A lookup on a flow with no socket row runs the reset at its top before the table
+      // read fails; the point is that the previous scan's state cannot leak into it.
+      let _ = attributor.lookup(
+         v4([127, 0, 0, 1], 1),
+         v4([192, 0, 2, 1], 65_000),
+         L4Proto::Tcp,
+         Some(own_uid()),
+         Instant::now(),
+      );
+      assert!(
+         !attributor.scan_incomplete,
+         "a new lookup starts from a complete scan"
       );
    }
 
@@ -2428,7 +2671,12 @@ mod tests {
          L4Proto::Tcp,
          Some(own_uid()),
       );
-      assert_eq!(attribution, Attribution::Unknown);
+      assert!(attribution.is_unknown());
+      assert_eq!(
+         attribution.missing,
+         Some(Missing::SocketGone),
+         "the flow is in no socket table"
+      );
       assert_eq!(attributor.stats().hits, 0);
       assert_eq!(attributor.stats().misses, 1);
       assert_eq!(

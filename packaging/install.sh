@@ -119,6 +119,7 @@ install_config() {
   "dns_queue_num": 1,
   "prompt_timeout_secs": 30,
   "default_action": "prompt",
+  "unattributable_closed_flow": "drop",
   "allowed_uid": $allowed_uid,
   "log_level": "info",
   "socket_path": "$SOCKET_PATH",

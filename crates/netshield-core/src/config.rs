@@ -18,6 +18,22 @@ pub enum DefaultAction {
    Deny,
 }
 
+/// What to do with a flow whose socket was already closed when the daemon attributed it.
+///
+/// `Drop` is the default. The application has closed the descriptor, so nothing is waiting for
+/// an answer, and a process must not be able to reach the network by closing its socket fast.
+/// `Allow` exists for applications that send one datagram and close immediately; `Prompt`
+/// restores the pre-2026 behaviour and should not be the default, because a prompt about a
+/// flow that can no longer happen teaches the owner to dismiss prompts unread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClosedFlowAction {
+   #[default]
+   Drop,
+   Allow,
+   Prompt,
+}
+
 /// Verbosity of the daemon log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -44,6 +60,12 @@ pub struct Config {
    pub prompt_timeout_secs: u64,
    /// Verdict for connections that match no rule.
    pub default_action: DefaultAction,
+   /// How an unattributable flow whose socket is already gone is decided.
+   ///
+   /// `#[serde(default)]` is load-bearing: [`Config::load`] treats a JSON parse error as
+   /// fatal, and every config written by the current installer lacks this key.
+   #[serde(default)]
+   pub unattributable_closed_flow: ClosedFlowAction,
    /// The only non-root UID allowed to use the control socket.
    ///
    /// `None` means root only. It is never a wildcard: a missing value must not widen the
@@ -63,6 +85,7 @@ impl Default for Config {
          dns_queue_num: 1,
          prompt_timeout_secs: 30,
          default_action: DefaultAction::Prompt,
+         unattributable_closed_flow: ClosedFlowAction::Drop,
          allowed_uid: None,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
@@ -198,6 +221,11 @@ mod tests {
       assert_eq!(config.dns_queue_num, 1);
       assert_eq!(config.prompt_timeout_secs, 30);
       assert_eq!(config.default_action, DefaultAction::Prompt);
+      assert_eq!(
+         config.unattributable_closed_flow,
+         ClosedFlowAction::Drop,
+         "a closed flow is dropped unless the owner says otherwise"
+      );
       assert_eq!(config.allowed_uid, None);
       assert_eq!(config.log_level, LogLevel::Info);
       assert_eq!(
@@ -209,6 +237,49 @@ mod tests {
          PathBuf::from("/etc/netshield/rules.json")
       );
       assert!(config.validate().is_ok());
+   }
+
+   #[test]
+   fn a_config_without_the_new_key_takes_the_drop_default() {
+      // Exactly what the current installer writes: no `unattributable_closed_flow` key.
+      let json = r#"{
+  "queue_num": 0,
+  "dns_queue_num": 1,
+  "prompt_timeout_secs": 30,
+  "default_action": "prompt",
+  "allowed_uid": null,
+  "log_level": "info",
+  "socket_path": "/run/netshield/control.sock",
+  "rules_path": "/etc/netshield/rules.json"
+}"#;
+      let config: Config = serde_json::from_str(json).expect("the installed config must load");
+      assert_eq!(
+         config.unattributable_closed_flow,
+         ClosedFlowAction::Drop
+      );
+   }
+
+   #[test]
+   fn the_new_key_round_trips() {
+      for (json, expected) in [
+         ("\"allow\"", ClosedFlowAction::Allow),
+         ("\"prompt\"", ClosedFlowAction::Prompt),
+         ("\"drop\"", ClosedFlowAction::Drop),
+      ] {
+         let action: ClosedFlowAction =
+            serde_json::from_str(json).expect("a valid ClosedFlowAction");
+         assert_eq!(action, expected);
+      }
+
+      // The default config serializes `drop`, and the daemon can read that back: the
+      // installer's sample and the save path must agree with the field's default.
+      let json = serde_json::to_string(&Config::default()).expect("serialize the default config");
+      let back: Config = serde_json::from_str(&json).expect("read our own default back");
+      assert_eq!(
+         back.unattributable_closed_flow,
+         ClosedFlowAction::Drop
+      );
+      assert_eq!(back, Config::default());
    }
 
    #[test]
@@ -273,6 +344,10 @@ mod tests {
       assert_eq!(
          serde_json::to_string(&LogLevel::Warn).unwrap(),
          "\"warn\""
+      );
+      assert_eq!(
+         serde_json::to_string(&ClosedFlowAction::Drop).unwrap(),
+         "\"drop\""
       );
    }
 

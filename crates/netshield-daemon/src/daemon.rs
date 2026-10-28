@@ -17,7 +17,7 @@
 //! error, a malformed datagram or a cache miss all end in [`Verdict::Accept`], because a
 //! dropped DNS answer looks like a broken network and is not something a firewall may do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -27,7 +27,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
-use netshield_core::config::Config;
+use netshield_core::config::{ClosedFlowAction, Config};
 use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
 use netshield_core::dns::{DnsRecord, RecordKind, Target, parse_response, parse_tcp_response};
 use netshield_core::dns_cache::DnsCache;
@@ -45,7 +45,7 @@ use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{PendingPrompts, PromptRecord};
 use crate::policy::{Decision, Policy};
-use crate::proc::{Attributor, ProcessCache};
+use crate::proc::{Attributor, Missing, ProcessCache};
 use crate::store::{RuleStore, StoreError};
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
@@ -56,6 +56,12 @@ const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
 
 /// Upper bound on the addresses the DNS miss limiter remembers.
 const DNS_MISS_LIMIT: usize = 1024;
+
+/// Upper bound on the applications the multicast log line remembers.
+///
+/// A desktop session rarely has more than a few dozen applications talking to a multicast
+/// destination; past the bound the line is skipped and the packet is still allowed.
+const MAX_MULTICAST_APPS: usize = 64;
 
 /// How long the proc connector receive may block before the shutdown flag is checked.
 ///
@@ -198,6 +204,8 @@ struct Daemon {
    silent_warned: bool,
    table_verified: bool,
    dns_misses: MissLimiter,
+   closed_flows: MissLimiter,
+   multicast_logged: HashSet<String>,
 }
 
 impl Daemon {
@@ -228,6 +236,8 @@ impl Daemon {
          silent_warned: false,
          table_verified,
          dns_misses: MissLimiter::new(),
+         closed_flows: MissLimiter::new(),
+         multicast_logged: HashSet::new(),
       }
    }
 
@@ -902,7 +912,7 @@ impl Daemon {
          }
       };
 
-      let Some(connection) = self.connection_for(&parsed, &packet) else {
+      let Some((connection, missing)) = self.connection_for(&parsed, &packet) else {
          // Not a flow the policy governs (ICMP, an unknown transport, a family mismatch);
          // accept rather than invent a decision for a packet the model cannot express.
          self.accept(packet.id);
@@ -930,7 +940,12 @@ impl Daemon {
             self.drop_packet(packet.id);
             self.broadcast_connection(&connection, Action::Deny, rule, false);
          }
-         None => self.prompt(&connection, packet.id),
+         None => match unmatched(&connection, missing, &self.config, self.mode) {
+            Unmatched::Prompt => self.prompt(&connection, packet.id),
+            Unmatched::DropClosed => self.closed_flow_dropped(&connection, packet.id),
+            Unmatched::AllowClosed => self.closed_flow_allowed(&connection, packet.id),
+            Unmatched::AllowMulticast => self.multicast_allowed(&connection, packet.id),
+         },
       }
    }
 
@@ -999,6 +1014,56 @@ impl Daemon {
       self.publish_status();
    }
 
+   /// Drops a flow whose socket is already gone and records it in the connection log.
+   fn closed_flow_dropped(&mut self, connection: &Connection, packet_id: u32) {
+      self.drop_packet(packet_id);
+      self.broadcast_connection(connection, Action::Deny, None, false);
+      if self.closed_flows.record(connection.remote.addr, Instant::now()) {
+         warn!(
+            "dropped a flow whose socket was already closed: {} -> {}:{} ({}); \
+             nothing is waiting for it, see unattributable_closed_flow",
+            connection.app_name(),
+            connection.remote.addr,
+            connection.remote.port,
+            connection.proto
+         );
+      }
+   }
+
+   /// Allows a flow whose socket is already gone, because the owner asked for fail-open.
+   fn closed_flow_allowed(&mut self, connection: &Connection, packet_id: u32) {
+      self.accept(packet_id);
+      self.broadcast_connection(connection, Action::Allow, None, false);
+      if self.closed_flows.record(connection.remote.addr, Instant::now()) {
+         info!(
+            "allowed a flow whose socket was already closed: {} -> {}:{} ({}); \
+             unattributable_closed_flow is allow",
+            connection.app_name(),
+            connection.remote.addr,
+            connection.remote.port,
+            connection.proto
+         );
+      }
+   }
+
+   /// Allows an unmatched multicast destination once per app.
+   fn multicast_allowed(&mut self, connection: &Connection, packet_id: u32) {
+      self.accept(packet_id);
+      self.broadcast_connection(connection, Action::Allow, None, false);
+      let app = connection.app_name();
+      // The bound only keeps the one-per-app line from growing without limit on a machine
+      // that runs an unusual number of multicast speakers; the packet is still allowed.
+      if self.multicast_logged.contains(&app) || self.multicast_logged.len() >= MAX_MULTICAST_APPS {
+         return;
+      }
+      self.multicast_logged.insert(app.clone());
+      info!(
+         "allowing multicast traffic from {app} without a prompt: {} cannot be attributed \
+          (the local port is shared with other uids), and it cannot leave the link",
+         connection.remote.addr
+      );
+   }
+
    /// Times out the active prompt, expires grants and prunes the DNS cache.
    fn sweep(&mut self, now: Instant) {
       let expired = self.pending.expired(now);
@@ -1037,9 +1102,13 @@ impl Daemon {
       self.dns_cache.lock().expect("dns cache").expire(epoch);
    }
 
-   /// Builds the [`Connection`] for a parsed packet, or `None` when the transport has no
-   /// endpoints to govern.
-   fn connection_for(&mut self, parsed: &ParsedPacket, packet: &Packet) -> Option<Connection> {
+   /// Builds the [`Connection`] for a parsed packet and, when it has no owner, why — or
+   /// `None` when the transport has no endpoints to govern.
+   fn connection_for(
+      &mut self,
+      parsed: &ParsedPacket,
+      packet: &Packet,
+   ) -> Option<(Connection, Option<Missing>)> {
       let (proto, local_port, remote_port) = match parsed.l4 {
          L4Payload::Tcp {
             src_port,
@@ -1066,21 +1135,23 @@ impl Daemon {
          addr: parsed.dst,
          port: remote_port,
       };
-      let process = self.attributor.attribute(
+      let attributed = self.attributor.attribute(
          (local.addr, local.port),
          (remote.addr, remote.port),
          proto,
          packet.uid,
       );
+      let missing = attributed.missing;
 
-      Some(Connection {
+      let connection = Connection {
          family: parsed.family,
          proto,
          local,
          remote,
-         process,
+         process: attributed.attribution,
          domain: self.domain_for(remote.addr),
-      })
+      };
+      Some((connection, missing))
    }
 
    /// The name the DNS cache learned for `addr`, if one is still live.
@@ -1179,8 +1250,44 @@ fn dest_label(connection: &Connection) -> String {
    }
 }
 
-/// Remembers when each address last missed the DNS cache, so the miss debug line stays
-/// cheap on a machine that resolves many addresses the cache never saw.
+/// What happens to a flow the policy declined to decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unmatched {
+   /// Open a prompt, which is also what silent mode wants: `prompt` then auto-allows.
+   Prompt,
+   /// The socket is already gone and the owner asked for fail-closed.
+   DropClosed,
+   /// The socket is already gone and the owner asked for fail-open.
+   AllowClosed,
+   /// A multicast destination: never attributable, and it cannot leave the link.
+   AllowMulticast,
+}
+
+/// Decides an unmatched flow from what attribution learned and the owner's settings.
+fn unmatched(
+   connection: &Connection,
+   missing: Option<Missing>,
+   config: &Config,
+   mode: Mode,
+) -> Unmatched {
+   // Silent mode allows unmatched traffic by contract, closed socket or not.
+   if mode == Mode::Silent {
+      return Unmatched::Prompt;
+   }
+   if connection.remote.addr.is_multicast() {
+      return Unmatched::AllowMulticast;
+   }
+   match (missing, config.unattributable_closed_flow) {
+      (Some(Missing::SocketGone), ClosedFlowAction::Drop) => Unmatched::DropClosed,
+      (Some(Missing::SocketGone), ClosedFlowAction::Allow) => Unmatched::AllowClosed,
+      _ => Unmatched::Prompt,
+   }
+}
+
+/// A per-address one-line-per-gap log limiter.
+///
+/// It keeps a repeated line cheap on a machine that touches many addresses the cache or a
+/// scan never saw, without changing the fact that the condition happened.
 struct MissLimiter {
    last: HashMap<IpAddr, Instant>,
 }
@@ -1858,6 +1965,130 @@ mod tests {
             "{net:?} must not cover the neighbouring address {neighbour}"
          );
       }
+   }
+
+   /// A connection to `remote:port`, for the unmatched-flow decision tests.
+   fn unmatched_connection(remote: &str, port: u16) -> Connection {
+      let remote: IpAddr = remote.parse().expect("a remote address");
+      Connection {
+         family: match remote {
+            IpAddr::V4(_) => Family::V4,
+            IpAddr::V6(_) => Family::V6,
+         },
+         proto: L4Proto::Udp,
+         local: Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 51_234,
+         },
+         remote: Endpoint { addr: remote, port },
+         process: Attribution::Unknown,
+         domain: None,
+      }
+   }
+
+   #[test]
+   fn a_closed_flow_is_dropped_by_default() {
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            Some(Missing::SocketGone),
+            &Config::default(),
+            Mode::Alert,
+         ),
+         Unmatched::DropClosed
+      );
+   }
+
+   #[test]
+   fn a_closed_flow_can_be_allowed() {
+      let config = Config {
+         unattributable_closed_flow: ClosedFlowAction::Allow,
+         ..Config::default()
+      };
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            Some(Missing::SocketGone),
+            &config,
+            Mode::Alert,
+         ),
+         Unmatched::AllowClosed
+      );
+   }
+
+   #[test]
+   fn a_closed_flow_can_still_prompt() {
+      let config = Config {
+         unattributable_closed_flow: ClosedFlowAction::Prompt,
+         ..Config::default()
+      };
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            Some(Missing::SocketGone),
+            &config,
+            Mode::Alert,
+         ),
+         Unmatched::Prompt
+      );
+   }
+
+   #[test]
+   fn a_transient_miss_still_prompts() {
+      // A row existed but could not be resolved: the socket may still be alive, so the
+      // default must ask rather than drop.
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            Some(Missing::NotOurs),
+            &Config::default(),
+            Mode::Alert,
+         ),
+         Unmatched::Prompt
+      );
+      // No reason at all is not a closed socket either.
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            None,
+            &Config::default(),
+            Mode::Alert,
+         ),
+         Unmatched::Prompt
+      );
+   }
+
+   #[test]
+   fn an_unmatched_multicast_destination_is_allowed() {
+      // Even with the socket gone and the fail-closed default: a multicast destination is
+      // unattributable in principle and cannot leave the link.
+      for (remote, port) in [("224.0.0.251", 5353), ("ff02::fb", 5353)] {
+         assert_eq!(
+            unmatched(
+               &unmatched_connection(remote, port),
+               Some(Missing::SocketGone),
+               &Config::default(),
+               Mode::Alert,
+            ),
+            Unmatched::AllowMulticast,
+            "{remote}:{port} must be allowed without a prompt"
+         );
+      }
+   }
+
+   #[test]
+   fn silent_mode_allows_a_closed_flow() {
+      // `Prompt` is what auto-allows in silent mode, so the closed-flow default must not
+      // bypass silent mode's contract.
+      assert_eq!(
+         unmatched(
+            &unmatched_connection("93.184.216.34", 443),
+            Some(Missing::SocketGone),
+            &Config::default(),
+            Mode::Silent,
+         ),
+         Unmatched::Prompt
+      );
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
