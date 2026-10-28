@@ -371,6 +371,7 @@ mod tests {
             domain_candidates: Vec::new(),
          },
          timeout_secs: 30,
+         dests: Vec::new(),
          domain_scope_available: false,
          pending: 0,
       })

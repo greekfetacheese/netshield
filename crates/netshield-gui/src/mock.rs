@@ -164,6 +164,9 @@ fn prompt(id: u64, tick: usize, pending: usize) -> PromptRequest {
          domain_candidates: Vec::new(),
       },
       timeout_secs: PROMPT_TIMEOUT,
+      // The mock keeps the single-destination shape: the fallback fills this from
+      // `connection`, exactly as an older daemon's frame is handled.
+      dests: Vec::new(),
       // Only the named shape has a hostname, so only it may offer domain scope.
       domain_scope_available: domain.is_some(),
       pending,

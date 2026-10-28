@@ -172,7 +172,11 @@ impl App {
          if let Ok(mut model) = model_slot.lock()
             && model.prompt().map(|open| open.id) != Some(prompt.id)
          {
-            model.present(prompt.clone(), timeout, Instant::now());
+            model.present(
+               with_destinations(prompt.clone()),
+               timeout,
+               Instant::now(),
+            );
          }
          if let Some(ctx) = ctx_slot.lock().ok().and_then(|slot| slot.clone()) {
             let id = alert_viewport_id();
@@ -387,12 +391,39 @@ impl App {
       self.connected = connected;
    }
 
-   /// Queues one prompt, ignoring an id that is already queued.
+   /// Queues one prompt, replacing an earlier copy of the same id.
    ///
    /// The prompt is also presented to the alert model, which starts its countdown. The
    /// daemon only activates one prompt at a time, so a later one replaces the active alert.
+   /// [`with_destinations`] fills the destination list before the prompt is stored, so the
+   /// whole group the answer covers survives in the queue as well as in the alert.
+   ///
+   /// The daemon re-broadcasts the same id as destinations join its group, and the newer
+   /// copy is the truth: it replaces the pending entry in place, keeping its queue position
+   /// and the user's selection, but only when it names strictly more destinations, because
+   /// a reordered or duplicated broadcast must not shrink the list. The displayed prompt
+   /// earns a repaint; it must not raise or focus the window again.
    fn enqueue_prompt(&mut self, prompt: PromptRequest) {
-      if self.pending.iter().any(|queued| queued.id == prompt.id) {
+      let prompt = with_destinations(prompt);
+      if let Some(index) = self.pending.iter().position(|queued| queued.id == prompt.id) {
+         if prompt.dests.len() <= self.pending[index].dests.len() {
+            return;
+         }
+         log::info!(
+            "prompt {} grew to {} destinations",
+            prompt.id,
+            prompt.dests.len()
+         );
+         if self.model().prompt().map(|open| open.id) == Some(prompt.id) {
+            // Same id, so the selection and the raise guard are kept: the window is
+            // already up, and only its contents changed. The repaint is what makes the
+            // new destinations and labels visible before the next scheduled frame.
+            self.model().replace_prompt(prompt.clone());
+            if let Some(ctx) = self.ui_waker.lock().ok().and_then(|slot| slot.clone()) {
+               ctx.request_repaint();
+            }
+         }
+         self.pending[index] = prompt;
          return;
       }
       log::info!(
@@ -832,6 +863,18 @@ impl eframe::App for App {
    }
 }
 
+/// Fills a prompt's destination list, so the panel always sees what the answer covers.
+///
+/// A current daemon sends every destination; an older one leaves `dests` empty and its
+/// `connection` is the whole prompt, so the fallback keeps that prompt a single destination
+/// rather than an empty list the panel would have to special-case.
+fn with_destinations(mut prompt: PromptRequest) -> PromptRequest {
+   if prompt.dests.is_empty() {
+      prompt.dests = vec![prompt.connection.clone()];
+   }
+   prompt
+}
+
 /// The name the one alert viewport's id is hashed from.
 ///
 /// A single id for every prompt: the window is registered once and reused, so each new
@@ -961,8 +1004,26 @@ mod tests {
             domain_candidates: Vec::new(),
          },
          timeout_secs: 30,
+         dests: Vec::new(),
          domain_scope_available: true,
          pending: 0,
+      }
+   }
+
+   /// The same connection, for the destinations of a group.
+   fn destination(domain: &str) -> ConnectionView {
+      ConnectionView {
+         app_name: "firefox".to_owned(),
+         exe: None,
+         pid: Some(4242),
+         uid: Some(1000),
+         family: Family::V4,
+         proto: L4Proto::Tcp,
+         remote_ip: IpAddr::V4(Ipv4Addr::new(142, 250, 185, 78)),
+         remote_port: 443,
+         local_port: 51_000,
+         domain: Some(domain.to_owned()),
+         domain_candidates: Vec::new(),
       }
    }
 
@@ -974,6 +1035,87 @@ mod tests {
       assert_eq!(app.pending.len(), 1);
       assert_eq!(app.alerts.len(), 1);
       assert_eq!(app.prompt_deadlines.len(), 1);
+   }
+
+   /// A prompt with `count` destinations, all of the same connection.
+   fn group(id: u64, count: usize) -> PromptRequest {
+      let mut request = prompt(id);
+      request.dests = vec![destination("accounts.google.com"); count];
+      request
+   }
+
+   /// The daemon re-broadcasts a prompt as destinations join its group; the newer copy is
+   /// the truth and must replace the earlier one in place, including in the alert.
+   #[test]
+   fn a_prompt_that_grows_replaces_its_earlier_copy() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 1));
+      app.enqueue_prompt(group(7, 6));
+
+      assert_eq!(
+         app.pending.len(),
+         1,
+         "the growth is not a second prompt"
+      );
+      assert_eq!(
+         app.pending[0].id, 7,
+         "and it keeps its queue position"
+      );
+      assert_eq!(
+         app.pending[0].dests.len(),
+         6,
+         "the queue shows every destination of the grown group"
+      );
+      assert_eq!(
+         app.model().prompt().map(|open| open.dests.len()),
+         Some(6),
+         "the alert the window paints is the newer copy"
+      );
+      assert_eq!(
+         app.prompt_deadlines.len(),
+         1,
+         "the deadline bookkeeping is not duplicated"
+      );
+      assert_eq!(app.alerts.len(), 1);
+   }
+
+   /// A reordered or duplicated broadcast must not shrink a group the user is answering.
+   #[test]
+   fn a_repeat_that_would_shrink_is_ignored() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 6));
+      app.enqueue_prompt(group(7, 1));
+
+      assert_eq!(app.pending.len(), 1);
+      assert_eq!(
+         app.pending[0].dests.len(),
+         6,
+         "the six-destination list survives a shorter repeat"
+      );
+      assert_eq!(
+         app.model().prompt().map(|open| open.dests.len()),
+         Some(6)
+      );
+   }
+
+   #[test]
+   fn a_new_prompt_still_appends() {
+      let mut app = app();
+      app.enqueue_prompt(group(7, 1));
+      app.enqueue_prompt(group(8, 1));
+
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 7);
+      assert_eq!(app.pending[1].id, 8);
+
+      // A growth of the older prompt lands where that prompt already was: the queue the
+      // user sees does not reorder, and the newest prompt stays the active one.
+      app.enqueue_prompt(group(7, 6));
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 7);
+      assert_eq!(app.pending[0].dests.len(), 6);
+      assert_eq!(app.pending[1].id, 8);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(8));
    }
 
    #[test]
@@ -1091,6 +1233,50 @@ mod tests {
 
       app.remove_prompt(2);
       assert!(app.model().prompt().is_none());
+   }
+
+   #[test]
+   fn a_prompt_keeps_its_whole_destination_list_in_the_prompt_state() {
+      let mut app = app();
+      let mut request = prompt(1);
+      request.dests = vec![
+         destination("accounts.google.com"),
+         destination("ssl.gstatic.com"),
+      ];
+      app.enqueue_prompt(request);
+
+      let queued = &app.pending[0];
+      assert_eq!(
+         queued.dests.len(),
+         2,
+         "the queue keeps every destination"
+      );
+      let model = app.model();
+      let presented = model.prompt().expect("the alert is presented");
+      assert_eq!(
+         presented.dests.len(),
+         2,
+         "the alert state gets the whole group, not just the first destination"
+      );
+   }
+
+   #[test]
+   fn an_empty_dests_field_is_filled_from_the_first_destination() {
+      let mut app = app();
+      let request = prompt(1);
+      assert!(
+         request.dests.is_empty(),
+         "an older daemon omits the field"
+      );
+      app.enqueue_prompt(request);
+
+      let model = app.model();
+      let presented = model.prompt().expect("the alert is presented");
+      assert_eq!(
+         presented.dests,
+         vec![presented.connection.clone()],
+         "the fallback makes the prompt a single destination"
+      );
    }
 
    #[test]
