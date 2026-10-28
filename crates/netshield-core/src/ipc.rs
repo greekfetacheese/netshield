@@ -156,10 +156,20 @@ pub enum ScopeChoice {
 }
 
 /// A question the daemon puts to the user.
+///
+/// One prompt covers every destination of one application that is waiting on an answer, so
+/// the user decides a page's several origins once instead of once per origin. `connection`
+/// is kept as the first destination for a client that predates `dests`; a current client
+/// lists `dests`, which is every destination the answer will cover. `dests` defaults to
+/// empty so an older daemon's frame still decodes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptRequest {
    pub id: u64,
+   /// The first destination, retained for older readers.
    pub connection: ConnectionView,
+   /// Every destination the answer will cover.
+   #[serde(default)]
+   pub dests: Vec<ConnectionView>,
    pub timeout_secs: u64,
    /// False when no name was learned, so the UI disables domain scope rather than
    /// guessing one.
@@ -370,6 +380,7 @@ mod tests {
          Response::Prompt(PromptRequest {
             id: 1,
             connection: view(),
+            dests: vec![view()],
             timeout_secs: 30,
             domain_scope_available: true,
             pending: 2,
@@ -429,6 +440,33 @@ mod tests {
          let decoded = decode_line::<Response>(&bytes).expect("decodable response");
          assert_eq!(decoded, response);
       }
+   }
+
+   /// A frame from a daemon that predates `dests` must still decode, with an empty list
+   /// rather than a missing field error; the retained `connection` is what such a client
+   /// shows.
+   #[test]
+   fn a_prompt_frame_without_dests_decodes_with_an_empty_vec() {
+      let mut frame = serde_json::to_value(Response::Prompt(PromptRequest {
+         id: 3,
+         connection: view(),
+         dests: vec![view(), view()],
+         timeout_secs: 30,
+         domain_scope_available: true,
+         pending: 0,
+      }))
+      .expect("serialisable response");
+      let body = frame.get_mut("value").expect("the prompt is the variant's value");
+      body.as_object_mut().expect("a prompt is an object").remove("dests");
+
+      let bytes = encode_line(&frame).expect("serialisable frame");
+      let Response::Prompt(prompt) = decode_line::<Response>(&bytes).expect("decodable frame")
+      else {
+         panic!("the frame is a prompt");
+      };
+      assert!(prompt.dests.is_empty());
+      assert_eq!(prompt.connection, view());
+      assert_eq!(prompt.id, 3);
    }
 
    #[test]
