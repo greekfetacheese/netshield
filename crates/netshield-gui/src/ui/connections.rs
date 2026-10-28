@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Color32, FontId, Rect, Response, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
+use elegance::{Indicator, IndicatorState};
 use netshield_core::rule::{Rule, RuleId};
 
 use crate::connlog::{ConnectionLog, Row, clock};
@@ -23,14 +24,18 @@ const LINE_HEIGHT: f32 = 24.0;
 /// The column-header line above the list.
 const HEADER_HEIGHT: f32 = 18.0;
 
-/// Whitespace between two columns.
+/// Whitespace between the Rule and Activity columns; Activity holds short labels.
 const COLUMN_GAP: f32 = 12.0;
+
+/// Whitespace between the Connection and Rule columns: names and rule labels are both long,
+/// so the boundary needs to read as a boundary rather than as another space inside a cell.
+const CONNECTION_GAP: f32 = 32.0;
 
 /// The chevron's tip on an application line: the centre of its click band.
 const APP_CHEVRON_X: f32 = 11.0;
 
 /// Where an application row's name starts, past the painted chevron: the click band's right
-/// edge, so the name sits just above the destination text it owns. The verdict dot is
+/// edge, so the name sits just above the destination text it owns. The verdict indicator is
 /// measured from the end of that `name count` text, not from a fixed column.
 const APP_NAME_X: f32 = 22.0;
 
@@ -42,15 +47,15 @@ const DEST_NAME_X: f32 = 44.0;
 /// Where a connection line's text starts: under the destination it belongs to.
 const CONN_TEXT_X: f32 = 56.0;
 
-/// Where the verdict dot's centre sits past the end of the `<name> <count>` text.
-const DOT_GAP: f32 = 7.0;
+/// Where the verdict indicator's centre sits past the end of the `<name> <count>` text.
+const DOT_GAP: f32 = 8.0;
 
-/// The painted verdict dot's diameter; it stays a 3.5 radius circle.
-const DOT_SIZE: f32 = 7.0;
+/// The verdict indicator's diameter: the same 9 points the shell's own indicator uses.
+const DOT_SIZE: f32 = 9.0;
 
-/// Room the name galley leaves for the gap and the dot, so the dot cannot fall outside the
+/// Room the name galley leaves for the gap and the indicator, so it cannot fall outside the
 /// Connection column however long the name is.
-const DOT_SPACE: f32 = 18.0;
+const DOT_SPACE: f32 = 22.0;
 
 /// Width of the chevron's click band on a group line; it ends at the row's name.
 const CHEVRON_HIT: f32 = 22.0;
@@ -179,6 +184,7 @@ pub enum Selection {
       app: String,
       at: u64,
       addr: String,
+      proto: String,
    },
 }
 
@@ -259,6 +265,9 @@ pub struct Conn {
    /// Whether `dest` came from a resolved domain rather than an address.
    pub domain: bool,
    pub allowed: bool,
+   /// How many identical flows this row stands for: `1` for a single connection, `N` when `N`
+   /// flows shared the same endpoint, protocol and verdict.
+   pub repeat: usize,
    pub via_prompt: bool,
    pub candidate: Option<String>,
    /// `allow example.com`, `deny anywhere`, … or `—` when the rule is gone.
@@ -377,13 +386,17 @@ pub fn show(
                         app: conn.app.clone(),
                         at: conn.at,
                         addr: conn.addr.clone(),
+                        proto: conn.proto.clone(),
                      };
                      ui.ctx().request_repaint();
                   }
                   let selected = matches!(
                      selection,
-                     Selection::Conn { app, at, addr }
-                        if app == &conn.app && *at == conn.at && addr == &conn.addr
+                     Selection::Conn { app, at, addr, proto }
+                        if app == &conn.app
+                           && *at == conn.at
+                           && addr == &conn.addr
+                           && proto == &conn.proto
                   );
                   conn_row(ui, &response, &columns, conn, selected, now);
                }
@@ -439,7 +452,7 @@ impl Columns {
       let activity_x = (width - ROW_PAD - ACTIVITY_WIDTH).max(0.0);
       let rule_x = (activity_x - COLUMN_GAP - RULE_WIDTH).max(CONN_TEXT_X + CONNECTION_MIN);
       let rule = (activity_x - COLUMN_GAP - rule_x).max(0.0);
-      let connection = (rule_x - COLUMN_GAP).max(0.0);
+      let connection = (rule_x - CONNECTION_GAP).max(0.0);
       Self {
          connection,
          rule,
@@ -473,7 +486,7 @@ impl Cells<'_> {
 }
 
 /// The width a group line's `<name> <count>` galley may use, i.e. the Connection column
-/// less the name's start and the room the verdict dot needs.
+/// less the name's start and the room the verdict indicator needs.
 fn name_width_limit(columns: &Columns, name_x: f32) -> f32 {
    (columns.connection - name_x - DOT_SPACE).max(0.0)
 }
@@ -499,18 +512,43 @@ fn truncation_hint(
    }
 }
 
-/// The verdict dot's rectangle on a group line.
+/// The verdict indicator's rectangle on a group line.
 ///
 /// Measured from the row's left edge like every other cell, and from the end of the laid-out
-/// `name count` text: a dot pinned to a column instead sits in the middle of the row and,
-/// once the detail pane narrows the columns, on top of the application's own name.
-fn dot_rect(row: Rect, name_x: f32, name_width: f32) -> Rect {
+/// `name count` text; `center_y` is the *count label's* centre, not the row's, because the
+/// label is a smaller font sharing the name's baseline and therefore sits lower.
+fn indicator_rect(row: Rect, name_x: f32, name_width: f32, center_y: f32) -> Rect {
    Rect::from_center_size(
       pos2(
          row.left() + name_x + name_width + DOT_GAP,
-         row.center().y,
+         center_y,
       ),
       vec2(DOT_SIZE, DOT_SIZE),
+   )
+}
+
+/// The centre of a glyph's own box: its ascent above the baseline, its descent below.
+fn glyph_center_y(baseline: f32, ascent: f32, height: f32) -> f32 {
+   baseline - ascent + height / 2.0
+}
+
+/// The screen-space centre of a group line's trailing count label.
+///
+/// The trailing glyph carries the small font's own metrics — `pos.y` is its baseline, and
+/// `font_ascent` / `font_height` give its box — so the light can sit on the label's line.
+/// Falls back to the galley's own centre for an empty or fully truncated line.
+fn count_center_y(galley: &egui::Galley, text_top: f32) -> f32 {
+   let centre = text_top + galley.size().y / 2.0;
+   let Some(row) = galley.rows.first() else {
+      return centre;
+   };
+   let Some(glyph) = row.row.glyphs.last() else {
+      return centre;
+   };
+   glyph_center_y(
+      text_top + row.pos.y + glyph.pos.y,
+      glyph.font_ascent,
+      glyph.font_height,
    )
 }
 
@@ -646,7 +684,8 @@ fn dest_row(
    );
 }
 
-/// Paints a group line's cells: chevron, `name count`, verdict dot, rule and activity pill.
+/// Paints a group line's cells: chevron, `name count`, verdict indicator, rule and activity
+/// pill.
 fn group_row(
    ui: &mut Ui,
    response: &Response,
@@ -657,7 +696,7 @@ fn group_row(
    now: u64,
 ) {
    let rect = response.rect;
-   let visuals = ui.visuals();
+   let visuals = ui.visuals().clone();
    let fill = if selected {
       visuals.selection.bg_fill
    } else if response.hovered() {
@@ -665,7 +704,7 @@ fn group_row(
    } else {
       visuals.faint_bg_color
    };
-   let painter = ui.painter();
+   let painter = ui.painter().clone();
    painter.rect_filled(rect, 0.0, fill);
 
    let weak = visuals.weak_text_color();
@@ -711,26 +750,40 @@ fn group_row(
    );
    let galley = painter.layout_job(name);
    let name_width = galley.size().x;
+   let text_top = center_y - galley.size().y / 2.0;
    painter.galley(
-      pos2(
-         rect.left() + line.name_x,
-         center_y - galley.size().y / 2.0,
-      ),
-      galley,
+      pos2(rect.left() + line.name_x, text_top),
+      galley.clone(),
       line.name_colour,
    );
    truncation_hint(
       response,
-      painter,
+      &painter,
       name_limit,
       &format!("{} {}", line.name, count),
       &line.name_font,
    );
 
-   let dot_colour = if line.denied { DENIED } else { ALLOWED };
-   let dot = dot_rect(rect, line.name_x, name_width);
-   painter.circle_filled(dot.center(), 3.5, dot_colour);
-   let cells = Cells { painter, rect };
+   let indicator = indicator_rect(
+      rect,
+      line.name_x,
+      name_width,
+      count_center_y(&galley, text_top),
+   );
+   let state = if line.denied {
+      IndicatorState::Off
+   } else {
+      IndicatorState::On
+   };
+   // A child ui, not `ui.put`: placing a widget with `put` moves the row's own cursor to
+   // the widget's bottom, so every following row would start inside this one and the list
+   // would lose its `LINE_HEIGHT` pitch.
+   let mut light = ui.new_child(egui::UiBuilder::new().max_rect(indicator));
+   light.add(Indicator::new(state).size(DOT_SIZE));
+   let cells = Cells {
+      painter: &painter,
+      rect,
+   };
    let rule_width = (columns.rule).max(0.0);
    cells.text(
       columns.rule_x,
@@ -740,9 +793,16 @@ fn group_row(
       visuals.text_color(),
       false,
    );
-   truncation_hint(response, painter, rule_width, line.rule, &body);
+   truncation_hint(response, &painter, rule_width, line.rule, &body);
 
-   activity_pill(painter, columns, rect, line.last_at, now, visuals);
+   activity_pill(
+      &painter,
+      columns,
+      rect,
+      line.last_at,
+      now,
+      &visuals,
+   );
 }
 
 /// One connection row. The endpoint reads in the normal text colour, the protocol part weak
@@ -790,6 +850,13 @@ fn conn_row(
       0.0,
       TextFormat::simple(body.clone(), verdict_colour),
    );
+   if conn.repeat > 1 {
+      job.append(
+         &format!(" ×{}", conn.repeat),
+         0.0,
+         TextFormat::simple(body.clone(), weak),
+      );
+   }
    let galley = painter.layout_job(job);
    painter.galley(
       pos2(
@@ -978,10 +1045,20 @@ impl<'a> Detail<'a> {
             // The destination may be past the app's child cap; the app's own details are
             // still the honest answer, so the pane does not blink out of existence.
             .or_else(|| Self::app(lines, app)),
-         Selection::Conn { app, at, addr } => lines
+         Selection::Conn {
+            app,
+            at,
+            addr,
+            proto,
+         } => lines
             .iter()
             .find_map(|line| match line {
-               Line::Conn(conn) if &conn.app == app && conn.at == *at && &conn.addr == addr => {
+               Line::Conn(conn)
+                  if &conn.app == app
+                     && conn.at == *at
+                     && &conn.addr == addr
+                     && &conn.proto == proto =>
+               {
                   Some(Self {
                      process: conn.exe.as_deref(),
                      dest: Some(&conn.dest),
@@ -1162,17 +1239,18 @@ fn build_lines(
          if !expanded.contains(&dest_node) {
             continue;
          }
+         let unique = unique_conns(conns);
          let shown_conns = if showing_all.contains(&dest_node) {
-            conns.len()
+            unique.len()
          } else {
-            MAX_CHILDREN.min(conns.len())
+            MAX_CHILDREN.min(unique.len())
          };
-         for row in conns.iter().take(shown_conns) {
-            lines.push(Line::Conn(conn(row, rules)));
+         for (row, repeat) in unique.iter().take(shown_conns) {
+            lines.push(Line::Conn(conn(row, *repeat, rules)));
          }
-         if conns.len() > shown_conns {
+         if unique.len() > shown_conns {
             lines.push(Line::More {
-               remaining: conns.len() - shown_conns,
+               remaining: unique.len() - shown_conns,
                node: dest_node,
             });
          }
@@ -1208,8 +1286,34 @@ fn dest_groups<'a>(rows: &[&'a Row]) -> Vec<(&'a str, Vec<&'a Row>)> {
    groups
 }
 
+/// One destination's connections collapsed to unique flows, newest first.
+///
+/// A resolver or a browser opens the same `addr:port` flow dozens of times, and dozens of
+/// identical rows bury the one that is new. Each entry is the newest row of its group plus how
+/// many flows it stands for; the destination line keeps the raw total on its own count.
+fn unique_conns<'a>(conns: &[&'a Row]) -> Vec<(&'a Row, usize)> {
+   let mut unique: Vec<(&'a Row, usize)> = Vec::new();
+   let mut index: HashMap<(String, String, bool, bool), usize> = HashMap::new();
+   for row in conns {
+      let key = (
+         row.addr.clone(),
+         row.proto.clone(),
+         row.allowed,
+         row.via_prompt,
+      );
+      match index.get(&key).copied() {
+         Some(slot) => unique[slot].1 += 1,
+         None => {
+            index.insert(key, unique.len());
+            unique.push((row, 1));
+         }
+      }
+   }
+   unique
+}
+
 /// Flattens one log row, resolving its rule id against the current rule list.
-fn conn(row: &Row, rules: &[Rule]) -> Conn {
+fn conn(row: &Row, repeat: usize, rules: &[Rule]) -> Conn {
    Conn {
       app: row.app.clone(),
       at: row.at,
@@ -1218,6 +1322,7 @@ fn conn(row: &Row, rules: &[Rule]) -> Conn {
       proto: row.proto.clone(),
       domain: row.dest.parse::<std::net::IpAddr>().is_err(),
       allowed: row.allowed,
+      repeat,
       via_prompt: row.via_prompt,
       candidate: row.candidate.clone(),
       rule: rule_label(row.rule_id.as_ref(), rules),
@@ -1247,12 +1352,16 @@ fn count_label(count: usize) -> String {
 
 /// One connection line's full text, untruncated: the endpoint, the protocol and the verdict.
 fn conn_line_text(conn: &Conn) -> String {
-   format!(
+   let mut text = format!(
       "{} · {} · {}",
       conn.addr,
       conn.proto,
       verdict_label(conn)
-   )
+   );
+   if conn.repeat > 1 {
+      text.push_str(&format!(" ×{}", conn.repeat));
+   }
+   text
 }
 
 /// `ALLOWED`, `ALLOWED (prompt)`, `DENIED`, or `DENIED (prompt)`.
@@ -1559,13 +1668,23 @@ mod tests {
       );
    }
 
+   /// A log of `count` flows to one destination, each with its own address, so none collapse.
+   fn distinct_flows(count: u64) -> ConnectionLog {
+      let mut history = ConnectionLog::new(64);
+      for at in 0..count {
+         let mut row = event(at, "firefox", "a.example");
+         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
+         history.push(&row);
+      }
+      history
+   }
+
    #[test]
    fn a_group_shows_eight_connections_then_the_remainder() {
       let app = Node::app("firefox");
       let host = Node::dest("firefox", "a.example");
-      let eight: Vec<(u64, &str, &str)> = (0..8).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&eight),
+         &distinct_flows(8),
          &[],
          &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
@@ -1577,9 +1696,8 @@ mod tests {
       );
       assert!(matches!(lines[9], Line::Conn(_)));
 
-      let nine: Vec<(u64, &str, &str)> = (0..9).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&nine),
+         &distinct_flows(9),
          &[],
          &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
@@ -1597,9 +1715,8 @@ mod tests {
          }
       );
 
-      let ten: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&ten),
+         &distinct_flows(10),
          &[],
          &expanded_set(&[app, host.clone()]),
          &ShowingAll::default(),
@@ -1617,9 +1734,8 @@ mod tests {
    #[test]
    fn eleven_connections_are_capped_with_an_exact_remainder() {
       let host = Node::dest("firefox", "a.example");
-      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&events),
+         &distinct_flows(11),
          &[],
          &expanded_set(&[Node::app("firefox"), host.clone()]),
          &ShowingAll::default(),
@@ -1648,9 +1764,8 @@ mod tests {
 
    #[test]
    fn showing_all_reveals_every_connection_and_no_more_line() {
-      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&events),
+         &distinct_flows(11),
          &[],
          &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
          &showing_all_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
@@ -1726,17 +1841,14 @@ mod tests {
       );
       assert_eq!(
          open.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
-         2,
-         "only the open destination's rows are drawn"
+         1,
+         "only the open destination's rows are drawn, and its identical flows collapse"
       );
-      assert!(
-         open
-            .iter()
-            .filter_map(|line| match line {
-               Line::Conn(conn) => Some(conn.dest.as_str()),
-               _ => None,
-            })
-            .eq(["a.example", "a.example"])
+      let listed = conn(&open, 3);
+      assert_eq!(listed.dest, "a.example");
+      assert_eq!(
+         listed.repeat, 2,
+         "both of a.example's flows are counted"
       );
    }
 
@@ -1783,10 +1895,10 @@ mod tests {
          "the app's More row opens the app"
       );
 
-      let conns: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
+      let conns = distinct_flows(10);
       let host = Node::dest("firefox", "a.example");
       let lines = build_lines(
-         &log(&conns),
+         &conns,
          &[],
          &expanded_set(&[Node::app("firefox"), host.clone()]),
          &ShowingAll::default(),
@@ -1961,6 +2073,7 @@ mod tests {
             app: "firefox".to_owned(),
             at: 10,
             addr: "203.0.113.9:443".to_owned(),
+            proto: "tcp".to_owned(),
          },
       )
       .expect("the first connection resolves");
@@ -1970,12 +2083,30 @@ mod tests {
             app: "firefox".to_owned(),
             at: 10,
             addr: "203.0.113.10:443".to_owned(),
+            proto: "tcp".to_owned(),
          },
       )
       .expect("the second connection resolves");
 
       assert_eq!(first.dest, Some("a.example"));
       assert_eq!(second.dest, Some("203.0.113.10"));
+
+      // Same app and timestamp, same address, other protocol: no connection matches, so the
+      // pane falls back to the app rather than to the address's row.
+      let other_proto = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "udp".to_owned(),
+         },
+      )
+      .expect("the app's own details are the fallback");
+      assert_eq!(
+         other_proto.dest, None,
+         "the protocol disambiguates the address"
+      );
    }
 
    #[test]
@@ -2085,31 +2216,44 @@ mod tests {
    }
 
    #[test]
-   fn the_verdict_dot_follows_the_count() {
+   fn the_indicator_follows_the_count_and_the_callers_line() {
       let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
 
-      let dot = dot_rect(row, APP_NAME_X, 50.0);
+      let indicator = indicator_rect(row, APP_NAME_X, 50.0, row.center().y + 1.5);
 
-      // Row-relative and text-relative: the pre-fix code painted at an absolute column x, so
-      // the dot sat ~195px from its column and landed on the name once the columns shrank.
+      // Row-relative and text-relative: the pre-fix code painted at an absolute column x.
       assert_eq!(
-         dot.center().x,
+         indicator.center().x,
          100.0 + APP_NAME_X + 50.0 + DOT_GAP
       );
-      assert!(
-         dot.left() > 100.0 + APP_NAME_X,
-         "the dot trails the name, it does not sit on it: {dot:?}"
-      );
       assert_eq!(
-         dot.center().y,
-         row.center().y,
-         "the dot is vertically centred"
+         indicator.width(),
+         DOT_SIZE,
+         "the widget's own diameter is the rect's width"
+      );
+      assert!(
+         indicator.center().y > row.center().y,
+         "the caller's centre is honoured, not the row's"
       );
    }
 
    #[test]
-   fn a_single_connection_reads_as_a_word() {
-      assert_eq!(count_label(1), "1 connection");
+   fn a_smaller_label_shares_the_baseline_but_sits_lower() {
+      // One LayoutJob puts both fonts on one baseline, so the 11px count's box centre is
+      // below the 13px name's — which is why a light centred on the row read as higher than
+      // the label it qualifies.
+      let name = glyph_center_y(100.0, 10.4, 13.0);
+      let count = glyph_center_y(100.0, 8.8, 11.0);
+      assert_eq!(count, 96.7);
+      assert!(
+         count > name,
+         "the label's centre is lower: {count} vs {name}"
+      );
+   }
+
+   #[test]
+   fn a_count_reads_as_a_bare_number() {
+      assert_eq!(count_label(1), "1");
       assert_eq!(count_label(12), "12");
    }
 
@@ -2126,6 +2270,7 @@ mod tests {
          &ShowingAll::default(),
       );
       let allowed = conn(&lines, 2);
+      assert_eq!(allowed.repeat, 1, "a lone flow stands for itself");
       assert_eq!(
          conn_line_text(allowed),
          "140.82.121.6:443 · tcp · ALLOWED"
@@ -2174,14 +2319,14 @@ mod tests {
    }
 
    #[test]
-   fn the_name_width_leaves_room_for_the_dot() {
+   fn the_name_width_leaves_room_for_the_indicator() {
       let columns = Columns::new(900.0);
 
       let limit = name_width_limit(&columns, APP_NAME_X);
 
       assert!(
          limit + APP_NAME_X + DOT_SPACE == columns.connection,
-         "the galley must stop short of the dot: limit {limit}, column {}",
+         "the galley must stop short of the indicator: limit {limit}, column {}",
          columns.connection
       );
       assert!(limit > 0.0, "a 900px row has room for a name");
@@ -2190,7 +2335,212 @@ mod tests {
       let limit = name_width_limit(&columns, DEST_NAME_X);
       assert!(
          limit + DEST_NAME_X + DOT_SPACE == columns.connection,
-         "a destination's galley stops short of its dot too"
+         "a destination's galley stops short of its indicator too"
+      );
+   }
+
+   #[test]
+   fn the_columns_keep_their_own_gaps() {
+      let columns = Columns::new(900.0);
+
+      assert_eq!(
+         columns.rule_x - columns.connection,
+         CONNECTION_GAP,
+         "the Connection column stops one wide gap short of Rule"
+      );
+      assert_eq!(
+         columns.rule, RULE_WIDTH,
+         "the Rule column keeps its width"
+      );
+      assert_eq!(
+         columns.activity_x - (columns.rule_x + columns.rule),
+         COLUMN_GAP,
+         "Rule and Activity stay a normal gap apart"
+      );
+   }
+
+   /// Four flows to one destination: one older udp flow and three identical tcp ones.
+   fn repeated_flows() -> ConnectionLog {
+      let mut udp = event(5, "firefox", "a.example");
+      udp.connection.proto = L4Proto::Udp;
+      let mut history = ConnectionLog::new(8);
+      history.push(&udp);
+      for at in [10, 20, 30] {
+         history.push(&event(at, "firefox", "a.example"));
+      }
+      history
+   }
+
+   #[test]
+   fn repeated_flows_collapse_into_one_counted_row() {
+      let history = repeated_flows();
+      let rows: Vec<&Row> = history.rows().rev().collect();
+      let unique = unique_conns(&rows);
+      assert_eq!(unique.len(), 2, "two distinct flows");
+      assert_eq!(unique[0].1, 3, "three identical tcp flows");
+      assert_eq!(
+         unique[0].0.at, 30,
+         "the group keeps its newest row"
+      );
+
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      let conns: Vec<&Conn> = lines
+         .iter()
+         .filter_map(|line| match line {
+            Line::Conn(conn) => Some(conn),
+            _ => None,
+         })
+         .collect();
+      assert_eq!(conns.len(), 2, "one row per distinct flow");
+      assert_eq!(conns[0].repeat, 3);
+      assert_eq!(conns[0].at, 30);
+      assert_eq!(conns[1].repeat, 1);
+   }
+
+   #[test]
+   fn the_group_keeps_the_raw_connection_count() {
+      let lines = build_lines(
+         &repeated_flows(),
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+
+      assert_eq!(group(&lines, 0), ("firefox", 4, 30));
+      assert_eq!(dest(&lines, 1), ("a.example", 4, 30));
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         2,
+         "the third level collapses even though the totals do not"
+      );
+   }
+
+   #[test]
+   fn the_cap_counts_unique_flows() {
+      let app = Node::app("firefox");
+      let host = Node::dest("firefox", "a.example");
+
+      let identical: Vec<(u64, &str, &str)> =
+         (0..10).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(
+         &log(&identical),
+         &[],
+         &expanded_set(&[app.clone(), host.clone()]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         1,
+         "ten identical flows are one collapsed row"
+      );
+      assert!(
+         !lines.iter().any(|line| matches!(line, Line::More { .. })),
+         "one unique flow fits under the cap"
+      );
+
+      let mut distinct = ConnectionLog::new(16);
+      for at in 0..10 {
+         let mut row = event(at, "firefox", "a.example");
+         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
+         distinct.push(&row);
+      }
+      let lines = build_lines(
+         &distinct,
+         &[],
+         &expanded_set(&[app, host.clone()]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         MAX_CHILDREN,
+         "ten distinct addresses still fill the cap"
+      );
+      assert_eq!(
+         lines[MAX_CHILDREN + 2],
+         Line::More {
+            remaining: 2,
+            node: host
+         },
+         "the remainder counts the unique flows past the cap"
+      );
+   }
+
+   #[test]
+   fn a_connection_is_selected_by_its_protocol_too() {
+      let mut tcp = event(10, "firefox", "a.example");
+      tcp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      let mut udp = event(10, "firefox", "a.example");
+      udp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      udp.connection.proto = L4Proto::Udp;
+      udp.allowed = false;
+      let mut history = ConnectionLog::new(8);
+      history.push(&tcp);
+      history.push(&udp);
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+
+      let tcp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "tcp".to_owned(),
+         },
+      )
+      .expect("the tcp connection resolves");
+      let udp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "udp".to_owned(),
+         },
+      )
+      .expect("the udp connection resolves");
+
+      assert_eq!(tcp_detail.verdict, Some(true));
+      assert_eq!(udp_detail.verdict, Some(false));
+   }
+
+   #[test]
+   fn a_repeated_flow_says_how_many_it_stands_for() {
+      let lines = build_lines(
+         &repeated_flows(),
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      let conns: Vec<&Conn> = lines
+         .iter()
+         .filter_map(|line| match line {
+            Line::Conn(conn) => Some(conn),
+            _ => None,
+         })
+         .collect();
+
+      let repeated = conns
+         .iter()
+         .find(|conn| conn.repeat == 3)
+         .expect("the collapsed group is present");
+      assert!(
+         conn_line_text(repeated).ends_with("×3"),
+         "the hint carries the collapsed count"
+      );
+      let single = conns.iter().find(|conn| conn.repeat == 1).expect("the single flow is present");
+      assert!(
+         !conn_line_text(single).contains('×'),
+         "a single flow has no count"
       );
    }
 }
