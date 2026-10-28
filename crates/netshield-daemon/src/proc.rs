@@ -545,8 +545,12 @@ impl Attributor {
       let senders = self.senders.as_ref()?;
       let uid = uid?;
       let pid = senders.recent_sender(uid, remote)?;
-      if read_pid_uid(pid) != Some(uid) {
-         debug!("send registry named pid {pid} for {remote:?} but /proc disagrees on its uid");
+      let owner = read_pid_uid(pid);
+      if owner != Some(uid) {
+         debug!(
+            "send registry named pid {pid} for {remote:?}, but the packet's uid is {uid} and \
+             /proc says that pid is {owner:?}"
+         );
          return None;
       }
       let process = self.process_identity(pid, uid)?;
