@@ -36,12 +36,6 @@ const SENDTO: &str = "sys_enter_sendto";
 /// The tracepoint whose `sockaddr` argument is read for a connect.
 const CONNECT: &str = "sys_enter_connect";
 
-/// The kernel's list of online CPUs.
-const CPU_ONLINE: &str = "/sys/devices/system/cpu/online";
-
-/// A sanity bound on how many CPUs one registry may attach to.
-const MAX_CPUS: usize = 4096;
-
 // eBPF opcode pieces, from `include/uapi/linux/bpf.h`.
 const BPF_LD: u8 = 0x00;
 const BPF_LDX: u8 = 0x01;
@@ -303,8 +297,6 @@ impl SendRegistry {
          planned.push((offset, id));
       }
 
-      let cpus = online_cpus()?;
-
       let attr = syscall::MapCreate {
          map_type: syscall::BPF_MAP_TYPE_HASH,
          key_size: std::mem::size_of::<FlowKey>() as u32,
@@ -343,19 +335,7 @@ impl SendRegistry {
                }
             })?;
             progs.push(prog_fd);
-            for &cpu in &cpus {
-               let event = syscall::perf_event_open_tracepoint(*id, cpu).map_err(|err| {
-                  RegistryError::Syscall(format!(
-                     "perf_event_open(tracepoint {id}, cpu {cpu}): {err}"
-                  ))
-               })?;
-               events.push(event);
-               syscall::perf_enable(event, prog_fd).map_err(|err| {
-                  RegistryError::Syscall(format!(
-                     "attaching tracepoint {id} on cpu {cpu}: {err}"
-                  ))
-               })?;
-            }
+            Self::attach_tracepoint(*id, prog_fd, &mut events)?;
          }
          Ok(())
       })();
@@ -376,9 +356,8 @@ impl SendRegistry {
          syscall::close_owned(prog);
       }
       info!(
-         "send registry active: {} probes on {} cpus",
-         planned.len(),
-         cpus.len()
+         "send registry active: {} tracepoints attached",
+         planned.len()
       );
       Ok(Self {
          map_fd,
@@ -386,6 +365,25 @@ impl SendRegistry {
          hits: AtomicU64::new(0),
          misses: AtomicU64::new(0),
       })
+   }
+
+   /// Opens the single perf event that carries `prog_fd` for the tracepoint `id`, and keeps
+   /// its descriptor in `events` so it outlives the call.
+   ///
+   /// An `EEXIST` from either syscall means another program already owns this tracepoint's
+   /// program slot; that is reported like any other attach failure, so the caller runs with
+   /// `/proc` attribution alone instead of treating it as fatal.
+   fn attach_tracepoint(id: i32, prog_fd: i32, events: &mut Vec<i32>) -> Result<(), RegistryError> {
+      // One event per tracepoint, not per cpu: the kernel stores a tracepoint's BPF program on the
+      // tracepoint itself, so a second perf event for the same id fails with EEXIST and the first
+      // one already runs for every occurrence on every cpu. Measured: a sender pinned to cpu 3 is
+      // still recorded by an event opened on cpu 0.
+      let event = syscall::perf_event_open_tracepoint(id, 0).map_err(|err| {
+         RegistryError::Syscall(format!("perf_event_open(tracepoint {id}): {err}"))
+      })?;
+      events.push(event);
+      syscall::perf_enable(event, prog_fd)
+         .map_err(|err| RegistryError::Syscall(format!("attaching tracepoint {id}: {err}")))
    }
 
    /// The pid that sent to `remote` from `uid` within [`SENDER_TTL_NS`], if the kernel
@@ -479,48 +477,6 @@ fn tracefs_root() -> Option<PathBuf> {
       .iter()
       .map(PathBuf::from)
       .find(|root| root.join("events").is_dir())
-}
-
-/// The CPUs a probe must be attached to.
-///
-/// The online list is preferred because it names ids, not a count: a machine with CPU 1
-/// offline has a count that no contiguous range of ids matches. The count is only a
-/// fallback for a kernel that does not export the list.
-fn online_cpus() -> Result<Vec<i32>, RegistryError> {
-   if let Some(cpus) = fs::read_to_string(CPU_ONLINE).ok().and_then(|text| parse_cpu_list(&text)) {
-      return Ok(cpus);
-   }
-   let count = std::thread::available_parallelism()
-      .map_err(|err| RegistryError::Unavailable(format!("cannot size the cpu set: {err}")))?;
-   let count = i32::try_from(count.get())
-      .map_err(|_| RegistryError::Unavailable("cpu count does not fit in i32".to_string()))?;
-   Ok((0..count).collect())
-}
-
-/// Parses the kernel's CPU list syntax (`0-3,6,8-9`) into ids.
-///
-/// Returns `None` on anything unexpected — a malformed list is not a reason to guess which
-/// CPUs exist.
-fn parse_cpu_list(text: &str) -> Option<Vec<i32>> {
-   let mut cpus = Vec::new();
-   for part in text.trim().split(',') {
-      let (first, last) = match part.trim().split_once('-') {
-         Some((first, last)) => (first.trim(), last.trim()),
-         None => (part.trim(), part.trim()),
-      };
-      let first: i32 = first.parse().ok()?;
-      let last: i32 = last.parse().ok()?;
-      if first < 0 || last < first || last - first >= MAX_CPUS as i32 {
-         return None;
-      }
-      for cpu in first..=last {
-         if cpus.len() >= MAX_CPUS {
-            return None;
-         }
-         cpus.push(cpu);
-      }
-   }
-   if cpus.is_empty() { None } else { Some(cpus) }
 }
 
 /// Reads the `offset:` of the field whose type names a `sockaddr`.
@@ -624,6 +580,27 @@ mod tests {
       assert!(!is_fresh(0, SENDER_TTL_NS + 1));
       // A stamp from the future means the clock moved; treat it as stale.
       assert!(!is_fresh(SENDER_TTL_NS, 0));
+   }
+
+   #[test]
+   fn the_attach_reports_the_tracepoint_it_could_not_attach() {
+      // perf_event_open needs CAP_PERFMON/CAP_SYS_ADMIN, so without root this asserts
+      // nothing about the tracepoint id; the failure the daemon must survive is the
+      // unprivileged one, which `open()` already falls back from.
+      if crate::ipc_server::effective_uid() != Some(0) {
+         return;
+      }
+      let mut events = Vec::new();
+      let err = SendRegistry::attach_tracepoint(i32::MAX, -1, &mut events)
+         .expect_err("tracepoint i32::MAX cannot exist");
+      assert!(
+         err.to_string().contains(&i32::MAX.to_string()),
+         "the failure must name the tracepoint: {err}"
+      );
+      assert!(
+         events.is_empty(),
+         "no descriptor is kept for a failed attach"
+      );
    }
 
    #[test]
