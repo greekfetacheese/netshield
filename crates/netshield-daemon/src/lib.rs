@@ -13,6 +13,7 @@
 //! together on a live machine.
 
 pub mod daemon;
+pub mod ebpf;
 pub mod firewall;
 pub mod ipc_server;
 pub mod logging;

@@ -39,6 +39,7 @@ use netshield_core::packet::{L4Payload, ParsedPacket, parse};
 use netshield_core::rule::{Action, AppMatcher, Duration as RuleDuration, Rule, RuleId};
 use netshield_core::{DestMatcher, IpNet, ScopeRequest, rule_from_scope};
 
+use crate::ebpf;
 use crate::firewall::{self, FirewallError};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
@@ -227,7 +228,13 @@ impl Daemon {
          policy,
          pending: PendingPrompts::new(),
          dns_cache,
-         attributor: Attributor::with_process_cache(process_cache),
+         attributor: match ebpf::SendRegistry::open() {
+            Ok(registry) => {
+               Attributor::with_process_cache(process_cache).with_senders(Box::new(registry))
+            }
+            // `open` has already logged why; `/proc` attribution is what the daemon had before.
+            Err(_) => Attributor::with_process_cache(process_cache),
+         },
          ipc,
          queue,
          mode: Mode::Alert,
@@ -544,6 +551,11 @@ impl Daemon {
       loop {
          if SHUTDOWN.load(Ordering::SeqCst) {
             info!("shutdown signal received; stopping");
+            let stats = self.attributor.stats();
+            info!(
+               "attribution: {} flows came from the send registry, {} scans still found nothing",
+               stats.registry_hits, stats.misses
+            );
             return;
          }
 
