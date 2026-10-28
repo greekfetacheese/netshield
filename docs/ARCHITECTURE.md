@@ -186,8 +186,8 @@ sockets (QUIC racing losers, cancelled preconnects) inside the ~5 ms attribution
 old behaviour produced an `unknown` prompt for traffic that had already been abandoned.
 
 On the same machine the daemon also loads a small BPF program on the `sys_enter_sendto` and
-`sys_enter_connect` tracepoints. It records `(uid, destination) -> (pid, timestamp)` into a hash
-map at syscall time — which is before the socket can be closed — so a flow whose socket is already
+`sys_enter_connect` tracepoints. It records `(uid, destination) -> (thread group id, timestamp)`
+into a hash map at syscall time — which is before the socket can be closed — so a flow whose socket is already
 gone can still be attributed. It is a fallback and never an override: it is consulted only after the
 `/proc` scan fails, its answer is refused unless `/proc` agrees that the pid exists and is owned by
 the packet's UID, and the whole probe is optional. No tracefs, no `CAP_BPF`, or a tracepoint whose

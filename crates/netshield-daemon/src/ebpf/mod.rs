@@ -411,6 +411,9 @@ impl SendRegistry {
 
    /// The pid that sent to `remote` from `uid` within [`SENDER_TTL_NS`], if the kernel
    /// recorded it.
+   ///
+   /// A record whose process id is zero is a miss, not a lookup for pid 0: zero means the
+   /// program could not name the sender, and `/proc/0` would only obscure that.
    pub fn recent_sender(&self, uid: u32, remote: (IpAddr, u16)) -> Option<u32> {
       let key = flow_key(uid, remote);
       let mut val = FlowVal {
@@ -428,8 +431,15 @@ impl SendRegistry {
          )
       };
       if looked_up.is_ok() && is_fresh(val.ts_ns, now_ns()) {
-         self.hits.fetch_add(1, Ordering::Relaxed);
-         return Some((val.pid_tgid & 0xffff_ffff) as u32);
+         // The high half of `bpf_get_current_pid_tgid` is the thread group id: the process. The low
+         // half is the tid, and `/proc/<tid>` cannot be read from another process, so a worker
+         // thread's send would be recorded with an id that nothing outside its thread group can
+         // name — which is how a browser's QUIC traffic ended up unattributable.
+         let pid = sender_pid(val.pid_tgid);
+         if pid != 0 {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(pid);
+         }
       }
       self.misses.fetch_add(1, Ordering::Relaxed);
       None
@@ -451,6 +461,14 @@ impl Drop for SendRegistry {
       }
       syscall::close_owned(self.map_fd);
    }
+}
+
+/// The process id carried by a `bpf_get_current_pid_tgid` value.
+///
+/// The kernel packs `tgid << 32 | tid`; only the thread group id names a process that
+/// `/proc` can be read for from outside the owning thread group.
+fn sender_pid(pid_tgid: u64) -> u32 {
+   (pid_tgid >> 32) as u32
 }
 
 /// Builds the map key for `remote`, in the byte order the in-kernel program writes.
@@ -593,6 +611,19 @@ mod tests {
       assert_eq!(key.family, libc::AF_INET6 as u16);
       assert_eq!(key.dport, 443u16.to_be());
       assert_eq!(key.addr, ip.octets());
+   }
+
+   #[test]
+   fn a_worker_thread_is_named_by_its_process() {
+      assert_eq!(sender_pid((4242u64 << 32) | 4243), 4242);
+      assert_eq!(sender_pid((4242u64 << 32) | 4242), 4242);
+   }
+
+   #[test]
+   fn a_record_without_a_process_id_is_a_miss() {
+      assert_eq!(sender_pid(0), 0);
+      // A tid without a tgid names no process that `/proc` can be read for.
+      assert_eq!(sender_pid(4243), 0);
    }
 
    #[test]
