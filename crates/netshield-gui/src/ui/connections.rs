@@ -184,6 +184,7 @@ pub enum Selection {
       app: String,
       at: u64,
       addr: String,
+      proto: String,
    },
 }
 
@@ -264,6 +265,9 @@ pub struct Conn {
    /// Whether `dest` came from a resolved domain rather than an address.
    pub domain: bool,
    pub allowed: bool,
+   /// How many identical flows this row stands for: `1` for a single connection, `N` when `N`
+   /// flows shared the same endpoint, protocol and verdict.
+   pub repeat: usize,
    pub via_prompt: bool,
    pub candidate: Option<String>,
    /// `allow example.com`, `deny anywhere`, … or `—` when the rule is gone.
@@ -382,13 +386,17 @@ pub fn show(
                         app: conn.app.clone(),
                         at: conn.at,
                         addr: conn.addr.clone(),
+                        proto: conn.proto.clone(),
                      };
                      ui.ctx().request_repaint();
                   }
                   let selected = matches!(
                      selection,
-                     Selection::Conn { app, at, addr }
-                        if app == &conn.app && *at == conn.at && addr == &conn.addr
+                     Selection::Conn { app, at, addr, proto }
+                        if app == &conn.app
+                           && *at == conn.at
+                           && addr == &conn.addr
+                           && proto == &conn.proto
                   );
                   conn_row(ui, &response, &columns, conn, selected, now);
                }
@@ -838,6 +846,13 @@ fn conn_row(
       0.0,
       TextFormat::simple(body.clone(), verdict_colour),
    );
+   if conn.repeat > 1 {
+      job.append(
+         &format!(" ×{}", conn.repeat),
+         0.0,
+         TextFormat::simple(body.clone(), weak),
+      );
+   }
    let galley = painter.layout_job(job);
    painter.galley(
       pos2(
@@ -1026,10 +1041,20 @@ impl<'a> Detail<'a> {
             // The destination may be past the app's child cap; the app's own details are
             // still the honest answer, so the pane does not blink out of existence.
             .or_else(|| Self::app(lines, app)),
-         Selection::Conn { app, at, addr } => lines
+         Selection::Conn {
+            app,
+            at,
+            addr,
+            proto,
+         } => lines
             .iter()
             .find_map(|line| match line {
-               Line::Conn(conn) if &conn.app == app && conn.at == *at && &conn.addr == addr => {
+               Line::Conn(conn)
+                  if &conn.app == app
+                     && conn.at == *at
+                     && &conn.addr == addr
+                     && &conn.proto == proto =>
+               {
                   Some(Self {
                      process: conn.exe.as_deref(),
                      dest: Some(&conn.dest),
@@ -1210,17 +1235,18 @@ fn build_lines(
          if !expanded.contains(&dest_node) {
             continue;
          }
+         let unique = unique_conns(conns);
          let shown_conns = if showing_all.contains(&dest_node) {
-            conns.len()
+            unique.len()
          } else {
-            MAX_CHILDREN.min(conns.len())
+            MAX_CHILDREN.min(unique.len())
          };
-         for row in conns.iter().take(shown_conns) {
-            lines.push(Line::Conn(conn(row, rules)));
+         for (row, repeat) in unique.iter().take(shown_conns) {
+            lines.push(Line::Conn(conn(row, *repeat, rules)));
          }
-         if conns.len() > shown_conns {
+         if unique.len() > shown_conns {
             lines.push(Line::More {
-               remaining: conns.len() - shown_conns,
+               remaining: unique.len() - shown_conns,
                node: dest_node,
             });
          }
@@ -1256,8 +1282,34 @@ fn dest_groups<'a>(rows: &[&'a Row]) -> Vec<(&'a str, Vec<&'a Row>)> {
    groups
 }
 
+/// One destination's connections collapsed to unique flows, newest first.
+///
+/// A resolver or a browser opens the same `addr:port` flow dozens of times, and dozens of
+/// identical rows bury the one that is new. Each entry is the newest row of its group plus how
+/// many flows it stands for; the destination line keeps the raw total on its own count.
+fn unique_conns<'a>(conns: &[&'a Row]) -> Vec<(&'a Row, usize)> {
+   let mut unique: Vec<(&'a Row, usize)> = Vec::new();
+   let mut index: HashMap<(String, String, bool, bool), usize> = HashMap::new();
+   for row in conns {
+      let key = (
+         row.addr.clone(),
+         row.proto.clone(),
+         row.allowed,
+         row.via_prompt,
+      );
+      match index.get(&key).copied() {
+         Some(slot) => unique[slot].1 += 1,
+         None => {
+            index.insert(key, unique.len());
+            unique.push((row, 1));
+         }
+      }
+   }
+   unique
+}
+
 /// Flattens one log row, resolving its rule id against the current rule list.
-fn conn(row: &Row, rules: &[Rule]) -> Conn {
+fn conn(row: &Row, repeat: usize, rules: &[Rule]) -> Conn {
    Conn {
       app: row.app.clone(),
       at: row.at,
@@ -1266,6 +1318,7 @@ fn conn(row: &Row, rules: &[Rule]) -> Conn {
       proto: row.proto.clone(),
       domain: row.dest.parse::<std::net::IpAddr>().is_err(),
       allowed: row.allowed,
+      repeat,
       via_prompt: row.via_prompt,
       candidate: row.candidate.clone(),
       rule: rule_label(row.rule_id.as_ref(), rules),
@@ -1295,12 +1348,16 @@ fn count_label(count: usize) -> String {
 
 /// One connection line's full text, untruncated: the endpoint, the protocol and the verdict.
 fn conn_line_text(conn: &Conn) -> String {
-   format!(
+   let mut text = format!(
       "{} · {} · {}",
       conn.addr,
       conn.proto,
       verdict_label(conn)
-   )
+   );
+   if conn.repeat > 1 {
+      text.push_str(&format!(" ×{}", conn.repeat));
+   }
+   text
 }
 
 /// `ALLOWED`, `ALLOWED (prompt)`, `DENIED`, or `DENIED (prompt)`.
@@ -1607,13 +1664,23 @@ mod tests {
       );
    }
 
+   /// A log of `count` flows to one destination, each with its own address, so none collapse.
+   fn distinct_flows(count: u64) -> ConnectionLog {
+      let mut history = ConnectionLog::new(64);
+      for at in 0..count {
+         let mut row = event(at, "firefox", "a.example");
+         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
+         history.push(&row);
+      }
+      history
+   }
+
    #[test]
    fn a_group_shows_eight_connections_then_the_remainder() {
       let app = Node::app("firefox");
       let host = Node::dest("firefox", "a.example");
-      let eight: Vec<(u64, &str, &str)> = (0..8).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&eight),
+         &distinct_flows(8),
          &[],
          &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
@@ -1625,9 +1692,8 @@ mod tests {
       );
       assert!(matches!(lines[9], Line::Conn(_)));
 
-      let nine: Vec<(u64, &str, &str)> = (0..9).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&nine),
+         &distinct_flows(9),
          &[],
          &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
@@ -1645,9 +1711,8 @@ mod tests {
          }
       );
 
-      let ten: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&ten),
+         &distinct_flows(10),
          &[],
          &expanded_set(&[app, host.clone()]),
          &ShowingAll::default(),
@@ -1665,9 +1730,8 @@ mod tests {
    #[test]
    fn eleven_connections_are_capped_with_an_exact_remainder() {
       let host = Node::dest("firefox", "a.example");
-      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&events),
+         &distinct_flows(11),
          &[],
          &expanded_set(&[Node::app("firefox"), host.clone()]),
          &ShowingAll::default(),
@@ -1696,9 +1760,8 @@ mod tests {
 
    #[test]
    fn showing_all_reveals_every_connection_and_no_more_line() {
-      let events: Vec<(u64, &str, &str)> = (0..11).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log(&events),
+         &distinct_flows(11),
          &[],
          &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
          &showing_all_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
@@ -1774,17 +1837,14 @@ mod tests {
       );
       assert_eq!(
          open.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
-         2,
-         "only the open destination's rows are drawn"
+         1,
+         "only the open destination's rows are drawn, and its identical flows collapse"
       );
-      assert!(
-         open
-            .iter()
-            .filter_map(|line| match line {
-               Line::Conn(conn) => Some(conn.dest.as_str()),
-               _ => None,
-            })
-            .eq(["a.example", "a.example"])
+      let listed = conn(&open, 3);
+      assert_eq!(listed.dest, "a.example");
+      assert_eq!(
+         listed.repeat, 2,
+         "both of a.example's flows are counted"
       );
    }
 
@@ -1831,10 +1891,10 @@ mod tests {
          "the app's More row opens the app"
       );
 
-      let conns: Vec<(u64, &str, &str)> = (0..10).map(|at| (at, "firefox", "a.example")).collect();
+      let conns = distinct_flows(10);
       let host = Node::dest("firefox", "a.example");
       let lines = build_lines(
-         &log(&conns),
+         &conns,
          &[],
          &expanded_set(&[Node::app("firefox"), host.clone()]),
          &ShowingAll::default(),
@@ -2009,6 +2069,7 @@ mod tests {
             app: "firefox".to_owned(),
             at: 10,
             addr: "203.0.113.9:443".to_owned(),
+            proto: "tcp".to_owned(),
          },
       )
       .expect("the first connection resolves");
@@ -2018,12 +2079,30 @@ mod tests {
             app: "firefox".to_owned(),
             at: 10,
             addr: "203.0.113.10:443".to_owned(),
+            proto: "tcp".to_owned(),
          },
       )
       .expect("the second connection resolves");
 
       assert_eq!(first.dest, Some("a.example"));
       assert_eq!(second.dest, Some("203.0.113.10"));
+
+      // Same app and timestamp, same address, other protocol: no connection matches, so the
+      // pane falls back to the app rather than to the address's row.
+      let other_proto = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "udp".to_owned(),
+         },
+      )
+      .expect("the app's own details are the fallback");
+      assert_eq!(
+         other_proto.dest, None,
+         "the protocol disambiguates the address"
+      );
    }
 
    #[test]
@@ -2187,6 +2266,7 @@ mod tests {
          &ShowingAll::default(),
       );
       let allowed = conn(&lines, 2);
+      assert_eq!(allowed.repeat, 1, "a lone flow stands for itself");
       assert_eq!(
          conn_line_text(allowed),
          "140.82.121.6:443 · tcp · ALLOWED"
@@ -2272,6 +2352,191 @@ mod tests {
          columns.activity_x - (columns.rule_x + columns.rule),
          COLUMN_GAP,
          "Rule and Activity stay a normal gap apart"
+      );
+   }
+
+   /// Four flows to one destination: one older udp flow and three identical tcp ones.
+   fn repeated_flows() -> ConnectionLog {
+      let mut udp = event(5, "firefox", "a.example");
+      udp.connection.proto = L4Proto::Udp;
+      let mut history = ConnectionLog::new(8);
+      history.push(&udp);
+      for at in [10, 20, 30] {
+         history.push(&event(at, "firefox", "a.example"));
+      }
+      history
+   }
+
+   #[test]
+   fn repeated_flows_collapse_into_one_counted_row() {
+      let history = repeated_flows();
+      let rows: Vec<&Row> = history.rows().rev().collect();
+      let unique = unique_conns(&rows);
+      assert_eq!(unique.len(), 2, "two distinct flows");
+      assert_eq!(unique[0].1, 3, "three identical tcp flows");
+      assert_eq!(
+         unique[0].0.at, 30,
+         "the group keeps its newest row"
+      );
+
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      let conns: Vec<&Conn> = lines
+         .iter()
+         .filter_map(|line| match line {
+            Line::Conn(conn) => Some(conn),
+            _ => None,
+         })
+         .collect();
+      assert_eq!(conns.len(), 2, "one row per distinct flow");
+      assert_eq!(conns[0].repeat, 3);
+      assert_eq!(conns[0].at, 30);
+      assert_eq!(conns[1].repeat, 1);
+   }
+
+   #[test]
+   fn the_group_keeps_the_raw_connection_count() {
+      let lines = build_lines(
+         &repeated_flows(),
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+
+      assert_eq!(group(&lines, 0), ("firefox", 4, 30));
+      assert_eq!(dest(&lines, 1), ("a.example", 4, 30));
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         2,
+         "the third level collapses even though the totals do not"
+      );
+   }
+
+   #[test]
+   fn the_cap_counts_unique_flows() {
+      let app = Node::app("firefox");
+      let host = Node::dest("firefox", "a.example");
+
+      let identical: Vec<(u64, &str, &str)> =
+         (0..10).map(|at| (at, "firefox", "a.example")).collect();
+      let lines = build_lines(
+         &log(&identical),
+         &[],
+         &expanded_set(&[app.clone(), host.clone()]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         1,
+         "ten identical flows are one collapsed row"
+      );
+      assert!(
+         !lines.iter().any(|line| matches!(line, Line::More { .. })),
+         "one unique flow fits under the cap"
+      );
+
+      let mut distinct = ConnectionLog::new(16);
+      for at in 0..10 {
+         let mut row = event(at, "firefox", "a.example");
+         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
+         distinct.push(&row);
+      }
+      let lines = build_lines(
+         &distinct,
+         &[],
+         &expanded_set(&[app, host.clone()]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         MAX_CHILDREN,
+         "ten distinct addresses still fill the cap"
+      );
+      assert_eq!(
+         lines[MAX_CHILDREN + 2],
+         Line::More {
+            remaining: 2,
+            node: host
+         },
+         "the remainder counts the unique flows past the cap"
+      );
+   }
+
+   #[test]
+   fn a_connection_is_selected_by_its_protocol_too() {
+      let mut tcp = event(10, "firefox", "a.example");
+      tcp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      let mut udp = event(10, "firefox", "a.example");
+      udp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      udp.connection.proto = L4Proto::Udp;
+      udp.allowed = false;
+      let mut history = ConnectionLog::new(8);
+      history.push(&tcp);
+      history.push(&udp);
+      let lines = build_lines(
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+
+      let tcp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "tcp".to_owned(),
+         },
+      )
+      .expect("the tcp connection resolves");
+      let udp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "udp".to_owned(),
+         },
+      )
+      .expect("the udp connection resolves");
+
+      assert_eq!(tcp_detail.verdict, Some(true));
+      assert_eq!(udp_detail.verdict, Some(false));
+   }
+
+   #[test]
+   fn a_repeated_flow_says_how_many_it_stands_for() {
+      let lines = build_lines(
+         &repeated_flows(),
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
+         &ShowingAll::default(),
+      );
+      let conns: Vec<&Conn> = lines
+         .iter()
+         .filter_map(|line| match line {
+            Line::Conn(conn) => Some(conn),
+            _ => None,
+         })
+         .collect();
+
+      let repeated = conns
+         .iter()
+         .find(|conn| conn.repeat == 3)
+         .expect("the collapsed group is present");
+      assert!(
+         conn_line_text(repeated).ends_with("×3"),
+         "the hint carries the collapsed count"
+      );
+      let single = conns.iter().find(|conn| conn.repeat == 1).expect("the single flow is present");
+      assert!(
+         !conn_line_text(single).contains('×'),
+         "a single flow has no count"
       );
    }
 }
