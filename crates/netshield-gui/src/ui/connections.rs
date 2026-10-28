@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{Color32, FontId, Rect, Response, RichText, Sense, Shape, Stroke, Ui, pos2, vec2};
+use elegance::{Indicator, IndicatorState};
 use netshield_core::rule::{Rule, RuleId};
 
 use crate::connlog::{ConnectionLog, Row, clock};
@@ -30,7 +31,7 @@ const COLUMN_GAP: f32 = 12.0;
 const APP_CHEVRON_X: f32 = 11.0;
 
 /// Where an application row's name starts, past the painted chevron: the click band's right
-/// edge, so the name sits just above the destination text it owns. The verdict dot is
+/// edge, so the name sits just above the destination text it owns. The verdict indicator is
 /// measured from the end of that `name count` text, not from a fixed column.
 const APP_NAME_X: f32 = 22.0;
 
@@ -42,15 +43,15 @@ const DEST_NAME_X: f32 = 44.0;
 /// Where a connection line's text starts: under the destination it belongs to.
 const CONN_TEXT_X: f32 = 56.0;
 
-/// Where the verdict dot's centre sits past the end of the `<name> <count>` text.
-const DOT_GAP: f32 = 7.0;
+/// Where the verdict indicator's centre sits past the end of the `<name> <count>` text.
+const DOT_GAP: f32 = 8.0;
 
-/// The painted verdict dot's diameter; it stays a 3.5 radius circle.
-const DOT_SIZE: f32 = 7.0;
+/// The verdict indicator's diameter: the same 9 points the shell's own indicator uses.
+const DOT_SIZE: f32 = 9.0;
 
-/// Room the name galley leaves for the gap and the dot, so the dot cannot fall outside the
+/// Room the name galley leaves for the gap and the indicator, so it cannot fall outside the
 /// Connection column however long the name is.
-const DOT_SPACE: f32 = 18.0;
+const DOT_SPACE: f32 = 22.0;
 
 /// Width of the chevron's click band on a group line; it ends at the row's name.
 const CHEVRON_HIT: f32 = 22.0;
@@ -473,7 +474,7 @@ impl Cells<'_> {
 }
 
 /// The width a group line's `<name> <count>` galley may use, i.e. the Connection column
-/// less the name's start and the room the verdict dot needs.
+/// less the name's start and the room the verdict indicator needs.
 fn name_width_limit(columns: &Columns, name_x: f32) -> f32 {
    (columns.connection - name_x - DOT_SPACE).max(0.0)
 }
@@ -499,18 +500,43 @@ fn truncation_hint(
    }
 }
 
-/// The verdict dot's rectangle on a group line.
+/// The verdict indicator's rectangle on a group line.
 ///
 /// Measured from the row's left edge like every other cell, and from the end of the laid-out
-/// `name count` text: a dot pinned to a column instead sits in the middle of the row and,
-/// once the detail pane narrows the columns, on top of the application's own name.
-fn dot_rect(row: Rect, name_x: f32, name_width: f32) -> Rect {
+/// `name count` text; `center_y` is the *count label's* centre, not the row's, because the
+/// label is a smaller font sharing the name's baseline and therefore sits lower.
+fn indicator_rect(row: Rect, name_x: f32, name_width: f32, center_y: f32) -> Rect {
    Rect::from_center_size(
       pos2(
          row.left() + name_x + name_width + DOT_GAP,
-         row.center().y,
+         center_y,
       ),
       vec2(DOT_SIZE, DOT_SIZE),
+   )
+}
+
+/// The centre of a glyph's own box: its ascent above the baseline, its descent below.
+fn glyph_center_y(baseline: f32, ascent: f32, height: f32) -> f32 {
+   baseline - ascent + height / 2.0
+}
+
+/// The screen-space centre of a group line's trailing count label.
+///
+/// The trailing glyph carries the small font's own metrics — `pos.y` is its baseline, and
+/// `font_ascent` / `font_height` give its box — so the light can sit on the label's line.
+/// Falls back to the galley's own centre for an empty or fully truncated line.
+fn count_center_y(galley: &egui::Galley, text_top: f32) -> f32 {
+   let centre = text_top + galley.size().y / 2.0;
+   let Some(row) = galley.rows.first() else {
+      return centre;
+   };
+   let Some(glyph) = row.row.glyphs.last() else {
+      return centre;
+   };
+   glyph_center_y(
+      text_top + row.pos.y + glyph.pos.y,
+      glyph.font_ascent,
+      glyph.font_height,
    )
 }
 
@@ -646,7 +672,8 @@ fn dest_row(
    );
 }
 
-/// Paints a group line's cells: chevron, `name count`, verdict dot, rule and activity pill.
+/// Paints a group line's cells: chevron, `name count`, verdict indicator, rule and activity
+/// pill.
 fn group_row(
    ui: &mut Ui,
    response: &Response,
@@ -657,7 +684,7 @@ fn group_row(
    now: u64,
 ) {
    let rect = response.rect;
-   let visuals = ui.visuals();
+   let visuals = ui.visuals().clone();
    let fill = if selected {
       visuals.selection.bg_fill
    } else if response.hovered() {
@@ -665,7 +692,7 @@ fn group_row(
    } else {
       visuals.faint_bg_color
    };
-   let painter = ui.painter();
+   let painter = ui.painter().clone();
    painter.rect_filled(rect, 0.0, fill);
 
    let weak = visuals.weak_text_color();
@@ -711,26 +738,36 @@ fn group_row(
    );
    let galley = painter.layout_job(name);
    let name_width = galley.size().x;
+   let text_top = center_y - galley.size().y / 2.0;
    painter.galley(
-      pos2(
-         rect.left() + line.name_x,
-         center_y - galley.size().y / 2.0,
-      ),
-      galley,
+      pos2(rect.left() + line.name_x, text_top),
+      galley.clone(),
       line.name_colour,
    );
    truncation_hint(
       response,
-      painter,
+      &painter,
       name_limit,
       &format!("{} {}", line.name, count),
       &line.name_font,
    );
 
-   let dot_colour = if line.denied { DENIED } else { ALLOWED };
-   let dot = dot_rect(rect, line.name_x, name_width);
-   painter.circle_filled(dot.center(), 3.5, dot_colour);
-   let cells = Cells { painter, rect };
+   let indicator = indicator_rect(
+      rect,
+      line.name_x,
+      name_width,
+      count_center_y(&galley, text_top),
+   );
+   let state = if line.denied {
+      IndicatorState::Off
+   } else {
+      IndicatorState::On
+   };
+   ui.put(indicator, Indicator::new(state).size(DOT_SIZE));
+   let cells = Cells {
+      painter: &painter,
+      rect,
+   };
    let rule_width = (columns.rule).max(0.0);
    cells.text(
       columns.rule_x,
@@ -740,9 +777,16 @@ fn group_row(
       visuals.text_color(),
       false,
    );
-   truncation_hint(response, painter, rule_width, line.rule, &body);
+   truncation_hint(response, &painter, rule_width, line.rule, &body);
 
-   activity_pill(painter, columns, rect, line.last_at, now, visuals);
+   activity_pill(
+      &painter,
+      columns,
+      rect,
+      line.last_at,
+      now,
+      &visuals,
+   );
 }
 
 /// One connection row. The endpoint reads in the normal text colour, the protocol part weak
@@ -2085,25 +2129,38 @@ mod tests {
    }
 
    #[test]
-   fn the_verdict_dot_follows_the_count() {
+   fn the_indicator_follows_the_count_and_the_callers_line() {
       let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
 
-      let dot = dot_rect(row, APP_NAME_X, 50.0);
+      let indicator = indicator_rect(row, APP_NAME_X, 50.0, row.center().y + 1.5);
 
-      // Row-relative and text-relative: the pre-fix code painted at an absolute column x, so
-      // the dot sat ~195px from its column and landed on the name once the columns shrank.
+      // Row-relative and text-relative: the pre-fix code painted at an absolute column x.
       assert_eq!(
-         dot.center().x,
+         indicator.center().x,
          100.0 + APP_NAME_X + 50.0 + DOT_GAP
       );
-      assert!(
-         dot.left() > 100.0 + APP_NAME_X,
-         "the dot trails the name, it does not sit on it: {dot:?}"
-      );
       assert_eq!(
-         dot.center().y,
-         row.center().y,
-         "the dot is vertically centred"
+         indicator.width(),
+         DOT_SIZE,
+         "the widget's own diameter is the rect's width"
+      );
+      assert!(
+         indicator.center().y > row.center().y,
+         "the caller's centre is honoured, not the row's"
+      );
+   }
+
+   #[test]
+   fn a_smaller_label_shares_the_baseline_but_sits_lower() {
+      // One LayoutJob puts both fonts on one baseline, so the 11px count's box centre is
+      // below the 13px name's — which is why a light centred on the row read as higher than
+      // the label it qualifies.
+      let name = glyph_center_y(100.0, 10.4, 13.0);
+      let count = glyph_center_y(100.0, 8.8, 11.0);
+      assert_eq!(count, 96.7);
+      assert!(
+         count > name,
+         "the label's centre is lower: {count} vs {name}"
       );
    }
 
@@ -2174,14 +2231,14 @@ mod tests {
    }
 
    #[test]
-   fn the_name_width_leaves_room_for_the_dot() {
+   fn the_name_width_leaves_room_for_the_indicator() {
       let columns = Columns::new(900.0);
 
       let limit = name_width_limit(&columns, APP_NAME_X);
 
       assert!(
          limit + APP_NAME_X + DOT_SPACE == columns.connection,
-         "the galley must stop short of the dot: limit {limit}, column {}",
+         "the galley must stop short of the indicator: limit {limit}, column {}",
          columns.connection
       );
       assert!(limit > 0.0, "a 900px row has room for a name");
@@ -2190,7 +2247,7 @@ mod tests {
       let limit = name_width_limit(&columns, DEST_NAME_X);
       assert!(
          limit + DEST_NAME_X + DOT_SPACE == columns.connection,
-         "a destination's galley stops short of its dot too"
+         "a destination's galley stops short of its indicator too"
       );
    }
 }
