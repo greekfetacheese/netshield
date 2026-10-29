@@ -90,6 +90,7 @@ fn app_label(view: &ConnectionView) -> String {
 }
 
 /// A fixed-capacity ring of rendered connections, oldest first.
+#[derive(Debug)]
 pub struct ConnectionLog {
    /// Rows are shared rather than owned so handing a snapshot of the log to another thread
    /// is a refcount bump instead of a deep clone of every string in the history.
@@ -132,6 +133,20 @@ impl ConnectionLog {
    /// owning count.
    pub fn rows(&self) -> impl DoubleEndedIterator<Item = &Row> {
       self.rows.iter().map(std::convert::AsRef::as_ref)
+   }
+
+   /// A frozen copy of the log for a background rebuild.
+   ///
+   /// The rows are shared, so this is a refcount bump per row rather than a deep clone of every
+   /// string in the history; the copy never moves while a derivation reads it, which is the whole
+   /// point of taking one.
+   pub fn snapshot(&self) -> Self {
+      Self {
+         rows: self.rows.clone(),
+         capacity: self.capacity,
+         dropped: self.dropped,
+         version: self.version,
+      }
    }
 
    pub fn len(&self) -> usize {

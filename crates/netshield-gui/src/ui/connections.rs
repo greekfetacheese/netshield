@@ -8,6 +8,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -16,7 +17,9 @@ use elegance::{Indicator, IndicatorState};
 use netshield_core::rule::{Rule, RuleId};
 
 use crate::connlog::{ConnectionLog, Row, clock};
+use crate::ruleset::Ruleset;
 use crate::ui::rules::{action_label, dest_label};
+use crate::work::{Done, Job, Worker};
 
 /// The fixed height of every line, group or connection; `show_rows` depends on it.
 const LINE_HEIGHT: f32 = 24.0;
@@ -188,39 +191,182 @@ pub enum Selection {
    },
 }
 
-/// Cached derived lines, rebuilt only when the log, the rules or the group state changes.
-#[derive(Default)]
-pub struct LinesCache {
-   version: u64,
-   /// The rule list's revision, bumped by the app whenever it is replaced.
-   rules_rev: u64,
+/// Everything one rebuild reads, and therefore part of a rebuild's identity: opening a group
+/// changes nothing about the log or the rules, and it still has to rebuild.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Inputs {
+   log: u64,
+   rules: u64,
    expanded: HashSet<Node>,
    showing_all: HashSet<Node>,
+}
+
+impl Inputs {
+   /// Whether these are the inputs described by `self`.
+   fn matches(
+      &self,
+      log: u64,
+      rules: u64,
+      expanded: &HashSet<Node>,
+      showing_all: &HashSet<Node>,
+   ) -> bool {
+      self.log == log
+         && self.rules == rules
+         && &self.expanded == expanded
+         && &self.showing_all == showing_all
+   }
+}
+
+/// One rebuild's work: an owned snapshot, because the GUI thread keeps pushing events into the
+/// log while the worker reads it.
+#[derive(Debug)]
+pub struct LinesJob {
+   log: ConnectionLog,
+   rules: Arc<Vec<Rule>>,
+   inputs: Inputs,
+}
+
+/// The finished lines, tagged with the inputs they were derived from.
+#[derive(Debug)]
+pub struct LinesReady {
    lines: Vec<Line>,
+   inputs: Inputs,
+}
+
+/// Builds one job's lines; the worker thread's entry point.
+pub(crate) fn derive(job: &LinesJob) -> LinesReady {
+   LinesReady {
+      lines: build_lines(
+         &job.log,
+         &job.rules,
+         &Expanded(job.inputs.expanded.clone()),
+         &ShowingAll(job.inputs.showing_all.clone()),
+      ),
+      inputs: job.inputs.clone(),
+   }
+}
+
+/// The owned snapshot one rebuild reads, taken from the live state at this instant.
+fn take_job(log: &ConnectionLog, rules: &Ruleset, inputs: Inputs) -> LinesJob {
+   LinesJob {
+      log: log.snapshot(),
+      rules: rules.shared(),
+      inputs,
+   }
+}
+
+/// What the cache does next for the inputs it was handed.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+   /// The installed lines, or the job in flight, already match these inputs.
+   Current,
+   /// The inputs moved and nothing is in flight.
+   Submit,
+   /// The inputs moved but a job is in flight; its result re-runs this decision.
+   Wait,
+}
+
+/// Cached derived lines, rebuilt on the worker thread when the log, the rules or the group
+/// state moves.
+#[derive(Default)]
+pub struct LinesCache {
+   lines: Vec<Line>,
+   /// The inputs the installed lines were built from.
+   installed: Inputs,
+   /// The inputs of the job in flight, if one is.
+   in_flight: Option<Inputs>,
+   /// `None` in tests, and when the thread could not be started: the cache then derives
+   /// synchronously, so the page is correct rather than silently stale.
+   worker: Option<Worker>,
 }
 
 impl LinesCache {
-   /// Rebuilds the lines when any input moved; an unchanged frame reuses the old vector.
+   /// A cache that derives on the worker thread, or on the GUI thread when it is `None`.
+   pub fn new(worker: Option<Worker>) -> Self {
+      Self {
+         worker,
+         ..Self::default()
+      }
+   }
+
+   /// Drains a finished rebuild and, when the inputs moved again, queues the next one.
    fn refresh(
       &mut self,
       log: &ConnectionLog,
-      rules: &[Rule],
-      rules_rev: u64,
+      rules: &Ruleset,
       expanded: &Expanded,
       showing_all: &ShowingAll,
    ) {
-      let unchanged = self.version == log.version()
-         && self.rules_rev == rules_rev
-         && self.expanded == expanded.0
-         && self.showing_all == showing_all.0;
-      if unchanged {
+      // The result is taken first, so this frame paints what the worker finished. The poll
+      // comes before the marker is cleared: a running job must stay marked as in flight.
+      if let Some(worker) = &self.worker
+         && let Some(Done::Lines(ready)) = worker.poll()
+         && let Some(pending) = self.in_flight.take()
+      {
+         self.install(*ready, &pending);
+      }
+      if self.step(
+         log.version(),
+         rules.rev(),
+         &expanded.0,
+         &showing_all.0,
+      ) != Step::Submit
+      {
          return;
       }
-      self.lines = build_lines(log, rules, expanded, showing_all);
-      self.version = log.version();
-      self.rules_rev = rules_rev;
-      self.expanded = expanded.0.clone();
-      self.showing_all = showing_all.0.clone();
+      let inputs = Inputs {
+         log: log.version(),
+         rules: rules.rev(),
+         expanded: expanded.0.clone(),
+         showing_all: showing_all.0.clone(),
+      };
+      if let Some(worker) = &self.worker
+         && worker.submit(Job::Lines(Box::new(take_job(
+            log,
+            rules,
+            inputs.clone(),
+         ))))
+      {
+         self.in_flight = Some(inputs);
+         return;
+      }
+      // No thread, or it is gone: derive here rather than show a stale list. Readiness is worth
+      // more than one frame's jank, and `Worker::spawn` has already logged the cause.
+      let job = take_job(log, rules, inputs.clone());
+      self.install(derive(&job), &inputs);
+   }
+
+   /// One job at a time: a second submission would rebuild a snapshot the first already made
+   /// obsolete, and its result re-runs this decision, so the newest inputs still win.
+   fn step(
+      &self,
+      log: u64,
+      rules: u64,
+      expanded: &HashSet<Node>,
+      showing_all: &HashSet<Node>,
+   ) -> Step {
+      if let Some(in_flight) = &self.in_flight {
+         return if in_flight.matches(log, rules, expanded, showing_all) {
+            Step::Current
+         } else {
+            Step::Wait
+         };
+      }
+      if self.installed.matches(log, rules, expanded, showing_all) {
+         Step::Current
+      } else {
+         Step::Submit
+      }
+   }
+
+   /// Installs a result only when it belongs to the job being waited for: a superseded one must
+   /// not replace newer lines.
+   fn install(&mut self, ready: LinesReady, pending: &Inputs) {
+      if &ready.inputs != pending {
+         return;
+      }
+      self.lines = ready.lines;
+      self.installed = ready.inputs;
    }
 }
 
@@ -278,19 +424,16 @@ pub struct Conn {
 }
 
 /// Draws the heading, the detail pane and the virtualised per-application list.
-// The arguments are distinct pieces of app state; bundling them would obscure that.
-#[allow(clippy::too_many_arguments)]
 pub fn show(
    ui: &mut Ui,
    log: &ConnectionLog,
-   rules: &[Rule],
-   rules_rev: u64,
+   rules: &Ruleset,
    expanded: &mut Expanded,
    showing_all: &mut ShowingAll,
    cache: &mut LinesCache,
    selection: &mut Selection,
 ) {
-   cache.refresh(log, rules, rules_rev, expanded, showing_all);
+   cache.refresh(log, rules, expanded, showing_all);
 
    let apps = cache.lines.iter().filter(|line| matches!(line, Line::Group { .. })).count();
    heading(ui, log, apps);
@@ -1188,6 +1331,9 @@ fn build_lines(
    #[cfg(test)]
    tests::bump_builds();
 
+   // One index per rebuild: `rule_label` used to scan the whole rule list for every line.
+   let rule_index: HashMap<&RuleId, &Rule> = rules.iter().map(|rule| (&rule.id, rule)).collect();
+
    let mut groups: Vec<(&str, Vec<&Row>)> = Vec::new();
    let mut index: HashMap<&str, usize> = HashMap::new();
    for row in log.rows().rev() {
@@ -1211,7 +1357,7 @@ fn build_lines(
          last_at: newest.map_or(0, |row| row.at),
          rule: newest.map_or_else(
             || DASH.to_owned(),
-            |row| rule_label(row.rule_id.as_ref(), rules),
+            |row| rule_label(row.rule_id.as_ref(), &rule_index),
          ),
          denied: rows.iter().any(|row| !row.allowed),
          exe: newest.and_then(|row| row.exe.clone()),
@@ -1236,7 +1382,7 @@ fn build_lines(
             last_at: newest.map_or(0, |row| row.at),
             rule: newest.map_or_else(
                || DASH.to_owned(),
-               |row| rule_label(row.rule_id.as_ref(), rules),
+               |row| rule_label(row.rule_id.as_ref(), &rule_index),
             ),
             denied: conns.iter().any(|row| !row.allowed),
             exe: newest.and_then(|row| row.exe.clone()),
@@ -1251,7 +1397,7 @@ fn build_lines(
             MAX_CHILDREN.min(unique.len())
          };
          for (row, repeat) in unique.iter().take(shown_conns) {
-            lines.push(Line::Conn(conn(row, *repeat, rules)));
+            lines.push(Line::Conn(conn(row, *repeat, &rule_index)));
          }
          if unique.len() > shown_conns {
             lines.push(Line::More {
@@ -1318,7 +1464,7 @@ fn unique_conns<'a>(conns: &[&'a Row]) -> Vec<(&'a Row, usize)> {
 }
 
 /// Flattens one log row, resolving its rule id against the current rule list.
-fn conn(row: &Row, repeat: usize, rules: &[Rule]) -> Conn {
+fn conn(row: &Row, repeat: usize, rules: &HashMap<&RuleId, &Rule>) -> Conn {
    Conn {
       app: row.app.clone(),
       at: row.at,
@@ -1336,11 +1482,8 @@ fn conn(row: &Row, repeat: usize, rules: &[Rule]) -> Conn {
 }
 
 /// `allow example.com`, `deny anywhere`, … or [`DASH`] when the rule is gone.
-fn rule_label(id: Option<&RuleId>, rules: &[Rule]) -> String {
-   let Some(id) = id else {
-      return DASH.to_owned();
-   };
-   match rules.iter().find(|rule| &rule.id == id) {
+fn rule_label(id: Option<&RuleId>, rules: &HashMap<&RuleId, &Rule>) -> String {
+   match id.and_then(|id| rules.get(id)) {
       Some(rule) => format!(
          "{} {}",
          action_label(rule.action),
@@ -1388,6 +1531,7 @@ mod tests {
    use netshield_core::rule::{Action, AppMatcher, DestMatcher, Duration};
 
    use super::*;
+   use crate::ruleset::Ruleset;
 
    thread_local! {
       /// Counts `build_lines` calls on this thread so the cache test can assert on real work.
@@ -2106,13 +2250,14 @@ mod tests {
 
    #[test]
    fn the_lines_cache_rebuilds_only_when_an_input_changes() {
+      let no_rules = Ruleset::default();
       let mut log = log(&[(10, "firefox", "a.example")]);
       let mut expanded = Expanded::default();
       let mut showing_all = ShowingAll::default();
       let mut cache = LinesCache::default();
 
       let before = builds();
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(
          cache.lines.len(),
          1,
@@ -2124,7 +2269,7 @@ mod tests {
          "the first frame builds the lines"
       );
 
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 1,
@@ -2132,12 +2277,12 @@ mod tests {
       );
 
       log.push(&event(20, "curl", "b.example"));
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(builds(), before + 2, "a new row rebuilds");
       assert_eq!(cache.lines.len(), 2, "both groups stay collapsed");
 
       expanded.toggle(&Node::app("firefox"));
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(builds(), before + 3, "expanding rebuilds");
       assert_eq!(
          cache.lines.len(),
@@ -2146,7 +2291,7 @@ mod tests {
       );
 
       expanded.toggle(&Node::dest("firefox", "a.example"));
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 4,
@@ -2155,15 +2300,16 @@ mod tests {
       assert_eq!(cache.lines.len(), 4);
 
       showing_all.insert(Node::app("firefox"));
-      cache.refresh(&log, &[], 0, &expanded, &showing_all);
+      cache.refresh(&log, &no_rules, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 5,
          "turning on showing all rebuilds the list"
       );
 
-      let rules = vec![rule(DestMatcher::Any, Action::Allow)];
-      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
+      let mut rules = Ruleset::default();
+      rules.install(vec![rule(DestMatcher::Any, Action::Allow)]);
+      cache.refresh(&log, &rules, &expanded, &showing_all);
       assert_eq!(builds(), before + 6, "a rule list rebuilds too");
    }
 
@@ -2171,13 +2317,14 @@ mod tests {
    fn a_rule_edit_that_keeps_the_count_rebuilds_the_lines() {
       let log = log(&[(10, "firefox", "a.example")]);
       let mut cache = LinesCache::default();
-      let rules = vec![rule(DestMatcher::Any, Action::Allow)];
+      let mut rules = Ruleset::default();
+      rules.install(vec![rule(DestMatcher::Any, Action::Allow)]);
       let expanded = Expanded::default();
       let showing_all = ShowingAll::default();
 
-      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
+      cache.refresh(&log, &rules, &expanded, &showing_all);
       let before = builds();
-      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
+      cache.refresh(&log, &rules, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before,
@@ -2185,11 +2332,117 @@ mod tests {
       );
 
       // A rule switched off, a duration changed: same count, different content.
-      cache.refresh(&log, &rules, 2, &expanded, &showing_all);
+      rules.install(vec![rule(DestMatcher::Any, Action::Allow)]);
+      cache.refresh(&log, &rules, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 1,
          "a rule edit rebuilds even at the same count"
+      );
+   }
+
+   #[test]
+   fn one_rebuild_is_in_flight_at_a_time() {
+      let mut cache = LinesCache::default();
+      let none = HashSet::new();
+      let inputs = |log: u64| Inputs {
+         log,
+         ..Inputs::default()
+      };
+
+      cache.in_flight = Some(inputs(1));
+      assert_eq!(
+         cache.step(1, 0, &none, &none),
+         Step::Current,
+         "these inputs are already being built"
+      );
+      assert_eq!(
+         cache.step(2, 0, &none, &none),
+         Step::Wait,
+         "a newer input waits for the job in flight"
+      );
+
+      cache.in_flight = None;
+      cache.installed = inputs(2);
+      assert_eq!(
+         cache.step(2, 0, &none, &none),
+         Step::Current,
+         "the installed lines match"
+      );
+      assert_eq!(
+         cache.step(3, 0, &none, &none),
+         Step::Submit,
+         "a moved input submits"
+      );
+   }
+
+   #[test]
+   fn a_result_is_only_installed_for_the_job_that_asked_for_it() {
+      let none = HashSet::new();
+      let pending = Inputs {
+         log: 1,
+         ..Inputs::default()
+      };
+      let job = take_job(
+         &log(&[(10, "firefox", "a.example"), (20, "curl", "b.example")]),
+         &Ruleset::default(),
+         pending.clone(),
+      );
+      let mut cache = LinesCache::default();
+      cache.install(derive(&job), &pending);
+      assert_eq!(
+         cache.lines.len(),
+         2,
+         "the pending job's result is installed"
+      );
+      assert!(
+         cache.installed.matches(1, 0, &none, &none),
+         "the installed inputs are the ones the job was built for"
+      );
+
+      // A result for inputs the cache is not waiting for must change nothing.
+      cache.install(
+         LinesReady {
+            lines: Vec::new(),
+            inputs: Inputs {
+               log: 2,
+               ..Inputs::default()
+            },
+         },
+         &pending,
+      );
+      assert_eq!(
+         cache.lines.len(),
+         2,
+         "a superseded result is dropped"
+      );
+      assert!(
+         cache.installed.matches(1, 0, &none, &none),
+         "and the installed inputs stay put"
+      );
+   }
+
+   #[test]
+   fn opening_a_group_rebuilds_even_when_the_log_stands_still() {
+      let log = log(&[(10, "firefox", "a.example")]);
+      let rules = Ruleset::default();
+      let mut cache = LinesCache::default();
+      let mut expanded = Expanded::default();
+      let showing_all = ShowingAll::default();
+
+      cache.refresh(&log, &rules, &expanded, &showing_all);
+      assert_eq!(
+         cache.lines.len(),
+         1,
+         "a never-seen app starts collapsed"
+      );
+
+      expanded.toggle(&Node::app("firefox"));
+      cache.refresh(&log, &rules, &expanded, &showing_all);
+      assert_eq!(
+         cache.lines.len(),
+         2,
+         "opening the app shows its group and its destination"
       );
    }
 
