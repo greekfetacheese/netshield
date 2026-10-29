@@ -10,16 +10,17 @@
 //! cost this change exists to avoid. And it never persists `hits`/`last_matched` updates — those
 //! change per matched packet, and writing them would turn a read-mostly file into a write amplifier.
 //!
-//! The first run seeds the resolver rule (ARCHITECTURE §6) unless a legacy `rules.json` sits next to
-//! the database, in which case that file is imported once and renamed away. A seed keyed on the
-//! resolver's executable path rather than its UID is deliberate: that uid is a per-machine detail.
+//! The first run seeds the resolver rule (ARCHITECTURE §6). A file at the store's path that is not a
+//! database is moved aside as `<name>.unreadable` rather than stopping the daemon, which would leave
+//! the machine unfirewalled. A seed keyed on the resolver's executable path rather than its UID is
+//! deliberate: that uid is a per-machine detail.
 
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use log::warn;
+use log::{error, warn};
 use netshield_core::{
    Action, AppMatcher, DestMatcher, Duration, Rule, RuleId, ScopeRequest, rule_from_scope,
 };
@@ -28,7 +29,6 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use crate::store::codec::RecordError;
 
 mod codec;
-mod legacy;
 
 /// The schema of the database this daemon writes. A database that declares anything else is refused
 /// rather than half-read: silently dropping a rule could turn a deny into a prompt.
@@ -141,40 +141,43 @@ impl RuleStore {
    /// case where a rule appears without the user asking for one. An existing database is
    /// authoritative, so it is never re-seeded and never merged with anything.
    ///
-   /// A legacy JSON store can sit at either candidate place and is imported once, renamed away: next
-   /// to the database (`rules.json` beside `rules.db`, the layout a fresh install creates) or exactly
-   /// at the configured path (a config an older install wrote, which names the JSON file itself).
-   /// Neither may stop the daemon: a store that cannot be opened leaves the machine unfirewalled,
-   /// which is the one failure worse than re-asking the user for a rule.
+   /// This runs before the firewall is installed, so failing here would leave the machine with no
+   /// firewall at all. A file at `path` that is not a database redb can open is therefore moved to
+   /// `<name>.unreadable` and reported rather than allowed to stop the daemon: the rules are
+   /// unavailable either way and the file stays on disk for whoever wants it back. A database of an
+   /// unknown *schema* is a different matter and still refuses (see `check_schema`), because that is
+   /// a real store written by another version and discarding it would destroy the user's rules.
    pub fn load_or_seed(path: &Path) -> Result<(Self, bool), StoreError> {
-      let first_run = !path.exists();
       if let Some(parent) = path.parent()
          && !parent.as_os_str().is_empty()
       {
          fs::create_dir_all(parent)?;
       }
 
-      // Before the database exists, clear its path if an older build's store is sitting there.
-      let adopted = if first_run {
-         None
-      } else {
-         legacy::adopt(path)?
+      let mut fresh = !path.exists();
+      let db = match Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path) {
+         Ok(db) => db,
+         Err(error) if path.exists() => {
+            let aside = unreadable_path(path);
+            error!(
+               "the rule store at {} cannot be opened ({error}); moving it to {} and starting with \
+                the resolver seed",
+               path.display(),
+               aside.display()
+            );
+            fs::rename(path, &aside)?;
+            fresh = true;
+            Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?
+         }
+         Err(error) => return Err(error.into()),
       };
-      // A file adopted or moved aside frees the path, so the database created there is new.
-      let first_run = first_run || !path.exists();
 
-      let db = Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?;
       let mut store = Self {
          db,
          rules: Vec::new(),
       };
-
-      if let Some(legacy) = adopted {
-         let seeded = store.initialize(Some(legacy))?;
-         return Ok((store, seeded));
-      }
-      if first_run {
-         let seeded = store.initialize(legacy::read(path))?;
+      if fresh {
+         let seeded = store.seed()?;
          return Ok((store, seeded));
       }
 
@@ -255,18 +258,9 @@ impl RuleStore {
       Ok(())
    }
 
-   /// Writes the schema marker and either imports `legacy` or seeds the resolver rule.
-   fn initialize(&mut self, legacy: Option<legacy::Legacy>) -> Result<bool, StoreError> {
+   /// Writes the schema marker and seeds the resolver rule.
+   fn seed(&mut self) -> Result<bool, StoreError> {
       self.write_schema()?;
-
-      if let Some(legacy) = legacy {
-         let puts = encode_all(&legacy.rules)?;
-         self.apply(&puts, &[])?;
-         // After the commit: a rename that fails leaves the file importable next boot.
-         legacy::mark_migrated(&legacy);
-         self.rules = legacy.rules;
-         return Ok(false);
-      }
 
       let Some(rule) = resolver_seed(now_secs()) else {
          warn!(
@@ -347,6 +341,13 @@ fn encode_all(rules: &[Rule]) -> Result<Vec<Put>, StoreError> {
       puts.push((key.to_vec(), value));
    }
    Ok(puts)
+}
+
+/// The name a store that cannot be opened is kept under, so nothing is deleted on the way past.
+fn unreadable_path(path: &Path) -> PathBuf {
+   let mut aside = path.as_os_str().to_owned();
+   aside.push(".unreadable");
+   PathBuf::from(aside)
 }
 
 /// The first-run resolver seed described in ARCHITECTURE §6, or `None` when no resolver
@@ -530,117 +531,59 @@ mod tests {
    }
 
    #[test]
-   fn a_legacy_json_store_is_imported_once_and_renamed() {
-      let path = temp_path("migrate");
-      let legacy = path.with_extension("json");
-      let migrated = path.with_extension("json.migrated");
-      let rule = sample_rule("from the file");
-      let document = serde_json::json!({ "version": 1, "rules": [rule] });
-      fs::write(
-         &legacy,
-         serde_json::to_vec(&document).expect("encode"),
-      )
-      .expect("fixture");
-
-      let (store, seeded) = RuleStore::load_or_seed(&path).expect("migrate");
-      assert!(!seeded, "an imported file replaces the seed");
-      assert_eq!(store.rules(), std::slice::from_ref(&rule));
-      assert!(path.exists(), "the database is created");
-      assert!(
-         !legacy.exists(),
-         "the imported file is renamed away"
-      );
-      assert!(migrated.exists());
-      drop(store);
-
-      let (reloaded, seeded) = RuleStore::load_or_seed(&path).expect("reload");
-      assert!(!seeded);
-      assert_eq!(reloaded.rules(), [rule], "the import runs once");
-      let _ = fs::remove_file(&path);
-      let _ = fs::remove_file(&migrated);
-   }
-
-   #[test]
-   fn a_store_that_cannot_be_read_is_reported() {
-      // A legacy file this build cannot read: nothing is imported, the file is left where it is,
-      // and the store starts from the resolver seed instead of pretending the rules are gone.
-      let path = temp_path("broken-legacy");
-      let legacy = path.with_extension("json");
-      fs::write(&legacy, b"{ not json").expect("fixture");
-      let (store, _) =
-         RuleStore::load_or_seed(&path).expect("a broken legacy file must not stop the daemon");
-      assert_eq!(
-         store.rules().len(),
-         usize::from(resolver_seed(0).is_some())
-      );
-      assert!(
-         legacy.exists(),
-         "a file that was not imported is left alone"
-      );
-      drop(store);
-      let _ = fs::remove_file(&path);
-      let _ = fs::remove_file(&legacy);
-
-      // A database that is not ours declares no schema, and guessing would be worse than refusing.
-      let path = temp_path("foreign");
-      drop(Database::create(&path).expect("create a foreign database"));
-      assert!(matches!(
-         RuleStore::load_or_seed(&path),
-         Err(StoreError::Schema(0))
-      ));
-      let _ = fs::remove_file(&path);
-   }
-
-   #[test]
-   fn a_legacy_store_at_the_database_path_is_adopted() {
-      // The config of a build before the database names the JSON file itself as `rules_path`.
-      let path = temp_path("adopt");
-      let rule = sample_rule("from the configured path");
-      let document = serde_json::json!({ "version": 1, "rules": [rule] });
-      fs::write(
-         &path,
-         serde_json::to_vec(&document).expect("encode"),
-      )
-      .expect("fixture");
-
-      let (store, seeded) = RuleStore::load_or_seed(&path).expect("adopting must not fail");
-      assert!(!seeded, "an adopted store replaces the seed");
-      assert_eq!(store.rules(), std::slice::from_ref(&rule));
-      assert!(path.exists(), "the database takes the freed path");
-      let migrated = path.with_extension("json.migrated");
-      assert!(migrated.exists(), "the old file is kept, renamed");
-      drop(store);
-
-      let (reloaded, seeded) = RuleStore::load_or_seed(&path).expect("second run");
-      assert!(!seeded);
-      assert_eq!(reloaded.rules(), [rule], "the adoption runs once");
-      let _ = fs::remove_file(&path);
-      let _ = fs::remove_file(&migrated);
-   }
-
-   #[test]
-   fn an_unreadable_store_at_the_database_path_is_moved_aside() {
-      // A file that is text but not the store this build knows must not stop the daemon: the rules
-      // are unavailable either way, and an unfirewalled machine is the worse outcome.
-      let path = temp_path("unreadable");
-      fs::write(&path, b"{ this is not the rule store").expect("fixture");
+   fn a_file_that_is_not_a_database_is_moved_aside() {
+      // The daemon loads its store before it installs the firewall, so a file it cannot open must
+      // never stop it: the file is kept, the rules are gone from the policy, and the machine is
+      // filtered by a fresh store instead of by nothing.
+      let path = temp_path("not-a-database");
+      fs::write(&path, b"this is not a database\n").expect("fixture");
 
       let (store, seeded) =
-         RuleStore::load_or_seed(&path).expect("an unreadable store must not stop the daemon");
+         RuleStore::load_or_seed(&path).expect("a foreign file must not stop the daemon");
       assert_eq!(seeded, resolver_seed(0).is_some());
       assert_eq!(
          store.rules().len(),
          usize::from(resolver_seed(0).is_some())
       );
 
-      let mut aside = path.as_os_str().to_owned();
-      aside.push(".unreadable");
+      let aside = unreadable_path(&path);
       assert!(
-         Path::new(&aside).exists(),
-         "the unreadable file is kept for the user to inspect"
+         aside.exists(),
+         "the file is kept for the user to inspect"
+      );
+      assert!(
+         fs::read(&aside).expect("read the kept file") == b"this is not a database\n",
+         "the bytes are not touched on the way past"
       );
       drop(store);
+      let (reloaded, seeded) = RuleStore::load_or_seed(&path).expect("second run");
+      assert!(
+         !seeded,
+         "the second run opens the database it just created"
+      );
+      assert_eq!(
+         reloaded.rules().len(),
+         usize::from(resolver_seed(0).is_some())
+      );
       let _ = fs::remove_file(&path);
       let _ = fs::remove_file(&aside);
+   }
+
+   #[test]
+   fn a_database_of_an_unknown_schema_is_refused() {
+      // A real database written by another version is not moved aside: discarding it would destroy
+      // rules the user still owns, so this one refuses loudly instead.
+      let path = temp_path("foreign");
+      drop(Database::create(&path).expect("create a foreign database"));
+
+      assert!(matches!(
+         RuleStore::load_or_seed(&path),
+         Err(StoreError::Schema(0))
+      ));
+      assert!(
+         path.exists(),
+         "the foreign database is left alone"
+      );
+      let _ = fs::remove_file(&path);
    }
 }

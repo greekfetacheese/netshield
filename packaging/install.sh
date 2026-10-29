@@ -98,19 +98,6 @@ install_config() {
       install -d -m 0750 -o root -g root "$CONFIG_DIR"
    fi
 
-   # An install written before the rule store became a database names rules.json as `rules_path`.
-   # The daemon adopts that file on its first start, but a config that keeps naming it would name a
-   # database `rules.json` on every later start, so the key is migrated here as the installer's own
-   # file.
-   if [ -f "$CONFIG_FILE" ] && grep -q '"/etc/netshield/rules.json"' "$CONFIG_FILE"; then
-      if [ "$DRY_RUN" -eq 1 ]; then
-         note "would migrate rules_path in $CONFIG_FILE to /etc/netshield/rules.db"
-      else
-         sed -i 's|"/etc/netshield/rules.json"|"/etc/netshield/rules.db"|' "$CONFIG_FILE"
-         note "migrated rules_path in $CONFIG_FILE to /etc/netshield/rules.db"
-      fi
-   fi
-
    if [ -e "$CONFIG_FILE" ]; then
       note "keeping existing $CONFIG_FILE"
       return
