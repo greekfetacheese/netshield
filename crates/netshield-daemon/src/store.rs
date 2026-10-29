@@ -65,6 +65,12 @@ pub enum StoreError {
    Io(io::Error),
    /// redb refused the operation.
    Redb(redb::Error),
+   /// Another process holds the database open.
+   ///
+   /// redb locks the file, so this is what a second open looks like — `netshieldd --check` against a
+   /// running service, or two daemons overlapping a restart. It is not a defect in the file, and the
+   /// caller must never replace the store for it.
+   InUse,
    /// The database declares a schema this daemon must not misread.
    Schema(u32),
    /// One record cannot be read back as a rule of this version.
@@ -78,6 +84,7 @@ impl fmt::Display for StoreError {
       match self {
          Self::Io(error) => write!(f, "rule store I/O error: {error}"),
          Self::Redb(error) => write!(f, "rule store error: {error}"),
+         Self::InUse => f.write_str("the rule store is open in another process"),
          Self::Schema(version) => write!(
             f,
             "rule store schema version {version} is not supported (expected {SCHEMA_VERSION})"
@@ -94,7 +101,7 @@ impl std::error::Error for StoreError {
          Self::Io(error) => Some(error),
          Self::Redb(error) => Some(error),
          Self::Record { reason, .. } => Some(reason),
-         Self::Schema(_) | Self::Key => None,
+         Self::Schema(_) | Self::Key | Self::InUse => None,
       }
    }
 }
@@ -145,13 +152,24 @@ impl RuleStore {
    /// with a fresh seeded store; a path that cannot even be created (a read-only filesystem, a permission
    /// mistake) falls back to a store in memory, which works for the session and does not survive a
    /// restart. Both cases are reported at `error`: the rules are unavailable either way, and starting
-   /// unfiltered is the outcome this daemon must never produce.
+   /// unfiltered is the outcome this daemon must never produce. A store that is open in another process
+   /// is left alone and this process runs in memory, because replacing a live database would destroy the
+   /// rules the running daemon is serving from.
    ///
    /// The returned flag says whether the resolver seed was written, which is the only case where a rule
    /// appears without the user asking for one.
    pub fn load_or_seed(path: &Path) -> (Self, bool) {
       match Self::open(path) {
          Ok(store) => store,
+         // Somebody else holds the file. Nothing is wrong with it, so nothing is touched.
+         Err(StoreError::InUse) => {
+            error!(
+               "the rule store at {} is open in another process; starting with an in-memory store, so \
+                no rule will persist while it is in use",
+               path.display()
+            );
+            Self::in_memory()
+         }
          Err(error) => {
             error!(
                "the rule store at {} cannot be used ({error}); quarantining it and starting fresh",
@@ -159,6 +177,14 @@ impl RuleStore {
             );
             match Self::replace(path) {
                Ok(store) => store,
+               Err(StoreError::InUse) => {
+                  error!(
+                     "the rule store at {} became in use while it was being replaced; starting with an \
+                      in-memory store",
+                     path.display()
+                  );
+                  Self::in_memory()
+               }
                Err(error) => {
                   error!(
                      "could not create a rule store at {} ({error}); rules will not survive a restart",
@@ -171,13 +197,25 @@ impl RuleStore {
       }
    }
 
+   /// Opens or creates the database at `path`, keeping "in use" distinct from "unreadable".
+   ///
+   /// Every other failure means the bytes cannot be read as a database of this build, which is what
+   /// [`RuleStore::load_or_seed`] is allowed to replace; this one means somebody else has it open.
+   fn open_database(path: &Path) -> Result<Database, StoreError> {
+      match Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path) {
+         Ok(db) => Ok(db),
+         Err(redb::DatabaseError::DatabaseAlreadyOpen) => Err(StoreError::InUse),
+         Err(error) => Err(error.into()),
+      }
+   }
+
    /// Opens an existing database, or creates and seeds a new one when the path is free.
    fn open(path: &Path) -> Result<(Self, bool), StoreError> {
       if !path.exists() {
          return Self::create(path);
       }
 
-      let db = Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?;
+      let db = Self::open_database(path)?;
       let mut store = Self {
          db,
          rules: Vec::new(),
@@ -208,7 +246,7 @@ impl RuleStore {
          fs::create_dir_all(parent)?;
       }
 
-      let db = Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?;
+      let db = Self::open_database(path)?;
       let mut store = Self {
          db,
          rules: Vec::new(),
@@ -710,5 +748,43 @@ mod tests {
          "nothing was written to the unusable path"
       );
       let _ = fs::remove_file(&blocker);
+   }
+
+   #[test]
+   fn a_store_open_elsewhere_is_never_replaced() {
+      // `netshieldd --check` runs against a live service, and redb refuses a second open of the same
+      // file. That is not a broken store, so it must not be quarantined: replacing it would delete the
+      // rules the running daemon is serving from.
+      let path = temp_path("in-use");
+      let (mut store, _) = RuleStore::load_or_seed(&path);
+      let rule = sample_rule("belongs to the running daemon");
+      store.upsert(rule.clone()).expect("insert a rule");
+      drop(store);
+
+      let held = Database::builder()
+         .create(&path)
+         .expect("hold the store the way a running daemon does");
+      let (in_memory, seeded) = RuleStore::load_or_seed(&path);
+      assert_eq!(seeded, resolver_seed(0).is_some());
+      assert_eq!(
+         in_memory.rules().len(),
+         usize::from(resolver_seed(0).is_some()),
+         "the in-memory fallback carries the seed and nothing else"
+      );
+      assert!(
+         !unreadable_path(&path).exists(),
+         "a store that is in use must not be quarantined"
+      );
+      drop(in_memory);
+      drop(held);
+
+      let (reloaded, seeded) = RuleStore::load_or_seed(&path);
+      assert!(!seeded);
+      assert!(
+         reloaded.rules().contains(&rule),
+         "the store is intact once the other handle is gone"
+      );
+      let _ = fs::remove_file(&path);
+      let _ = fs::remove_file(unreadable_path(&path));
    }
 }
