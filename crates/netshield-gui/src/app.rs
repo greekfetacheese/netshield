@@ -169,8 +169,12 @@ impl App {
       let ctx_slot = Arc::clone(&ui_waker);
       let on_prompt = Arc::new(move |prompt: &PromptRequest| {
          let timeout = Duration::from_secs(prompt.timeout_secs);
+         // Only a prompt the model has not seen is presented here, so the window is raised
+         // before the UI drains the queue. A re-broadcast of an open id is left to the
+         // drain's in-place growth, which is the path that keeps its position and never
+         // shrinks the list on a stale repeat.
          if let Ok(mut model) = model_slot.lock()
-            && model.prompt().map(|open| open.id) != Some(prompt.id)
+            && model.get(prompt.id).is_none()
          {
             model.present(
                with_destinations(prompt.clone()),
@@ -366,6 +370,10 @@ impl App {
       for id in closed {
          self.remove_prompt(id);
       }
+      // The alert's own paint callback answers, steps and expires prompts outside this
+      // window's frames, so the local list is refreshed from the model it mutates before
+      // anything here reads it.
+      self.sync_pending();
 
       let now = Instant::now();
       if now < self.next_refresh {
@@ -393,8 +401,9 @@ impl App {
 
    /// Queues one prompt, replacing an earlier copy of the same id.
    ///
-   /// The prompt is also presented to the alert model, which starts its countdown. The
-   /// daemon only activates one prompt at a time, so a later one replaces the active alert.
+   /// The prompt is also presented to the alert model, which owns the local order and each
+   /// prompt's own countdown. A newer prompt is appended behind the one on screen; the
+   /// daemon publishes every prompt at once, so nothing here replaces the shown one.
    /// [`with_destinations`] fills the destination list before the prompt is stored, so the
    /// whole group the answer covers survives in the queue as well as in the alert.
    ///
@@ -414,14 +423,14 @@ impl App {
             prompt.id,
             prompt.dests.len()
          );
-         if self.model().prompt().map(|open| open.id) == Some(prompt.id) {
-            // Same id, so the selection and the raise guard are kept: the window is
-            // already up, and only its contents changed. The repaint is what makes the
-            // new destinations and labels visible before the next scheduled frame.
-            self.model().replace_prompt(prompt.clone());
-            if let Some(ctx) = self.ui_waker.lock().ok().and_then(|slot| slot.clone()) {
-               ctx.request_repaint();
-            }
+         // Same id, so the entry keeps its place and its selection: the window is already
+         // up, and only its contents changed. The repaint is what makes the new
+         // destinations and labels visible before the next scheduled frame.
+         self.model().replace_prompt(prompt.clone());
+         if self.model().prompt().map(|open| open.id) == Some(prompt.id)
+            && let Some(ctx) = self.ui_waker.lock().ok().and_then(|slot| slot.clone())
+         {
+            ctx.request_repaint();
          }
          self.pending[index] = prompt;
          return;
@@ -434,9 +443,7 @@ impl App {
       let timeout = Duration::from_secs(prompt.timeout_secs);
       self.prompt_deadlines.insert(prompt.id, Instant::now() + timeout);
       self.alerts.insert(prompt.id, AlertState::new());
-      if self.model().prompt().map(|open| open.id) != Some(prompt.id) {
-         self.model().present(prompt.clone(), timeout, Instant::now());
-      }
+      self.model().present(prompt.clone(), timeout, Instant::now());
       self.pending.push(prompt);
    }
 
@@ -446,11 +453,8 @@ impl App {
       self.pending.retain(|queued| queued.id != id);
       self.alerts.remove(&id);
       self.prompt_deadlines.remove(&id);
-      let mut model = self.model();
-      if model.prompt().is_some_and(|prompt| prompt.id == id) {
-         model.clear();
-      }
-      drop(model);
+      // Removing the shown prompt advances the alert to whatever is first afterwards.
+      self.model().remove(id);
       if had {
          log::info!("prompt {id} closed");
       }
@@ -461,6 +465,30 @@ impl App {
       self.prompt_deadlines.get(&id).map_or(0.0, |deadline| {
          deadline.saturating_duration_since(Instant::now()).as_secs_f32()
       })
+   }
+
+   /// Applies a step between prompts to the model and mirrors its order into `pending`.
+   ///
+   /// Nothing is answered: the prompt keeps running on its own deadline in the daemon.
+   fn step(&mut self, action: alert::AlertAction) {
+      {
+         let mut model = self.model();
+         match action {
+            alert::AlertAction::Later => model.later(),
+            alert::AlertAction::Previous => model.previous(),
+            alert::AlertAction::Decide(_) => return,
+         }
+      }
+      self.sync_pending();
+   }
+
+   /// Copies the alert model's local order into `pending`, the list the rest of the app reads.
+   ///
+   /// The model owns the order (the paint callback steps and answers it outside this
+   /// window's frames), so this is the one place the two copies are reconciled.
+   fn sync_pending(&mut self) {
+      let prompts = self.model().prompts().to_vec();
+      self.pending = prompts;
    }
 
    /// The alert model, with a poisoned lock recovered rather than propagated: a panic in
@@ -570,15 +598,27 @@ impl App {
          return;
       };
       let remaining = self.remaining_secs(prompt.id);
+      let waiting = self.pending.len().saturating_sub(1);
       let mut state = self.alerts.remove(&prompt.id).unwrap_or_default();
-      let mut decision = None;
+      let mut action = None;
       egui::CentralPanel::default().show(ui, |ui| {
-         decision = alert::ui(ui, &prompt, &mut state, remaining);
+         action = alert::ui(ui, &prompt, &mut state, remaining, waiting);
       });
       self.alerts.insert(prompt.id, state);
 
-      if let Some(decision) = decision {
-         self.answer(ui.ctx(), prompt.id, decision);
+      match action {
+         Some(alert::AlertAction::Decide(decision)) => {
+            self.answer(ui.ctx(), prompt.id, decision);
+         }
+         Some(alert::AlertAction::Later) => {
+            self.step(alert::AlertAction::Later);
+            ui.ctx().request_repaint();
+         }
+         Some(alert::AlertAction::Previous) => {
+            self.step(alert::AlertAction::Previous);
+            ui.ctx().request_repaint();
+         }
+         None => {}
       }
    }
 
@@ -921,8 +961,12 @@ fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider:
       return;
    };
    let remaining = model.remaining_secs(std::time::Instant::now()).unwrap_or(0.0);
-   if let Some(decision) = alert::ui(ui, &prompt, model.state_mut(), remaining) {
-      model.submit(decision);
+   let waiting = model.waiting();
+   match alert::ui(ui, &prompt, model.state_mut(), remaining, waiting) {
+      Some(alert::AlertAction::Decide(decision)) => model.submit(decision),
+      Some(alert::AlertAction::Later) => model.later(),
+      Some(alert::AlertAction::Previous) => model.previous(),
+      None => {}
    }
    if model.is_expired(std::time::Instant::now()) {
       model.clear();
@@ -1122,14 +1166,15 @@ mod tests {
       assert_eq!(app.pending[0].id, 7);
       assert_eq!(app.pending[1].id, 8);
 
-      // A growth of the older prompt lands where that prompt already was: the queue the
-      // user sees does not reorder, and the newest prompt stays the active one.
+      // A growth of the oldest prompt lands where that prompt already was: the queue the
+      // user sees does not reorder, and the oldest stays the one on screen.
       app.enqueue_prompt(group(7, 6));
       assert_eq!(app.pending.len(), 2);
       assert_eq!(app.pending[0].id, 7);
       assert_eq!(app.pending[0].dests.len(), 6);
       assert_eq!(app.pending[1].id, 8);
-      assert_eq!(app.model().prompt().map(|open| open.id), Some(8));
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(7));
+      assert_eq!(order(&app), vec![7, 8]);
    }
 
    #[test]
@@ -1226,19 +1271,31 @@ mod tests {
       );
    }
 
+   /// The ids the app and the model both hold, in local order.
+   fn order(app: &App) -> Vec<u64> {
+      let pending: Vec<u64> = app.pending.iter().map(|prompt| prompt.id).collect();
+      let model: Vec<u64> = app.model().prompts().iter().map(|prompt| prompt.id).collect();
+      assert_eq!(
+         pending, model,
+         "the app and the alert model must agree"
+      );
+      pending
+   }
+
    #[test]
-   fn the_model_keeps_the_latest_active_prompt() {
+   fn the_model_keeps_the_oldest_prompt_on_screen() {
       let mut app = app();
       app.enqueue_prompt(prompt(1));
       app.enqueue_prompt(prompt(2));
 
-      // The daemon activates one prompt at a time; the newest one owns the alert window.
+      // Every prompt is published at once, so the oldest unanswered one owns the window.
       assert_eq!(
          app.model().prompt().map(|prompt| prompt.id),
-         Some(2)
+         Some(1)
       );
+      assert_eq!(order(&app), vec![1, 2]);
 
-      // Closing the queued prompt leaves the model alone: it is not the active one.
+      // Closing the shown prompt advances to the next one.
       app.remove_prompt(1);
       assert_eq!(
          app.model().prompt().map(|prompt| prompt.id),
@@ -1247,6 +1304,59 @@ mod tests {
 
       app.remove_prompt(2);
       assert!(app.model().prompt().is_none());
+   }
+
+   /// Stepping with `Later` reorders the app's list and the model's identically, and sends
+   /// nothing: the prompt stays open in the daemon until it answers or expires.
+   #[test]
+   fn later_cycles_the_local_list_without_answering() {
+      let mut app = app();
+      for id in [1u64, 2, 3] {
+         app.enqueue_prompt(prompt(id));
+      }
+      assert_eq!(order(&app), vec![1, 2, 3]);
+
+      app.step(alert::AlertAction::Later);
+      assert_eq!(order(&app), vec![2, 3, 1]);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(2));
+
+      app.step(alert::AlertAction::Later);
+      assert_eq!(order(&app), vec![3, 1, 2]);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(3));
+
+      app.step(alert::AlertAction::Previous);
+      assert_eq!(order(&app), vec![2, 3, 1]);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(2));
+
+      assert!(
+         app.model().take_outgoing().is_empty(),
+         "stepping must not answer any prompt"
+      );
+   }
+
+   /// Answering the shown prompt sends exactly that decision, and the next becomes shown.
+   #[test]
+   fn answering_advances_to_the_next_prompt() {
+      let mut app = app();
+      for id in [1u64, 2] {
+         app.enqueue_prompt(prompt(id));
+      }
+
+      let shown = app.model().prompt().cloned().expect("a prompt is shown");
+      app.model().submit(Decision {
+         action: Action::Deny,
+         duration: netshield_core::rule::Duration::Session,
+         scope: ScopeChoice::AnyConnection,
+      });
+
+      let outgoing = app.model().take_outgoing();
+      assert_eq!(outgoing.len(), 1);
+      assert_eq!(outgoing[0].prompt_id, shown.id);
+      assert_eq!(
+         app.model().prompt().map(|prompt| prompt.id),
+         Some(2),
+         "the second prompt is shown after the first is answered"
+      );
    }
 
    #[test]

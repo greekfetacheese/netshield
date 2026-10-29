@@ -48,8 +48,12 @@ const SMALL_ROW: f32 = 12.0;
 const DESTINATION_ROW: f32 = 26.0;
 /// Height of one radio row, including the hit target.
 const RADIO_ROW: f32 = 22.0;
-/// Height of the `N more waiting` line.
-const PENDING_ROW: f32 = 12.0;
+/// Spare height the budget keeps for the header line.
+///
+/// The `+N waiting` counter shares the app row and `Later` shares the button row, so neither
+/// adds a section. The spare row is still counted so the fixed host window never has to grow
+/// for a shape, and it keeps the estimate identical whether prompts are waiting or not.
+const HEADER_SPARE: f32 = 12.0;
 /// Longest destination line drawn in the alert before it is elided; the list is one line
 /// per destination and must not wrap into the buttons.
 const DEST_LINE_CHARS: usize = 60;
@@ -167,6 +171,47 @@ pub struct Decision {
    pub scope: ScopeChoice,
 }
 
+/// What a click or a shortcut in the panel asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlertAction {
+   /// Answer the shown prompt with this decision.
+   Decide(Decision),
+   /// Step to the next open prompt without answering the shown one.
+   Later,
+   /// Step to the previous open prompt without answering the shown one.
+   Previous,
+}
+
+/// The controls in the panel's action row, left to right.
+///
+/// `Later` is only offered when another prompt is waiting behind the shown one; with a lone
+/// prompt the row is exactly the Deny/Allow pair it has always been.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertButton {
+   Later,
+   Deny,
+   Allow,
+}
+
+/// The action row for a prompt with `waiting` other prompts open behind it.
+pub fn button_row(waiting: usize) -> Vec<AlertButton> {
+   let mut row = Vec::with_capacity(2 + usize::from(waiting > 0));
+   if waiting > 0 {
+      row.push(AlertButton::Later);
+   }
+   row.push(AlertButton::Deny);
+   row.push(AlertButton::Allow);
+   row
+}
+
+/// The `+N waiting` counter shown beside the app name, or `None` for a lone prompt.
+///
+/// It shares the app row rather than adding a line, so the panel keeps its fixed height
+/// whether prompts are waiting or not.
+pub fn waiting_label(waiting: usize) -> Option<String> {
+   (waiting > 0).then(|| format!("+{waiting} waiting"))
+}
+
 /// Selection state for one alert.
 ///
 /// `duration` starts at `Session` ("until restart"). `scope` starts at `Any`, which is the
@@ -274,14 +319,16 @@ impl Default for AlertState {
 /// The alert's whole state, with no egui windowing in it: the host owns a viewport, this owns
 /// what that viewport shows and what the answer is.
 ///
-/// No host constructs it yet -- the deferred-viewport wiring is a separate change -- so the
-/// binary would otherwise warn on every field and method. Only the tests use it today.
+/// Every prompt the daemon publishes is kept in arrival order. The first entry is the one on
+/// screen; the rest are the others waiting behind it. The order is only ever changed by
+/// [`AlertModel::later`] and [`AlertModel::previous`], never by a re-broadcast, so a prompt
+/// that grows keeps its place.
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct AlertModel {
-   prompt: Option<PromptRequest>,
-   state: AlertState,
-   deadline: Option<std::time::Instant>,
+   pending: Vec<PromptRequest>,
+   states: std::collections::HashMap<u64, AlertState>,
+   deadlines: std::collections::HashMap<u64, std::time::Instant>,
    raised: std::collections::HashSet<u64>,
    outgoing: Vec<DecideRequest>,
 }
@@ -293,75 +340,130 @@ impl AlertModel {
       Self::default()
    }
 
-   /// Shows `prompt`, resets the selection to the defaults, and starts its countdown.
+   /// Adds `prompt` to the local list, or refreshes its payload when the id is already there.
    ///
-   /// The daemon only activates one prompt at a time and queues the rest, so a prompt
-   /// presented while another is active replaces it rather than waiting its turn.
+   /// A new prompt is appended, so the oldest unanswered prompt stays on screen; a prompt the
+   /// daemon re-broadcasts (same id, more destinations) is replaced in place and keeps both
+   /// its position and its own deadline. Each prompt has its own clock, so presenting one
+   /// never touches another prompt's countdown or selection.
    pub fn present(
       &mut self,
       prompt: PromptRequest,
       timeout: std::time::Duration,
       now: std::time::Instant,
    ) {
-      self.state = AlertState::new();
-      self.deadline = Some(now + timeout);
-      self.prompt = Some(prompt);
+      let id = prompt.id;
+      if self.pending.iter().any(|queued| queued.id == id) {
+         self.replace_prompt(prompt);
+         return;
+      }
+      self.states.entry(id).or_default();
+      self.deadlines.insert(id, now + timeout);
+      self.pending.push(prompt);
    }
 
-   /// Replaces the active prompt's payload with a newer copy of the same id.
+   /// Replaces a queued prompt's payload with a newer copy of the same id.
    ///
    /// The daemon re-broadcasts a prompt as destinations join its group, so only the
-   /// destination list changed. The selection and the countdown belong to the answer the
-   /// user is composing and must survive the update; a different id is ignored because
-   /// presenting and closing are the paths for a new prompt.
+   /// destination list changed. The entry keeps its list position, and if it is the one on
+   /// screen the selection and countdown belong to the answer the user is composing and
+   /// survive too. An unknown id is ignored: presenting and closing own the list's shape.
    pub fn replace_prompt(&mut self, prompt: PromptRequest) {
-      if self.prompt.as_ref().is_some_and(|open| open.id == prompt.id) {
-         self.prompt = Some(prompt);
+      if let Some(queued) = self.pending.iter_mut().find(|queued| queued.id == prompt.id) {
+         *queued = prompt;
       }
    }
 
-   /// The active prompt, if any.
+   /// The prompt on screen: the oldest unanswered one, if any.
    pub fn prompt(&self) -> Option<&PromptRequest> {
-      self.prompt.as_ref()
+      self.pending.first()
    }
 
-   /// The live selection, for `alert::ui`.
+   /// Every open prompt, in arrival order.
+   pub fn prompts(&self) -> &[PromptRequest] {
+      &self.pending
+   }
+
+   /// One open prompt by id, whether or not it is the one on screen.
+   pub fn get(&self, id: u64) -> Option<&PromptRequest> {
+      self.pending.iter().find(|queued| queued.id == id)
+   }
+
+   /// How many prompts are open.
+   pub fn len(&self) -> usize {
+      self.pending.len()
+   }
+
+   /// How many prompts are waiting behind the one on screen.
+   pub fn waiting(&self) -> usize {
+      self.pending.len().saturating_sub(1)
+   }
+
+   /// The live selection of the prompt on screen, for `alert::ui`.
    pub fn state_mut(&mut self) -> &mut AlertState {
-      &mut self.state
+      let id = self.pending.first().map_or(0, |prompt| prompt.id);
+      self.states.entry(id).or_default()
    }
 
-   /// Seconds left, for `alert::ui`'s `remaining`; `None` when no prompt is active.
+   /// Seconds left on the shown prompt's own countdown; `None` when no prompt is active.
    ///
    /// Saturates at `0.0`, never negative, so the countdown text and bar see one shape.
    pub fn remaining_secs(&self, now: std::time::Instant) -> Option<f32> {
-      self.prompt.as_ref()?;
-      let deadline = self.deadline?;
+      let id = self.pending.first()?.id;
+      let deadline = self.deadlines.get(&id)?;
       Some(deadline.saturating_duration_since(now).as_secs_f32())
    }
 
-   /// Whether the countdown has reached its deadline.
+   /// Whether the shown prompt has reached its own deadline.
    pub fn is_expired(&self, now: std::time::Instant) -> bool {
-      self.prompt.is_some() && self.deadline.is_some_and(|deadline| now >= deadline)
+      self
+         .pending
+         .first()
+         .and_then(|prompt| self.deadlines.get(&prompt.id))
+         .is_some_and(|deadline| now >= *deadline)
    }
 
    /// Returns the prompt id the first time it is called for that prompt, then `None`.
    /// This is the once-per-prompt guard for raising the window: never focus on every frame.
    pub fn raise_once(&mut self) -> Option<u64> {
-      let id = self.prompt.as_ref()?.id;
+      let id = self.prompt()?.id;
       self.raised.insert(id).then_some(id)
    }
 
-   /// Builds the `DecideRequest` from the current selection and queues it in `outgoing`.
+   /// Moves the shown prompt to the back of the list and shows the next one.
    ///
-   /// The request comes from [`AlertState::decision`], so it is exactly the rule the
-   /// preview line describes. After queueing, the prompt stops being active.
+   /// Nothing is answered: the prompt stays open in the daemon until its deadline. The newly
+   /// shown prompt is marked as raised so stepping through the list never yanks the window
+   /// away from where the user put it.
+   pub fn later(&mut self) {
+      if self.pending.len() > 1 {
+         self.pending.rotate_left(1);
+         self.mark_shown_raised();
+      }
+   }
+
+   /// Moves the shown prompt to the back and shows the one before it.
+   pub fn previous(&mut self) {
+      if self.pending.len() > 1 {
+         self.pending.rotate_right(1);
+         self.mark_shown_raised();
+      }
+   }
+
+   /// Builds the `DecideRequest` for the shown prompt and queues it in `outgoing`.
+   ///
+   /// The request comes from that prompt's own [`AlertState`], so it is exactly the rule the
+   /// preview line describes. After queueing, the prompt is removed and the alert advances to
+   /// whatever is first in the list.
    pub fn submit(&mut self, decision: Decision) {
-      let Some(prompt) = self.prompt.as_ref() else {
+      let Some(prompt) = self.pending.first() else {
          return;
       };
-      let request = self.state.decision(prompt, decision.action);
+      let id = prompt.id;
+      let state = self.states.entry(id).or_default();
+      let request = state.decision(prompt, decision.action);
       self.outgoing.push(request);
-      self.clear();
+      self.remove(id);
    }
 
    /// Hands the queued requests to the host, leaving the buffer empty.
@@ -369,10 +471,30 @@ impl AlertModel {
       std::mem::take(&mut self.outgoing)
    }
 
-   /// Drops the active prompt (after an answer or an expiry) and the countdown.
+   /// Removes one prompt and its state; returns whether it was open.
+   ///
+   /// A queued prompt can be closed by the daemon without being the one on screen, so this
+   /// is keyed by id rather than by position. Removing the shown prompt advances the alert.
+   pub fn remove(&mut self, id: u64) -> bool {
+      let before = self.pending.len();
+      self.pending.retain(|queued| queued.id != id);
+      self.states.remove(&id);
+      self.deadlines.remove(&id);
+      self.pending.len() != before
+   }
+
+   /// Drops the shown prompt (after an answer or an expiry) and advances.
    pub fn clear(&mut self) {
-      self.prompt = None;
-      self.deadline = None;
+      if let Some(id) = self.pending.first().map(|prompt| prompt.id) {
+         self.remove(id);
+      }
+   }
+
+   /// Records the current prompt as already raised, so cycling does not re-focus the window.
+   fn mark_shown_raised(&mut self) {
+      if let Some(prompt) = self.pending.first() {
+         self.raised.insert(prompt.id);
+      }
    }
 }
 
@@ -529,24 +651,32 @@ fn destination_label(view: &ConnectionView) -> String {
       .map_or_else(|| endpoint(view), str::to_owned)
 }
 
-/// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
+/// Draws the whole alert into `ui`. Returns the chosen action, if any button was pressed.
 ///
 /// The fixed layout is sized for the 480x462 host: app name, destination, duration, scope,
-/// countdown and the two action buttons all fit without scrolling. The app row is drawn
-/// first so a future section cannot push it off the top again; [`layout_height_estimate`]
-/// is the budget that guards that. The scope picker is always drawn, a group included: a
-/// group's list is visibly capped, and its default row is the app-wide rule that ends the
-/// prompting for the app instead of writing one rule per address. There are no keyboard
-/// shortcuts; Escape deliberately does nothing, because a stray key must not decide a
-/// firewall rule.
+/// countdown and the action buttons all fit without scrolling. The app row is drawn first so
+/// a future section cannot push it off the top again; [`layout_height_estimate`] is the
+/// budget that guards that. The scope picker is always drawn, a group included: a group's
+/// list is visibly capped, and its default row is the app-wide rule that ends the prompting
+/// for the app instead of writing one rule per address.
+///
+/// `waiting` is the number of *other* prompts open right now. It only adds the `+N waiting`
+/// counter to the app row and the `Later` button to the action row; a lone prompt draws
+/// exactly the panel it always has.
+///
+/// `PageDown`/`PageUp` step to the next/previous prompt without answering. The brief's first
+/// choice was `Tab`/`Shift+Tab`, but those are egui's own focus traversal (they move between
+/// the radios and buttons), so they collide and are deliberately not stolen here. Escape does
+/// nothing, because a stray key must not decide a firewall rule.
 pub fn ui(
    ui: &mut Ui,
    prompt: &PromptRequest,
    state: &mut AlertState,
    remaining_secs: f32,
-) -> Option<Decision> {
+   waiting: usize,
+) -> Option<AlertAction> {
    let view = &prompt.connection;
-   let mut decision = None;
+   let mut action = None;
 
    // The constants exist to catch a section that outgrows the fixed host window; the
    // matching test below states the spare margin the real layout must leave.
@@ -559,11 +689,9 @@ pub fn ui(
       ui.add_space(PANEL_TOP_GAP);
       ui.spacing_mut().item_spacing.y = SECTION_GAP;
 
-      // The app row goes first: the user must always know which program is asking.
-      app_row(ui, view);
-      if prompt.pending > 0 {
-         ui.label(RichText::new(format!("{} more waiting", prompt.pending)).small().weak());
-      }
+      // The app row goes first: the user must always know which program is asking. The
+      // counter shares the line, so the panel height never depends on how many wait.
+      app_row(ui, view, waiting_label(waiting));
 
       ui.add_space(SECTION_GAP);
       ui.label(RichText::new("wants to connect to").weak());
@@ -592,12 +720,36 @@ pub fn ui(
       );
 
       ui.add_space(SECTION_GAP);
+      action = action_row(ui, prompt, state, waiting);
+   });
+
+   action.or_else(|| shortcut_action(ui, waiting))
+}
+
+/// The button row. With a lone prompt this is exactly the Deny/Allow pair it always was.
+///
+/// `Later` joins to the left of `Deny` only when another prompt is waiting, and the row is
+/// laid out right to left so it stays anchored to the panel's right edge with `Allow` last.
+fn action_row(
+   ui: &mut Ui,
+   prompt: &PromptRequest,
+   state: &AlertState,
+   waiting: usize,
+) -> Option<AlertAction> {
+   let mut action = None;
+   let row = button_row(waiting);
+   if row.len() == 2 {
+      // The historical shape, byte for byte: two equal columns, Deny then Allow.
       ui.columns(2, |columns| {
          let deny =
             egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
          let deny_width = columns[0].available_width();
          if columns[0].add_sized(egui::vec2(deny_width, BUTTON_HEIGHT), deny).clicked() {
-            decision = Some(decision_for(state, prompt, Action::Deny));
+            action = Some(AlertAction::Decide(decision_for(
+               state,
+               prompt,
+               Action::Deny,
+            )));
          }
 
          let allow = egui::Button::new(
@@ -606,19 +758,87 @@ pub fn ui(
          .fill(ALLOW_FILL);
          let allow_width = columns[1].available_width();
          if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
-            decision = Some(decision_for(state, prompt, Action::Allow));
+            action = Some(AlertAction::Decide(decision_for(
+               state,
+               prompt,
+               Action::Allow,
+            )));
          }
       });
-   });
+      return action;
+   }
 
-   decision
+   let spacing = ui.spacing().item_spacing.x;
+   let width = ((ui.available_width() - spacing * 2.0) / 3.0).max(0.0);
+   ui.with_layout(
+      egui::Layout::right_to_left(egui::Align::Center),
+      |ui| {
+         let allow = egui::Button::new(
+            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
+         )
+         .fill(ALLOW_FILL);
+         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), allow).clicked() {
+            action = Some(AlertAction::Decide(decision_for(
+               state,
+               prompt,
+               Action::Allow,
+            )));
+         }
+
+         let deny =
+            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
+         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), deny).clicked() {
+            action = Some(AlertAction::Decide(decision_for(
+               state,
+               prompt,
+               Action::Deny,
+            )));
+         }
+
+         if row.contains(&AlertButton::Later) {
+            let later = ui
+               .add_sized(
+                  egui::vec2(width, BUTTON_HEIGHT),
+                  egui::Button::new("Later"),
+               )
+               .on_hover_text(format!(
+                  "Show the next prompt · {}",
+                  app_name(&prompt.connection)
+               ));
+            if later.clicked() {
+               action = Some(AlertAction::Later);
+            }
+         }
+      },
+   );
+   action
+}
+
+/// The keyboard step shortcuts: `PageDown` next, `PageUp` previous, only when one is waiting.
+///
+/// They are read after the buttons so a frame that both clicks and presses still answers.
+/// With a lone prompt the keys are left completely alone.
+fn shortcut_action(ui: &Ui, waiting: usize) -> Option<AlertAction> {
+   if waiting == 0 {
+      return None;
+   }
+   ui.input(|input| {
+      if input.key_pressed(egui::Key::PageDown) {
+         Some(AlertAction::Later)
+      } else if input.key_pressed(egui::Key::PageUp) {
+         Some(AlertAction::Previous)
+      } else {
+         None
+      }
+   })
 }
 
 /// Conservative vertical budget of the tallest panel the alert can draw, in points.
 ///
 /// It is deliberately generous: a real render must fit the configured window with room to
 /// spare, and the test below keeps a future section from silently clipping the app row.
-/// The `pending` line is always counted, even though it only appears when prompts queue.
+/// The header spare is always counted, even though it is slack rather than a section: the
+/// estimate must not change when a second prompt arrives.
 ///
 /// Every shape draws the scope picker now, so the group is no longer the shorter one: it
 /// adds the capped destination list to a scope block that is a row shorter than the single
@@ -631,7 +851,7 @@ pub fn layout_height_estimate() -> f32 {
 /// The stack of every section one prompt shape can draw; `group` adds the destination list
 /// and drops the domain checkbox row from the scope block.
 fn layout_height(group: bool) -> f32 {
-   let mut sections = PENDING_ROW
+   let mut sections = HEADER_SPARE
       + SECTION_GAP
       + APP_ROW
       + SECTION_GAP
@@ -661,14 +881,21 @@ fn layout_height(group: bool) -> f32 {
       + PANEL_TOP_GAP
 }
 
-/// The process name, with the right-aligned owner ids when the daemon attributed it.
+/// The process name, its `+N waiting` counter when others are open, and the right-aligned
+/// owner ids when the daemon attributed it.
 ///
-/// The name is elided rather than wrapped, so a long program name can never spill into
-/// the destination's line.
-fn app_row(ui: &mut Ui, view: &ConnectionView) {
+/// The name is elided rather than wrapped, so a long program name can never spill into the
+/// destination's line. The counter shares this line on purpose: it must not change the panel's
+/// height when other prompts arrive.
+fn app_row(ui: &mut Ui, view: &ConnectionView, waiting: Option<String>) {
    ui.horizontal(|ui| {
       let name = elide(&app_name(view), APP_NAME_CHARS);
       ui.add(egui::Label::new(RichText::new(name).size(20.0).strong()).truncate());
+
+      // Directly beside the name, before the right-aligned ids claim the rest of the line.
+      if let Some(waiting) = waiting {
+         ui.label(RichText::new(waiting).small().weak());
+      }
 
       let mut ids = Vec::new();
       if let Some(pid) = view.pid {
@@ -1368,9 +1595,8 @@ mod tests {
          ..Default::default()
       };
       let mut out: Vec<(&str, f32, f32)> = Vec::new();
-      for pending in [0usize, 2] {
-         let mut p = prompt(Some("www.google.com"), true);
-         p.pending = pending;
+      for waiting in [0usize, 2] {
+         let p = prompt(Some("www.google.com"), true);
          for _ in 0..3 {
             out.clear();
             let mut state = AlertState::new();
@@ -1381,16 +1607,8 @@ mod tests {
                      let mut m = |ui: &mut Ui, name: &'static str, kind: u8| {
                         let a = ui.cursor().min.y;
                         match kind {
-                           0 => app_row(ui, &p.connection),
-                           1 => {
-                              if p.pending > 0 {
-                                 ui.label(
-                                    RichText::new(format!("{} more waiting", p.pending))
-                                       .small()
-                                       .weak(),
-                                 );
-                              }
-                           }
+                           0 => app_row(ui, &p.connection, waiting_label(waiting)),
+                           1 => {}
                            2 => {
                               ui.label(RichText::new("wants to connect to").weak());
                            }
@@ -1410,24 +1628,7 @@ mod tests {
                               );
                            }
                            8 => {
-                              ui.columns(2, |columns| {
-                                 let w = columns[0].available_width();
-                                 columns[0].add_sized(
-                                    egui::vec2(w, BUTTON_HEIGHT),
-                                    egui::Button::new(
-                                       RichText::new("Deny").color(BUTTON_TEXT).strong(),
-                                    )
-                                    .fill(DENY_FILL),
-                                 );
-                                 let w = columns[1].available_width();
-                                 columns[1].add_sized(
-                                    egui::vec2(w, BUTTON_HEIGHT),
-                                    egui::Button::new(
-                                       RichText::new("Allow").color(BUTTON_TEXT).strong(),
-                                    )
-                                    .fill(ALLOW_FILL),
-                                 );
-                              });
+                              action_row(ui, &p, &state, waiting);
                            }
                            9 => ui.add_space(SECTION_GAP),
                            _ => {}
@@ -1454,7 +1655,7 @@ mod tests {
             });
             output.textures_delta.clear();
          }
-         println!("--- pending = {pending}");
+         println!("--- waiting = {waiting}");
          for (n, a, v) in &out {
             println!("{n:10} at {a:6.1} h={v:5.1}");
          }
@@ -1551,7 +1752,8 @@ mod tests {
       assert!(!model.is_expired(start + timeout - std::time::Duration::from_nanos(1)));
       assert!(model.is_expired(start + timeout));
 
-      // A prompt presented while one is active replaces it and resets the selection.
+      // A new prompt is appended behind the one on screen: it does not replace it, and it
+      // gets its own deadline instead of inheriting the shown prompt's.
       model.state_mut().duration = Duration::Forever;
       model.state_mut().scope = Scope::Domain;
       let mut next = prompt(Some("github.com"), true);
@@ -1561,10 +1763,20 @@ mod tests {
          std::time::Duration::from_secs(10),
          start,
       );
-      assert_eq!(model.prompt(), Some(&next));
-      assert_eq!(model.state_mut().duration, Duration::Session);
-      assert_eq!(model.state_mut().scope, Scope::Any);
-      assert_eq!(model.remaining_secs(start), Some(10.0));
+      assert_eq!(model.get(9), Some(&next));
+      assert_eq!(model.len(), 2);
+      assert_eq!(
+         model.prompt().map(|open| open.id),
+         Some(7),
+         "the older prompt stays on screen"
+      );
+      assert_eq!(
+         model.state_mut().duration,
+         Duration::Forever,
+         "a second prompt must not reset the shown prompt's selection"
+      );
+      assert_eq!(model.state_mut().scope, Scope::Domain);
+      assert_eq!(model.remaining_secs(start), Some(30.0));
    }
 
    /// The daemon re-broadcasts a prompt as destinations join its group: the newer payload
@@ -1644,9 +1856,20 @@ mod tests {
       assert_eq!(model.raise_once(), Some(7));
       assert_eq!(model.raise_once(), None);
 
+      // A prompt that arrives behind the shown one does not raise: the window is already
+      // up, and a second focus would steal the keyboard from the answer being composed.
       let mut next = prompt(Some("github.com"), true);
       next.id = 9;
       model.present(next, std::time::Duration::from_secs(30), now);
+      assert_eq!(model.raise_once(), None);
+
+      // Answering the shown prompt advances to it, and that transition does raise.
+      model.submit(Decision {
+         action: Action::Deny,
+         duration: Duration::Session,
+         scope: ScopeChoice::AnyConnection,
+      });
+      assert_eq!(model.prompt().map(|open| open.id), Some(9));
       assert_eq!(model.raise_once(), Some(9));
       assert_eq!(model.raise_once(), None);
    }
@@ -1724,6 +1947,146 @@ mod tests {
       assert!(
          model.take_outgoing().is_empty(),
          "the buffer must be empty after a take"
+      );
+   }
+
+   /// Three prompts with independent ids, in arrival order.
+   fn three_prompts(model: &mut AlertModel, now: std::time::Instant) {
+      for id in [1u64, 2, 3] {
+         let mut request = prompt(Some("www.google.com"), true);
+         request.id = id;
+         model.present(request, std::time::Duration::from_secs(30), now);
+      }
+   }
+
+   /// The ids currently on screen and waiting, in local order.
+   fn order(model: &AlertModel) -> Vec<u64> {
+      model.prompts().iter().map(|prompt| prompt.id).collect()
+   }
+
+   #[test]
+   fn a_lone_prompt_shows_no_counter_and_no_later() {
+      let mut model = AlertModel::new();
+      model.present(
+         prompt(Some("www.google.com"), true),
+         std::time::Duration::from_secs(30),
+         clock(),
+      );
+
+      assert_eq!(model.waiting(), 0);
+      assert_eq!(
+         waiting_label(model.waiting()),
+         None,
+         "a lone prompt draws no counter"
+      );
+      assert_eq!(
+         button_row(model.waiting()),
+         vec![AlertButton::Deny, AlertButton::Allow],
+         "a lone prompt keeps exactly the Deny/Allow pair"
+      );
+      assert!(
+         !button_row(model.waiting()).contains(&AlertButton::Later),
+         "Later only exists when another prompt is waiting"
+      );
+   }
+
+   #[test]
+   fn a_second_prompt_is_counted() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      let mut first = prompt(Some("www.google.com"), true);
+      first.id = 1;
+      model.present(first, std::time::Duration::from_secs(30), now);
+      let mut second = prompt(Some("github.com"), true);
+      second.id = 2;
+      model.present(second, std::time::Duration::from_secs(30), now);
+
+      assert_eq!(
+         waiting_label(model.waiting()),
+         Some("+1 waiting".to_owned())
+      );
+      assert_eq!(
+         button_row(model.waiting()),
+         vec![AlertButton::Later, AlertButton::Deny, AlertButton::Allow],
+         "Later joins to the left of Deny"
+      );
+      assert_eq!(
+         model.prompt().map(|open| open.id),
+         Some(1),
+         "the oldest unanswered prompt is the one on screen"
+      );
+   }
+
+   #[test]
+   fn later_shows_the_next_prompt_without_answering() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      three_prompts(&mut model, now);
+
+      assert_eq!(model.prompt().map(|open| open.id), Some(1));
+      model.later();
+      assert_eq!(model.prompt().map(|open| open.id), Some(2));
+      model.later();
+      assert_eq!(model.prompt().map(|open| open.id), Some(3));
+
+      assert_eq!(
+         order(&model),
+         vec![3, 1, 2],
+         "Later rotates, it never drops"
+      );
+      assert!(
+         model.take_outgoing().is_empty(),
+         "stepping sends no decision for any prompt"
+      );
+   }
+
+   #[test]
+   fn answering_advances_to_the_next() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      three_prompts(&mut model, now);
+
+      model.submit(Decision {
+         action: Action::Deny,
+         duration: Duration::Session,
+         scope: ScopeChoice::AnyConnection,
+      });
+
+      assert_eq!(
+         model.prompt().map(|open| open.id),
+         Some(2),
+         "the second prompt becomes the shown one"
+      );
+      assert_eq!(order(&model), vec![2, 3]);
+      let outgoing = model.take_outgoing();
+      assert_eq!(outgoing.len(), 1);
+      assert_eq!(outgoing[0].prompt_id, 1);
+   }
+
+   #[test]
+   fn a_grown_prompt_keeps_its_place() {
+      let mut model = AlertModel::new();
+      let now = clock();
+      three_prompts(&mut model, now);
+
+      let mut grown = group_of_six();
+      grown.id = 2;
+      model.replace_prompt(grown);
+
+      assert_eq!(
+         order(&model),
+         vec![1, 2, 3],
+         "growth never reorders the list"
+      );
+      assert_eq!(
+         model.get(2).map(|prompt| prompt.dests.len()),
+         Some(6),
+         "the second prompt gets the newer payload"
+      );
+      assert_eq!(
+         model.prompt().map(|open| open.id),
+         Some(1),
+         "the shown prompt is unchanged"
       );
    }
 }
