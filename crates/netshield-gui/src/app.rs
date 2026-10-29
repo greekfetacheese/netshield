@@ -8,7 +8,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use netshield_core::ipc::{
    DecideRequest, Mode, PromptRequest, Request, Response, ScopeChoice, StatusInfo,
 };
-use netshield_core::rule::Rule;
 
 use crate::alert::{self, AlertModel, AlertState, Decision};
 use crate::mock::{Mock, MockEvent};
@@ -18,6 +17,8 @@ use crate::{
    Cli,
    connlog::ConnectionLog,
    ipc::{self, Decider, IpcClient},
+   ruleset::Ruleset,
+   work,
 };
 
 /// How many connection rows the history keeps before dropping the oldest.
@@ -110,7 +111,9 @@ pub struct App {
    /// Latest snapshot; `None` until the daemon answers the first `Status` request.
    status: Option<StatusInfo>,
    next_refresh: Instant,
-   rules: Vec<Rule>,
+   /// The rule list as received, with the revision that moves whenever it is replaced; the
+   /// Connections derivation keys on the pair.
+   rules: Ruleset,
    confirm: ui::rules::Confirm,
    /// Which applications are expanded on the Connections page.
    connections_expanded: ui::connections::Expanded,
@@ -208,6 +211,17 @@ impl App {
             ctx.request_repaint();
          }
       });
+      // The derivation thread wakes the UI exactly as the socket thread does: a finished rebuild
+      // has to reach a frame even when no input does.
+      let work_waker: ipc::Waker = {
+         let wake_slot = Arc::clone(&ui_waker);
+         Arc::new(move || {
+            if let Some(ctx) = wake_slot.lock().ok().and_then(|slot| slot.clone()) {
+               ctx.request_repaint();
+            }
+         })
+      };
+      let work = work::Worker::spawn(work_waker);
       let ipc = if cli.mock {
          None
       } else {
@@ -253,11 +267,11 @@ impl App {
          mode: Mode::Alert,
          status: None,
          next_refresh: Instant::now() + REFRESH_EVERY,
-         rules: Vec::new(),
+         rules: Ruleset::default(),
          confirm: ui::rules::Confirm::default(),
          connections_expanded: ui::connections::Expanded::default(),
          connections_showing_all: ui::connections::ShowingAll::default(),
-         connections_cache: ui::connections::LinesCache::default(),
+         connections_cache: ui::connections::LinesCache::new(work),
          connections_selection: ui::connections::Selection::default(),
          editor: ui::rules::Editor::default(),
          refresh_rules: false,
@@ -348,7 +362,7 @@ impl App {
                   }
                   Response::Prompt(prompt) => arrived.push(prompt),
                   Response::PromptClosed { id, .. } => closed.push(id),
-                  Response::Rules { rules } => self.rules = rules,
+                  Response::Rules { rules } => self.rules.install(rules),
                   _ => {}
                },
             }
@@ -841,7 +855,7 @@ impl App {
             &mut self.connections_selection,
          ),
          Page::Rules => {
-            let actions = ui::rules::show(ui, &self.rules, &mut self.confirm);
+            let actions = ui::rules::show(ui, self.rules.as_slice(), &mut self.confirm);
             self.apply_actions(actions);
             // Drawn after the table so the modal sits over it.
             if let Some(rule) = self.editor.show(ui.ctx(), unix_now()) {

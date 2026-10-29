@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use netshield_core::ipc::{ConnectionEvent, ConnectionView};
 use netshield_core::rule::RuleId;
@@ -89,8 +90,11 @@ fn app_label(view: &ConnectionView) -> String {
 }
 
 /// A fixed-capacity ring of rendered connections, oldest first.
+#[derive(Debug)]
 pub struct ConnectionLog {
-   rows: VecDeque<Row>,
+   /// Rows are shared rather than owned so handing a snapshot of the log to another thread
+   /// is a refcount bump instead of a deep clone of every string in the history.
+   rows: VecDeque<Arc<Row>>,
    capacity: usize,
    dropped: u64,
    /// Bumped whenever the contents change, so the UI can cache a derived line list and
@@ -120,13 +124,29 @@ impl ConnectionLog {
          self.rows.pop_front();
          self.dropped += 1;
       }
-      self.rows.push_back(Row::from_event(event));
+      self.rows.push_back(Arc::new(Row::from_event(event)));
       self.version += 1;
    }
 
    /// Rows oldest first; the table reverses this so the newest is on top.
+   /// The rows are shared, so this borrows through the reference rather than handing out the
+   /// owning count.
    pub fn rows(&self) -> impl DoubleEndedIterator<Item = &Row> {
-      self.rows.iter()
+      self.rows.iter().map(std::convert::AsRef::as_ref)
+   }
+
+   /// A frozen copy of the log for a background rebuild.
+   ///
+   /// The rows are shared, so this is a refcount bump per row rather than a deep clone of every
+   /// string in the history; the copy never moves while a derivation reads it, which is the whole
+   /// point of taking one.
+   pub fn snapshot(&self) -> Self {
+      Self {
+         rows: self.rows.clone(),
+         capacity: self.capacity,
+         dropped: self.dropped,
+         version: self.version,
+      }
    }
 
    pub fn len(&self) -> usize {

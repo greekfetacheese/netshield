@@ -6,9 +6,11 @@ mod connlog;
 mod ipc;
 mod logging;
 mod mock;
+mod ruleset;
 mod theme;
 mod tray;
 mod ui;
+mod work;
 
 use std::path::PathBuf;
 
