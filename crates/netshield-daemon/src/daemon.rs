@@ -39,7 +39,6 @@ use netshield_core::packet::{L4Payload, ParsedPacket, parse};
 use netshield_core::rule::{Action, AppMatcher, Duration as RuleDuration, Rule, RuleId};
 use netshield_core::{DestMatcher, IpNet, ScopeRequest, rule_from_scope};
 
-use crate::conntrack::{Conntrack, Owner};
 use crate::ebpf;
 use crate::firewall::{self, FirewallError};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
@@ -47,7 +46,7 @@ use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
 use crate::policy::{Applied, Decision, Policy};
-use crate::proc::{Attributor, Missing, ProcessCache};
+use crate::proc::{Attributor, FlowOwner, Missing, ProcessCache, live_flows};
 use crate::store::{RuleStore, StoreError};
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
@@ -94,35 +93,26 @@ const REVOKE_TIMEOUT_SECS: u64 = 60;
 #[derive(Debug, PartialEq, Eq)]
 enum Revoke {
    Nothing,
-   Uids(Vec<u32>),
+   /// The flows held by processes running one executable — the same evidence the rule's own
+   /// `AppMatcher::Exe` is matched against, never the uid, which every application of a
+   /// desktop session shares.
+   Exe(PathBuf),
    All,
 }
 
 /// What a rule change revokes.
 ///
-/// A rule names an executable, so the flows to revoke are the ones owned by processes running that
-/// executable right now — the same evidence the rules are applied with. `live` is the daemon's own
-/// record of `(uid, exe)` for the processes it has attributed, which is preferred over a fresh
-/// `/proc` sweep: the cache also holds processes that have already exited, and a sweep would be a
-/// second scanner next to the one attribution already runs.
-fn rule_revoke(rule: &Rule, live: &[(u32, PathBuf)]) -> Revoke {
+/// A rule names an executable, so the flows to revoke are the ones held by processes running that
+/// executable right now. The enumeration is the socket table's ([`live_flows`]), not the daemon's
+/// attribution cache: a flow established while the daemon was not running was never attributed by
+/// it, and a revocation that cannot see such a flow leaves the app holding the access the deleted
+/// rule granted.
+fn rule_revoke(rule: &Rule) -> Revoke {
    match &rule.app {
-      AppMatcher::Exe(path) => {
-         // De-duplicated because one process can hold several of the app's flows, and the uid is
-         // what the conntrack dump takes: the same uid twice would list the same flows twice.
-         let mut uids: Vec<u32> =
-            live.iter().filter(|(_, exe)| exe == path).map(|(uid, _)| *uid).collect();
-         uids.sort_unstable();
-         uids.dedup();
-         if uids.is_empty() {
-            Revoke::Nothing
-         } else {
-            Revoke::Uids(uids)
-         }
-      }
+      AppMatcher::Exe(path) => Revoke::Exe(path.clone()),
       AppMatcher::Any => Revoke::All,
-      // Unattributable flows have no uid to look them up by, and they are governed by the
-      // closed-flow policy, so an `Unknown` rule has nothing it could revoke.
+      // Unattributable flows have no executable to look them up by, and they are governed by
+      // the closed-flow policy, so an `Unknown` rule has nothing it could revoke.
       AppMatcher::Unknown => Revoke::Nothing,
    }
 }
@@ -132,9 +122,9 @@ fn rule_revoke(rule: &Rule, live: &[(u32, PathBuf)]) -> Revoke {
 /// A deny must reach running traffic, because a connection that survives the rule would keep
 /// its old verdict for the life of the socket. An allow is not a revocation: it grants rather
 /// than withdraws, so nothing running is reset.
-fn upsert_revoke(rule: &Rule, live: &[(u32, PathBuf)]) -> Revoke {
+fn upsert_revoke(rule: &Rule) -> Revoke {
    if rule.action == Action::Deny {
-      rule_revoke(rule, live)
+      rule_revoke(rule)
    } else {
       Revoke::Nothing
    }
@@ -262,9 +252,6 @@ struct Daemon {
    attributor: Attributor,
    ipc: IpcHandle,
    queue: NfQueue,
-   /// The ctnetlink handle a revocation dumps and kills flows through. `None` when it could not be
-   /// opened, which only means decisions cannot reach running traffic; the daemon still runs.
-   conntrack: Option<Conntrack>,
    mode: Mode,
    started_at: u64,
    queue_drops: u64,
@@ -288,18 +275,6 @@ impl Daemon {
    ) -> Self {
       let policy = Policy::new(ruleset_from_store(&store), config.default_action);
       let started_at = now_secs();
-      // Like the send registry: an optional capability, never a reason not to start. A daemon
-      // without it still enforces every new flow, it just cannot revoke an established one.
-      let conntrack = match Conntrack::open() {
-         Ok(conntrack) => Some(conntrack),
-         Err(err) => {
-            warn!(
-               "could not open the ctnetlink handle: {err}; decision changes can then not be \
-                revoked, so an established flow keeps its old verdict"
-            );
-            None
-         }
-      };
       Self {
          config,
          store,
@@ -315,7 +290,6 @@ impl Daemon {
          },
          ipc,
          queue,
-         conntrack,
          mode: Mode::Alert,
          started_at,
          queue_drops: 0,
@@ -349,46 +323,18 @@ impl Daemon {
       }
    }
 
-   /// The processes the daemon has attributed, as `(uid, exe)`.
-   ///
-   /// This is the same evidence a rule is matched against: [`rule_revoke`] needs the uid of every
-   /// live process running a rule's executable, and an identity cached from attribution carries
-   /// both fields. A process whose `exe` was never readable is omitted rather than guessed.
-   fn live_apps(&self) -> Vec<(u32, PathBuf)> {
-      self
-         .attributor
-         .identities()
-         .into_iter()
-         .filter_map(|identity| identity.exe.map(|exe| (identity.uid, exe)))
-         .collect()
-   }
-
    /// Kills the flows a decision change just affected, so their owner has to reconnect.
    ///
    /// The next packet on a killed flow is rejected rather than queued, so the app sees a reset
    /// and opens a new connection, which the output chain queues and the policy decides again.
-   /// Nothing is a no-op: a mode switch back to silent, or a rule that governs no live process,
-   /// must not touch any flow.
+   /// `Nothing` revokes nothing: a rule that governs no live process, or one that was never an
+   /// application rule, must not touch a running flow.
    fn revoke_flows(&mut self, who: Revoke, reason: &str) {
-      let owners: Vec<Owner> = match who {
+      let flows = match who {
          Revoke::Nothing => return,
-         Revoke::All => vec![Owner::All],
-         Revoke::Uids(uids) => uids.into_iter().map(Owner::Uid).collect(),
+         Revoke::Exe(path) => live_flows(FlowOwner::Exe(&path)),
+         Revoke::All => live_flows(FlowOwner::All),
       };
-      let Some(conntrack) = self.conntrack.as_mut() else {
-         warn!("cannot revoke {reason}: no ctnetlink handle");
-         return;
-      };
-      let mut flows = Vec::new();
-      for owner in owners {
-         match conntrack.established_flows(owner) {
-            Ok(found) => flows.extend(found),
-            Err(err) => {
-               warn!("could not list the flows to revoke for {reason}: {err}");
-               return;
-            }
-         }
-      }
       match firewall::kill_flows(
          self.config.table_name(),
          &flows,
@@ -591,9 +537,9 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    );
    daemon.publish_rules();
    daemon.publish_status();
-   // Before any packet is served: every flow this daemon stamped was established while it was not
-   // running and was never checked by it, so it must not outlive the restart. The table is already
-   // installed, without which the kill would have nothing to reject against.
+   // Before any packet is served: every live flow on the machine was established while the daemon
+   // was not running and was never checked by it, so it must not outlive the restart. The table is
+   // already installed, without which the kill would have nothing to reject against.
    daemon.revoke_flows(Revoke::All, "the daemon started");
    info!(
       "netshieldd running: queue {} for flows, queue {} for DNS, control {}",
@@ -708,8 +654,8 @@ impl Daemon {
          return;
       }
       self.mode = requested;
-      // Either direction between silent and alert is a decision change for every flow this daemon
-      // stamped, so all of them are reset and the apps reconnect into the mode now in effect. This
+      // Either direction between silent and alert is a decision change for every live flow on the
+      // machine, so all of them are reset and the apps reconnect into the mode now in effect. This
       // is the point of the switch: a flow silently allowed must not outlive the move to
       // prompting, and one allowed under a prompt must not keep running unanswered if the mode
       // goes silent. It runs once per change, not per flow.
@@ -755,7 +701,7 @@ impl Daemon {
             let mut rule = rule;
             rule.updated_at = now_secs();
             // The rule's app has to be read before the change, and only a deny revokes.
-            let revoke = upsert_revoke(&rule, &self.live_apps());
+            let revoke = upsert_revoke(&rule);
             self.policy.upsert_rule(rule.clone());
             if let Err(err) = self.store.upsert(rule) {
                error!("could not persist a rule from the control socket: {err}");
@@ -777,7 +723,7 @@ impl Daemon {
             self.policy.remove_rule(&id);
             self.publish_rules();
             if let Some(rule) = rule {
-               let revoke = rule_revoke(&rule, &self.live_apps());
+               let revoke = rule_revoke(&rule);
                self.revoke_flows(revoke, "a rule was deleted");
             }
             self.publish_status();
@@ -794,7 +740,7 @@ impl Daemon {
                // Disabling withdraws a decision; enabling only widens what is allowed, so it is
                // not a revocation and must not reset a running flow.
                if !enabled {
-                  let revoke = rule_revoke(&rule, &self.live_apps());
+                  let revoke = rule_revoke(&rule);
                   self.revoke_flows(revoke, "a rule was disabled");
                }
                self.publish_status();
@@ -3337,85 +3283,40 @@ mod tests {
       );
    }
 
-   /// The live processes a rule's revocation is derived from, as the daemon records them.
-   fn live_processes(entries: &[(&str, u32)]) -> Vec<(u32, PathBuf)> {
-      entries.iter().map(|(exe, uid)| (*uid, PathBuf::from(exe))).collect()
-   }
-
-   /// A rule revokes the uids running its executable: one per executable, deduplicated and
-   /// sorted; an any rule revokes everything and an unknown rule revokes nothing.
+   /// A rule revokes the executable it names, and nothing wider.
    #[test]
-   fn a_rule_revokes_the_uids_running_its_executable() {
-      // Two processes running the same executable, one running another: the uid comes back once
-      // for the shared path and the unrelated path contributes nothing.
-      let live = live_processes(&[
-         ("/usr/lib/firefox/firefox", 1000),
-         ("/usr/lib/firefox/firefox", 1000),
-         ("/usr/bin/curl", 1001),
-      ]);
+   fn a_rule_revokes_the_app_it_names() {
       assert_eq!(
-         rule_revoke(&allow_rule_for("/usr/lib/firefox/firefox"), &live),
-         Revoke::Uids(vec![1000])
-      );
-
-      // Two distinct uids on the matching path are both kept, in a deterministic order.
-      let live = live_processes(&[
-         ("/usr/lib/firefox/firefox", 1001),
-         ("/usr/bin/curl", 1002),
-         ("/usr/lib/firefox/firefox", 1000),
-      ]);
-      assert_eq!(
-         rule_revoke(&allow_rule_for("/usr/lib/firefox/firefox"), &live),
-         Revoke::Uids(vec![1000, 1001])
-      );
-
-      // A rule whose executable has no live process, and an empty record, revoke nothing.
-      assert_eq!(
-         rule_revoke(
-            &allow_rule_for("/usr/bin/curl"),
-            &live_processes(&[("/usr/bin/curl", 1000)])
-         ),
-         Revoke::Uids(vec![1000])
-      );
-      assert_eq!(
-         rule_revoke(&allow_rule_for("/usr/bin/lynx"), &live),
-         Revoke::Nothing
-      );
-      assert_eq!(
-         rule_revoke(&allow_rule_for("/usr/bin/lynx"), &[]),
-         Revoke::Nothing
+         rule_revoke(&allow_rule_for("/usr/lib/firefox/firefox")),
+         Revoke::Exe(std::path::PathBuf::from(
+            "/usr/lib/firefox/firefox"
+         ))
       );
 
       // An any rule is not scoped to a process at all, so it revokes everything.
       let mut rule = allow_rule_for("/usr/bin/curl");
       rule.app = AppMatcher::Any;
-      assert_eq!(
-         rule_revoke(&rule, &live_processes(&[("/usr/bin/curl", 1000)])),
-         Revoke::All
-      );
-      assert_eq!(rule_revoke(&rule, &[]), Revoke::All);
+      assert_eq!(rule_revoke(&rule), Revoke::All);
 
       // An unknown owner names nothing to revoke.
       let mut rule = allow_rule_for("/usr/bin/curl");
       rule.app = AppMatcher::Unknown;
-      assert_eq!(
-         rule_revoke(&rule, &live_processes(&[("/usr/bin/curl", 1000)])),
-         Revoke::Nothing
-      );
+      assert_eq!(rule_revoke(&rule), Revoke::Nothing);
    }
 
    /// A deny upsert is the only upsert that revokes; an allow leaves running traffic alone.
    #[test]
    fn an_upserting_decision_revokes_only_on_deny() {
-      let live = live_processes(&[("/usr/lib/firefox/firefox", 1000)]);
       let allow = allow_rule_for("/usr/lib/firefox/firefox");
       let mut deny = allow.clone();
       deny.action = Action::Deny;
 
-      assert_eq!(upsert_revoke(&allow, &live), Revoke::Nothing);
+      assert_eq!(upsert_revoke(&allow), Revoke::Nothing);
       assert_eq!(
-         upsert_revoke(&deny, &live),
-         Revoke::Uids(vec![1000])
+         upsert_revoke(&deny),
+         Revoke::Exe(std::path::PathBuf::from(
+            "/usr/lib/firefox/firefox"
+         ))
       );
    }
 }
