@@ -65,10 +65,6 @@ const BUTTON_HEIGHT: f32 = 32.0;
 /// Longest process name drawn before it is elided; the row must stay one line.
 const APP_NAME_CHARS: usize = 30;
 
-/// Character budget of the rule preview line. The alert is only 480pt wide, so the line
-/// is elided to stay one line instead of wrapping into the buttons.
-const RULE_PREVIEW_CHARS: usize = 60;
-
 /// How many destinations the group list shows before the `+N more` remainder.
 ///
 /// Three, not four: the scope control is drawn for a group too and costs one row, so the
@@ -76,10 +72,10 @@ const RULE_PREVIEW_CHARS: usize = 60;
 /// action buttons past [`HEIGHT`] on the tallest shape.
 pub const DEST_LINES: usize = 3;
 
-/// Longest app name kept in the rule preview before it is elided.
+/// Longest app name kept in a scope row before it is elided.
 const PREVIEW_APP_CHARS: usize = 20;
 
-/// Longest host kept in the rule preview before it is elided.
+/// Longest host kept in a scope row before it is elided.
 const PREVIEW_HOST_CHARS: usize = 26;
 
 /// Red fill of the Deny button. White text keeps the contrast well above 4.5:1.
@@ -452,9 +448,8 @@ impl AlertModel {
 
    /// Builds the `DecideRequest` for the shown prompt and queues it in `outgoing`.
    ///
-   /// The request comes from that prompt's own [`AlertState`], so it is exactly the rule the
-   /// preview line describes. After queueing, the prompt is removed and the alert advances to
-   /// whatever is first in the list.
+   /// The request comes from that prompt's own [`AlertState`]. After queueing, the prompt is
+   /// removed and the alert advances to whatever is first in the list.
    pub fn submit(&mut self, decision: Decision) {
       let Some(prompt) = self.pending.first() else {
          return;
@@ -495,68 +490,6 @@ impl AlertModel {
       if let Some(prompt) = self.pending.first() {
          self.raised.insert(prompt.id);
       }
-   }
-}
-
-/// The rule the current selections would write, as one line:
-/// `allow firefox → anywhere · until restart`.
-///
-/// It renders exactly what [`AlertState::decision`] will send, never what the radios look
-/// like: a scope that is not available for this prompt reads as the scope the decision
-/// actually produces. On a group the list above the picker still shows what prompted the
-/// question, but the sentence names the grant: `anywhere` for the app-wide default, `these N
-/// destinations` only when that is the scope the click sends. Pure, so the wording is
-/// testable without a window.
-pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) -> String {
-   let verb = match action {
-      Action::Allow => "allow",
-      Action::Deny => "deny",
-   };
-   let app = elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS);
-   let scope = preview_scope(prompt, state);
-   let duration = duration_label(state.duration);
-   elide(
-      &format!("{verb} {app} → {scope} · {duration}"),
-      RULE_PREVIEW_CHARS,
-   )
-}
-
-/// The duration phrase shared by the preview and the grant sentence.
-fn duration_label(duration: Duration) -> &'static str {
-   match duration {
-      Duration::Once => "once",
-      Duration::Session => "until restart",
-      Duration::Forever => "forever",
-   }
-}
-
-/// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
-///
-/// The app-wide scope reads as `anywhere`, which is what its rule holds. The address scope
-/// renders as the bare address, matching what `DestMatcher::Ip` holds: there is no name to
-/// prefix and no subdomain question, so `only` would add nothing. The group scope names the
-/// count, because the click writes one rule for each of them.
-fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
-   match state.effective_scope(prompt) {
-      Scope::Any => "anywhere".to_owned(),
-      Scope::Address => prompt.connection.remote_ip.to_string(),
-      Scope::Domain => match offered_domain(prompt) {
-         Some(host) => {
-            let host = elide(host, PREVIEW_HOST_CHARS);
-            if state.subdomains {
-               format!("only *.{host}")
-            } else {
-               format!("only {host}")
-            }
-         }
-         // `effective_scope` never returns `Domain` without an offered host; state the
-         // address scope it resolves to rather than inventing a name.
-         None => prompt.connection.remote_ip.to_string(),
-      },
-      Scope::TheseDestinations => format!(
-         "these {} destinations",
-         destinations(prompt).len()
-      ),
    }
 }
 
@@ -685,7 +618,7 @@ pub fn ui(
       "the alert layout outgrew its {HEIGHT}pt host window",
    );
 
-   egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
+   panel_frame(ui).show(ui, |ui| {
       ui.add_space(PANEL_TOP_GAP);
       ui.spacing_mut().item_spacing.y = SECTION_GAP;
 
@@ -724,6 +657,11 @@ pub fn ui(
    });
 
    action.or_else(|| shortcut_action(ui, waiting))
+}
+
+/// The panel frame: the theme's panel background behind the fixed inner margin.
+fn panel_frame(ui: &Ui) -> egui::Frame {
+   egui::Frame::default().fill(ui.visuals().panel_fill).inner_margin(PANEL_MARGIN)
 }
 
 /// The button row. With a lone prompt this is exactly the Deny/Allow pair it always was.
@@ -867,8 +805,8 @@ fn layout_height(group: bool) -> f32 {
       sections += DEST_LINES as f32 * SMALL_ROW + SMALL_ROW;
       sections += SECTION_GAP + SMALL_ROW + 2.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    } else {
-      // The scope label, its three radio rows (with the domain checkbox and the address
-      // row) and the rule preview.
+      // The scope label and its three radio rows (with the domain checkbox and the
+      // address row).
       sections += SECTION_GAP + SMALL_ROW + 3.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    }
    sections
@@ -940,7 +878,6 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
       }
       None => {
          ui.label(RichText::new(endpoint).size(20.0).strong().monospace());
-         ui.label(RichText::new("no hostname was learned for this address").small().weak());
       }
    }
 }
@@ -987,8 +924,7 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
    });
 }
 
-/// The scope radios, the subdomain opt-in when the domain row is offered, and the rule
-/// preview.
+/// The scope radios and the subdomain opt-in when the domain row is offered.
 ///
 /// The rows come from [`scope_options`], so the control is the same for one destination and
 /// for a group and its first row is always the default. The muted `Scope` label keeps
@@ -1028,16 +964,6 @@ fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
          });
       }
    }
-
-   // The line below the radios states the rule the current selections would write, so the
-   // app-wide scope above cannot be mistaken for a single flow, and a group's default says
-   // `anywhere` even though its destination list above still explains what was asked.
-   ui.label(
-      RichText::new(rule_preview(prompt, state, Action::Allow))
-         .small()
-         .monospace()
-         .weak(),
-   );
 }
 
 /// `Auto-deny in <n>s`, or the denying state once the deadline has passed.
@@ -1187,14 +1113,6 @@ mod tests {
          state.decision(&request, Action::Allow).scope,
          ScopeChoice::AnyConnection
       );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow firefox → anywhere · until restart"
-      );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Deny),
-         "deny firefox → anywhere · until restart"
-      );
    }
 
    #[test]
@@ -1249,115 +1167,7 @@ mod tests {
             state.decision(&request, Action::Allow).scope,
             ScopeChoice::AnyConnection
          );
-         assert!(
-            !rule_preview(&request, &state, Action::Allow).contains("anywhere"),
-            "the preview must not claim the broad scope"
-         );
       }
-   }
-
-   #[test]
-   fn unknown_app_preview_names_the_address_and_elides_none_of_it() {
-      let request = unknown_prompt(Some("www.google.com"), true);
-      let state = AlertState::new();
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow unknown → only www.google.com · until restart"
-      );
-
-      let mut address = AlertState::new();
-      address.scope = Scope::Address;
-      assert_eq!(
-         rule_preview(&request, &address, Action::Allow),
-         "allow unknown → 142.250.185.78 · until restart"
-      );
-
-      let request = unknown_prompt(None, false);
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow unknown → 142.250.185.78 · until restart"
-      );
-   }
-
-   /// The required example: an IPv6 address renders as the destination it scopes to.
-   #[test]
-   fn address_preview_renders_an_ipv6_destination() {
-      let mut request = unknown_prompt(None, false);
-      request.connection.remote_ip = "2001:4860:482c:400::".parse().expect("an IPv6 address");
-      request.connection.family = Family::V6;
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow unknown → 2001:4860:482c:400:: · until restart"
-      );
-   }
-
-   #[test]
-   fn rule_preview_matches_the_decision_it_previews() {
-      let any = rule_preview(
-         &prompt(Some("www.google.com"), true),
-         &AlertState::new(),
-         Action::Allow,
-      );
-      assert_eq!(any, "allow firefox → anywhere · until restart");
-
-      let mut once = AlertState::new();
-      once.scope = Scope::Domain;
-      once.duration = Duration::Once;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("www.google.com"), true),
-            &once,
-            Action::Allow
-         ),
-         "allow firefox → only www.google.com · once"
-      );
-
-      let mut forever = AlertState::new();
-      forever.scope = Scope::Domain;
-      forever.duration = Duration::Forever;
-      forever.subdomains = true;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("github.com"), true),
-            &forever,
-            Action::Allow
-         ),
-         "allow firefox → only *.github.com · forever"
-      );
-   }
-
-   #[test]
-   fn rule_preview_never_claims_an_unavailable_domain_scope() {
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("www.google.com"), false),
-            &state,
-            Action::Allow
-         ),
-         "allow firefox → anywhere · until restart"
-      );
-   }
-
-   #[test]
-   fn rule_preview_elides_a_long_app_and_domain() {
-      let mut request = prompt(
-         Some("a-very-long-subdomain.and-a-long-domain.example.com"),
-         true,
-      );
-      request.connection.app_name = "an-extremely-long-process-name-that-cannot-fit".to_owned();
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      let line = rule_preview(&request, &state, Action::Allow);
-      assert!(
-         line.chars().count() <= RULE_PREVIEW_CHARS,
-         "preview over budget: {line}"
-      );
-      assert!(
-         line.contains('…'),
-         "expected an ellipsis in: {line}"
-      );
    }
 
    #[test]
@@ -1466,18 +1276,14 @@ mod tests {
       let state = AlertState::new();
 
       assert_eq!(allow_label(&request, &state), "Allow");
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow brave → anywhere · until restart"
-      );
       assert!(
          !destination_lines(&request).is_empty(),
          "the list stays visible: it is what prompted the question"
       );
    }
 
-   /// Switching to the list scope names the count in the button and the sentence, and sends
-   /// the one scope that writes a rule per destination.
+   /// Switching to the list scope names the count in the button, and sends the one scope
+   /// that writes a rule per destination.
    #[test]
    fn choosing_these_destinations_states_the_list() {
       let request = group_of_six();
@@ -1487,10 +1293,6 @@ mod tests {
       assert_eq!(
          allow_label(&request, &state),
          "Allow 6 destinations"
-      );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow brave → these 6 destinations · until restart"
       );
       let decision = state.decision(&request, Action::Allow);
       assert_eq!(decision.scope, ScopeChoice::TheseDestinations);
@@ -1577,10 +1379,84 @@ mod tests {
       assert_eq!(destinations(&request).len(), 1);
       assert_eq!(allow_label(&request, &AlertState::new()), "Allow");
       assert!(destination_lines(&request).is_empty());
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow brave → anywhere · until restart"
+   }
+
+   /// Renders one prompt at the host size and returns the text the panel painted.
+   fn rendered_text(request: &PromptRequest) -> String {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, 0);
+      });
+      let mut text = String::new();
+      collect_text(&output.shapes, &mut text);
+      output.drop_without_applying_deltas();
+      text
+   }
+
+   /// Appends every glyph run in the painted shapes, so a test can read the panel.
+   fn collect_text(shapes: &[egui::epaint::ClippedShape], out: &mut String) {
+      fn collect(shape: &egui::Shape, out: &mut String) {
+         match shape {
+            egui::Shape::Text(text) => {
+               out.push_str(text.galley.text());
+               out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in shapes {
+         collect(&clipped.shape, out);
+      }
+   }
+
+   #[test]
+   fn the_panel_background_is_the_theme_background() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+         let frame = panel_frame(ui);
+         assert_eq!(frame.fill, ui.visuals().panel_fill);
+         assert_ne!(frame.fill, Color32::BLACK);
+      });
+      output.drop_without_applying_deltas();
+   }
+
+   #[test]
+   fn the_unnamed_address_note_is_gone() {
+      let text = rendered_text(&prompt(None, false));
+      assert!(
+         !text.contains("no hostname was learned"),
+         "the note is gone: {text}"
       );
+      assert!(
+         text.contains("142.250.185.78:443"),
+         "the address itself still names the destination: {text}"
+      );
+   }
+
+   #[test]
+   fn the_summary_sentence_is_gone() {
+      for request in [prompt(Some("www.google.com"), true), group_of_six()] {
+         let text = rendered_text(&request);
+         assert!(
+            !text.contains("→ anywhere") && !text.contains("→ these"),
+            "the summary sentence is gone: {text}"
+         );
+      }
    }
 
    #[test]
@@ -1812,10 +1688,6 @@ mod tests {
          allow_label(&presented, model.state_mut()),
          "Allow",
          "the app-wide default on a group writes one rule for the app"
-      );
-      assert_eq!(
-         rule_preview(&presented, model.state_mut(), Action::Allow),
-         "allow brave → anywhere · forever"
       );
    }
 
