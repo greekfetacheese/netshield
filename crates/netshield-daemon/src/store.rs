@@ -10,10 +10,11 @@
 //! cost this change exists to avoid. And it never persists `hits`/`last_matched` updates — those
 //! change per matched packet, and writing them would turn a read-mostly file into a write amplifier.
 //!
-//! The first run seeds the resolver rule (ARCHITECTURE §6). A file at the store's path that is not a
-//! database is moved aside as `<name>.unreadable` rather than stopping the daemon, which would leave
-//! the machine unfirewalled. A seed keyed on the resolver's executable path rather than its UID is
-//! deliberate: that uid is a per-machine detail.
+//! Loading is load or default: the store is loaded before the firewall is installed, so a store that
+//! cannot be opened, whose schema is unknown, or that holds a record this build cannot read is
+//! quarantined as `<name>.unreadable` and replaced with a freshly seeded one. A path that cannot even
+//! be created falls back to a store in memory. The daemon always starts. A seed keyed on the
+//! resolver's executable path rather than its UID is deliberate: that uid is a per-machine detail.
 
 use std::fmt;
 use std::fs;
@@ -24,6 +25,7 @@ use log::{error, warn};
 use netshield_core::{
    Action, AppMatcher, DestMatcher, Duration, Rule, RuleId, ScopeRequest, rule_from_scope,
 };
+use redb::backends::InMemoryBackend;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::store::codec::RecordError;
@@ -135,55 +137,100 @@ pub struct RuleStore {
 }
 
 impl RuleStore {
-   /// Opens `path`, creating it on first run, and seeds the resolver rule if this is that run.
+   /// Opens the store, or starts a fresh one. This never fails.
    ///
-   /// The returned flag says whether the resolver seed was written on this call, which is the only
-   /// case where a rule appears without the user asking for one. An existing database is
-   /// authoritative, so it is never re-seeded and never merged with anything.
+   /// The store is loaded before the firewall is installed, so a store that cannot be used would leave
+   /// the machine with no firewall at all. A database this build cannot open — not a database, an
+   /// unknown schema, a record that does not decode — is quarantined as `<name>.unreadable` and replaced
+   /// with a fresh seeded store; a path that cannot even be created (a read-only filesystem, a permission
+   /// mistake) falls back to a store in memory, which works for the session and does not survive a
+   /// restart. Both cases are reported at `error`: the rules are unavailable either way, and starting
+   /// unfiltered is the outcome this daemon must never produce.
    ///
-   /// This runs before the firewall is installed, so failing here would leave the machine with no
-   /// firewall at all. A file at `path` that is not a database redb can open is therefore moved to
-   /// `<name>.unreadable` and reported rather than allowed to stop the daemon: the rules are
-   /// unavailable either way and the file stays on disk for whoever wants it back. A database of an
-   /// unknown *schema* is a different matter and still refuses (see `check_schema`), because that is
-   /// a real store written by another version and discarding it would destroy the user's rules.
-   pub fn load_or_seed(path: &Path) -> Result<(Self, bool), StoreError> {
+   /// The returned flag says whether the resolver seed was written, which is the only case where a rule
+   /// appears without the user asking for one.
+   pub fn load_or_seed(path: &Path) -> (Self, bool) {
+      match Self::open(path) {
+         Ok(store) => store,
+         Err(error) => {
+            error!(
+               "the rule store at {} cannot be used ({error}); quarantining it and starting fresh",
+               path.display()
+            );
+            match Self::replace(path) {
+               Ok(store) => store,
+               Err(error) => {
+                  error!(
+                     "could not create a rule store at {} ({error}); rules will not survive a restart",
+                     path.display()
+                  );
+                  Self::in_memory()
+               }
+            }
+         }
+      }
+   }
+
+   /// Opens an existing database, or creates and seeds a new one when the path is free.
+   fn open(path: &Path) -> Result<(Self, bool), StoreError> {
+      if !path.exists() {
+         return Self::create(path);
+      }
+
+      let db = Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?;
+      let mut store = Self {
+         db,
+         rules: Vec::new(),
+      };
+      store.check_schema()?;
+      store.reload()?;
+      Ok((store, false))
+   }
+
+   /// Moves an unusable database aside and creates a seeded one in its place.
+   fn replace(path: &Path) -> Result<(Self, bool), StoreError> {
+      if path.exists() {
+         let aside = unreadable_path(path);
+         fs::rename(path, &aside)?;
+         error!(
+            "moved the unusable rule store to {}: its rules are not in the policy any more",
+            aside.display()
+         );
+      }
+      Self::create(path)
+   }
+
+   /// Creates a database at `path` and seeds the resolver rule.
+   fn create(path: &Path) -> Result<(Self, bool), StoreError> {
       if let Some(parent) = path.parent()
          && !parent.as_os_str().is_empty()
       {
          fs::create_dir_all(parent)?;
       }
 
-      let mut fresh = !path.exists();
-      let db = match Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path) {
-         Ok(db) => db,
-         Err(error) if path.exists() => {
-            let aside = unreadable_path(path);
-            error!(
-               "the rule store at {} cannot be opened ({error}); moving it to {} and starting with \
-                the resolver seed",
-               path.display(),
-               aside.display()
-            );
-            fs::rename(path, &aside)?;
-            fresh = true;
-            Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?
-         }
-         Err(error) => return Err(error.into()),
-      };
-
+      let db = Database::builder().set_cache_size(PAGE_CACHE_BYTES).create(path)?;
       let mut store = Self {
          db,
          rules: Vec::new(),
       };
-      if fresh {
-         let seeded = store.seed()?;
-         return Ok((store, seeded));
-      }
+      let seeded = store.seed()?;
+      Ok((store, seeded))
+   }
 
-      store.check_schema()?;
-      store.reload()?;
-      Ok((store, false))
+   /// A store that lives only as long as the process, for a host where the file cannot be had.
+   fn in_memory() -> (Self, bool) {
+      // An in-memory database performs no I/O, so there is nothing here that can fail; the `expect`s
+      // name that, because the alternative — inventing a store without a database — cannot be built.
+      let db = Database::builder()
+         .set_cache_size(PAGE_CACHE_BYTES)
+         .create_with_backend(InMemoryBackend::new())
+         .expect("an in-memory database cannot fail to open");
+      let mut store = Self {
+         db,
+         rules: Vec::new(),
+      };
+      let seeded = store.seed().expect("an in-memory database cannot fail to write");
+      (store, seeded)
    }
 
    /// The rules as the rule engine sees them.
@@ -413,7 +460,7 @@ mod tests {
    #[test]
    fn first_run_seeds_the_resolver_and_creates_the_database() {
       let path = temp_path("seed");
-      let (store, seeded) = RuleStore::load_or_seed(&path).expect("first run");
+      let (store, seeded) = RuleStore::load_or_seed(&path);
       assert_eq!(seeded, resolver_seed(0).is_some());
       assert!(path.exists(), "the database file must be created");
 
@@ -433,7 +480,7 @@ mod tests {
    #[test]
    fn an_existing_database_is_authoritative_and_never_reseeded() {
       let path = temp_path("authoritative");
-      let (mut store, _) = RuleStore::load_or_seed(&path).expect("first run");
+      let (mut store, _) = RuleStore::load_or_seed(&path);
       let seeded: Vec<RuleId> = store.rules().iter().map(|rule| rule.id.clone()).collect();
       for id in seeded {
          assert!(store.remove(&id).expect("clear the seed"));
@@ -442,17 +489,17 @@ mod tests {
       store.upsert(rule.clone()).expect("save");
       drop(store);
 
-      let (loaded, seeded) = RuleStore::load_or_seed(&path).expect("second run");
+      let (loaded, seeded) = RuleStore::load_or_seed(&path);
       assert!(!seeded, "an existing database is not re-seeded");
       assert_eq!(loaded.rules(), [rule]);
       drop(loaded);
 
       // All rules deleted is still not a first run: the seed must not come back.
-      let (mut emptied, _) = RuleStore::load_or_seed(&path).expect("third run");
+      let (mut emptied, _) = RuleStore::load_or_seed(&path);
       let id = emptied.rules()[0].id.clone();
       assert!(emptied.remove(&id).expect("remove the only rule"));
       drop(emptied);
-      let (empty, seeded) = RuleStore::load_or_seed(&path).expect("fourth run");
+      let (empty, seeded) = RuleStore::load_or_seed(&path);
       assert!(!seeded);
       assert!(
          empty.rules().is_empty(),
@@ -468,7 +515,7 @@ mod tests {
          .map_or(0, |elapsed| elapsed.as_nanos());
       let dir = std::env::temp_dir().join(format!("netshield-store-dir-{nanos}"));
       let path = dir.join("nested").join("rules.db");
-      let (store, _) = RuleStore::load_or_seed(&path).expect("save");
+      let (store, _) = RuleStore::load_or_seed(&path);
       assert!(path.exists());
       assert_eq!(
          store.rules().len(),
@@ -480,7 +527,7 @@ mod tests {
    #[test]
    fn upsert_replaces_by_id_and_reloads_every_matcher() {
       let path = temp_path("upsert");
-      let (mut store, _) = RuleStore::load_or_seed(&path).expect("open");
+      let (mut store, _) = RuleStore::load_or_seed(&path);
       let first = sample_rule("first");
       let other = sample_rule("untouched");
       store.upsert_many(&[first.clone(), other.clone()]).expect("insert both");
@@ -508,7 +555,7 @@ mod tests {
       );
       drop(store);
 
-      let (reloaded, _) = RuleStore::load_or_seed(&path).expect("reload");
+      let (reloaded, _) = RuleStore::load_or_seed(&path);
       assert!(reloaded.rules().contains(&changed));
       assert!(reloaded.rules().contains(&other));
       let _ = fs::remove_file(&path);
@@ -517,7 +564,7 @@ mod tests {
    #[test]
    fn remove_persists_and_reports_whether_it_existed() {
       let path = temp_path("remove");
-      let (mut store, _) = RuleStore::load_or_seed(&path).expect("open");
+      let (mut store, _) = RuleStore::load_or_seed(&path);
       let rule = sample_rule("doomed");
       store.upsert(rule.clone()).expect("insert");
       assert!(store.remove(&rule.id).expect("remove"));
@@ -525,7 +572,7 @@ mod tests {
       assert!(!store.remove(&rule.id).expect("remove again"));
       drop(store);
 
-      let (reloaded, _) = RuleStore::load_or_seed(&path).expect("reload");
+      let (reloaded, _) = RuleStore::load_or_seed(&path);
       assert!(!reloaded.rules().iter().any(|existing| existing.id == rule.id));
       let _ = fs::remove_file(&path);
    }
@@ -538,8 +585,7 @@ mod tests {
       let path = temp_path("not-a-database");
       fs::write(&path, b"this is not a database\n").expect("fixture");
 
-      let (store, seeded) =
-         RuleStore::load_or_seed(&path).expect("a foreign file must not stop the daemon");
+      let (store, seeded) = RuleStore::load_or_seed(&path);
       assert_eq!(seeded, resolver_seed(0).is_some());
       assert_eq!(
          store.rules().len(),
@@ -556,7 +602,7 @@ mod tests {
          "the bytes are not touched on the way past"
       );
       drop(store);
-      let (reloaded, seeded) = RuleStore::load_or_seed(&path).expect("second run");
+      let (reloaded, seeded) = RuleStore::load_or_seed(&path);
       assert!(
          !seeded,
          "the second run opens the database it just created"
@@ -570,20 +616,99 @@ mod tests {
    }
 
    #[test]
-   fn a_database_of_an_unknown_schema_is_refused() {
-      // A real database written by another version is not moved aside: discarding it would destroy
-      // rules the user still owns, so this one refuses loudly instead.
-      let path = temp_path("foreign");
+   fn a_database_of_an_unknown_schema_is_replaced() {
+      // A store this build cannot read is replaced rather than allowed to stop the daemon. The file is
+      // kept, not deleted, so its rules can still be recovered by hand.
+      let path = temp_path("unknown-schema");
       drop(Database::create(&path).expect("create a foreign database"));
 
-      assert!(matches!(
-         RuleStore::load_or_seed(&path),
-         Err(StoreError::Schema(0))
-      ));
+      let (store, seeded) = RuleStore::load_or_seed(&path);
+      assert_eq!(seeded, resolver_seed(0).is_some());
+      assert_eq!(
+         store.rules().len(),
+         usize::from(resolver_seed(0).is_some())
+      );
       assert!(
-         path.exists(),
-         "the foreign database is left alone"
+         unreadable_path(&path).exists(),
+         "the unusable store is kept for inspection"
+      );
+      drop(store);
+
+      let (reloaded, seeded) = RuleStore::load_or_seed(&path);
+      assert!(
+         !seeded,
+         "the second run opens the database the first one created"
+      );
+      assert_eq!(
+         reloaded.rules().len(),
+         usize::from(resolver_seed(0).is_some())
       );
       let _ = fs::remove_file(&path);
+      let _ = fs::remove_file(unreadable_path(&path));
+   }
+
+   #[test]
+   fn a_record_that_cannot_be_read_replaces_the_store() {
+      let path = temp_path("bad-record");
+      let (mut store, _) = RuleStore::load_or_seed(&path);
+      store.upsert(sample_rule("will be corrupted")).expect("insert a rule");
+      drop(store);
+
+      // One record whose leading version byte this build does not know, the way a foreign or torn write
+      // would look. Half-loading is not an option: a rule that cannot be read must neither be silently
+      // enforced nor silently skipped, so the store is replaced and the file kept.
+      {
+         let db = Database::create(&path).expect("reopen the database");
+         let tx = db.begin_write().expect("write");
+         {
+            let mut table = tx.open_table(RULES).expect("rules table");
+            let key = [0u8; 8];
+            table
+               .insert(key.as_slice(), [99u8, 0, 0].as_slice())
+               .expect("insert a bad record");
+         }
+         tx.commit().expect("commit");
+      }
+
+      let (store, seeded) = RuleStore::load_or_seed(&path);
+      assert_eq!(seeded, resolver_seed(0).is_some());
+      assert_eq!(
+         store.rules().len(),
+         usize::from(resolver_seed(0).is_some())
+      );
+      assert!(unreadable_path(&path).exists());
+      drop(store);
+      let _ = fs::remove_file(&path);
+      let _ = fs::remove_file(unreadable_path(&path));
+   }
+
+   #[test]
+   fn a_path_that_cannot_be_created_falls_back_to_memory() {
+      // A parent that is a regular file makes both creating the directory and replacing the file fail
+      // deterministically, without needing a read-only filesystem: this is the last way the store can
+      // stop the daemon, so it must fall back to a store that lives only for this process.
+      let nanos = SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let blocker = std::env::temp_dir().join(format!("netshield-store-blocked-{nanos}"));
+      fs::write(&blocker, b"not a directory").expect("fixture");
+      let path = blocker.join("rules.db");
+
+      let (mut store, seeded) = RuleStore::load_or_seed(&path);
+      assert_eq!(seeded, resolver_seed(0).is_some());
+      assert_eq!(
+         store.rules().len(),
+         usize::from(resolver_seed(0).is_some())
+      );
+
+      let rule = sample_rule("memory only");
+      store.upsert(rule.clone()).expect("an in-memory store still accepts a rule");
+      assert!(store.rules().contains(&rule));
+      drop(store);
+      assert!(
+         !path.exists(),
+         "nothing was written to the unusable path"
+      );
+      let _ = fs::remove_file(&blocker);
    }
 }

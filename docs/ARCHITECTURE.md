@@ -324,10 +324,11 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
 - `/etc/netshield/rules.db` — a redb database keyed by rule id, one record per `Forever`
   rule, written per record (never rewritten wholesale) and committed with
-  `Durability::Immediate`. It is opened before the firewall is installed, so a file at that
-  path which is not a database is moved to `<name>.unreadable` and reported instead of
-  stopping the daemon. A database whose schema this build does not know is refused, because
-  it belongs to another version and dropping it would destroy rules the user owns.
+  `Durability::Immediate`. It is opened before the firewall is installed, so loading is load
+  or default: a store that cannot be opened, whose schema is unknown, or that holds a record
+  which does not decode is renamed to `<name>.unreadable` and replaced with a freshly seeded
+  one; a path that cannot be created falls back to an in-memory store for the session. The
+  daemon always starts.
 - `/run/netshield/control.sock` — `0660`, owned by `allowed_uid` and that user's primary
   group when `allowed_uid` is set (chown after bind; the `SO_PEERCRED` check is still
   enforced), `root:root` otherwise. `/run/netshield` itself is mode `0711`: traversal
