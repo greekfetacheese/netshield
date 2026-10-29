@@ -421,31 +421,30 @@ mod tests {
    }
 
    #[test]
-   fn ipv4_udp_ports_are_parsed() {
-      let bytes = ipv4(17, &udp(53_000, 53), &[], None);
-      let packet = parse(&bytes).expect("valid packet");
-      assert_eq!(
-         packet.l4,
-         L4Payload::Udp {
-            src_port: 53_000,
-            dst_port: 53
-         }
-      );
-      assert_no_panic_on_truncation(&bytes);
-   }
-
-   #[test]
-   fn ipv4_icmp_type_and_code_are_parsed() {
-      let bytes = ipv4(1, &icmp(8, 0), &[], None);
-      let packet = parse(&bytes).expect("valid packet");
-      assert_eq!(
-         packet.l4,
-         L4Payload::Icmp {
-            icmp_type: 8,
-            icmp_code: 0
-         }
-      );
-      assert_no_panic_on_truncation(&bytes);
+   fn ipv4_udp_and_icmp_are_parsed() {
+      let cases = [
+         (
+            "UDP ports",
+            ipv4(17, &udp(53_000, 53), &[], None),
+            L4Payload::Udp {
+               src_port: 53_000,
+               dst_port: 53,
+            },
+         ),
+         (
+            "ICMP type and code",
+            ipv4(1, &icmp(8, 0), &[], None),
+            L4Payload::Icmp {
+               icmp_type: 8,
+               icmp_code: 0,
+            },
+         ),
+      ];
+      for (case, bytes, expected) in cases {
+         let packet = parse(&bytes).expect("valid packet");
+         assert_eq!(packet.l4, expected, "{case}");
+         assert_no_panic_on_truncation(&bytes);
+      }
    }
 
    #[test]
@@ -467,22 +466,32 @@ mod tests {
    }
 
    #[test]
-   fn ipv4_total_length_past_the_buffer_is_truncated() {
-      let bytes = ipv4(6, &tcp(1, 2, 0x02), &[], Some(200));
-      assert_eq!(parse(&bytes), Err(ParseError::Truncated));
-   }
+   fn ipv4_bad_lengths_and_versions_are_rejected() {
+      let past_the_buffer = ipv4(6, &tcp(1, 2, 0x02), &[], Some(200));
+      let below_the_header = ipv4(6, &tcp(1, 2, 0x02), &[1, 1, 1, 1], Some(20));
+      let mut version_five = ipv4(6, &tcp(1, 2, 0x02), &[], None);
+      version_five[0] = 0x50;
 
-   #[test]
-   fn ipv4_total_length_below_the_header_is_truncated() {
-      let bytes = ipv4(6, &tcp(1, 2, 0x02), &[1, 1, 1, 1], Some(20));
-      assert_eq!(parse(&bytes), Err(ParseError::Truncated));
-   }
-
-   #[test]
-   fn ipv4_version_five_is_bad_version() {
-      let mut bytes = ipv4(6, &tcp(1, 2, 0x02), &[], None);
-      bytes[0] = 0x50;
-      assert_eq!(parse(&bytes), Err(ParseError::BadVersion));
+      let cases = [
+         (
+            "total length past the buffer",
+            past_the_buffer,
+            ParseError::Truncated,
+         ),
+         (
+            "total length below the header",
+            below_the_header,
+            ParseError::Truncated,
+         ),
+         (
+            "version five",
+            version_five,
+            ParseError::BadVersion,
+         ),
+      ];
+      for (case, bytes, expected) in cases {
+         assert_eq!(parse(&bytes), Err(expected), "{case}");
+      }
    }
 
    #[test]
@@ -545,23 +554,28 @@ mod tests {
    }
 
    #[test]
-   fn ipv6_esp_is_other() {
-      let bytes = ipv6(50, &[0u8; 8], &[]);
-      assert_eq!(
-         parse(&bytes).map(|packet| packet.l4),
-         Ok(L4Payload::Other)
-      );
-   }
-
-   #[test]
-   fn ipv6_icmp_is_parsed() {
-      let bytes = ipv6(58, &icmp(128, 0), &[]);
-      assert_eq!(
-         parse(&bytes).map(|packet| packet.l4),
-         Ok(L4Payload::Icmp {
-            icmp_type: 128,
-            icmp_code: 0
-         })
-      );
+   fn ipv6_esp_and_icmp_are_parsed() {
+      let cases = [
+         (
+            "ESP is other",
+            ipv6(50, &[0u8; 8], &[]),
+            L4Payload::Other,
+         ),
+         (
+            "ICMP type and code",
+            ipv6(58, &icmp(128, 0), &[]),
+            L4Payload::Icmp {
+               icmp_type: 128,
+               icmp_code: 0,
+            },
+         ),
+      ];
+      for (case, bytes, expected) in cases {
+         assert_eq!(
+            parse(&bytes).map(|packet| packet.l4),
+            Ok(expected),
+            "{case}"
+         );
+      }
    }
 }

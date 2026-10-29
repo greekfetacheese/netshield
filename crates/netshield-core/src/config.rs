@@ -273,9 +273,10 @@ mod tests {
    }
 
    #[test]
-   fn a_config_without_the_new_key_takes_the_drop_default() {
-      // Exactly what the current installer writes: no `unattributable_closed_flow` key.
-      let json = r#"{
+   fn an_installed_config_without_the_new_keys_still_loads() {
+      // Exactly what the current installer writes: neither the flow-action key nor the
+      // table key exists yet, and both must take their documented defaults.
+      let installed = r#"{
   "queue_num": 0,
   "dns_queue_num": 1,
   "prompt_timeout_secs": 30,
@@ -285,15 +286,15 @@ mod tests {
   "socket_path": "/run/netshield/control.sock",
   "rules_path": "/etc/netshield/rules.json"
 }"#;
-      let config: Config = serde_json::from_str(json).expect("the installed config must load");
+      let config: Config = serde_json::from_str(installed).expect("the installed config must load");
       assert_eq!(
          config.unattributable_closed_flow,
          ClosedFlowAction::Drop
       );
-   }
+      assert_eq!(config.table_name(), "netshield");
+      assert_eq!(Config::default().table_name(), "netshield");
+      assert_eq!(Config::default().table, "netshield");
 
-   #[test]
-   fn the_new_key_round_trips() {
       for (json, expected) in [
          ("\"allow\"", ClosedFlowAction::Allow),
          ("\"prompt\"", ClosedFlowAction::Prompt),
@@ -301,7 +302,10 @@ mod tests {
       ] {
          let action: ClosedFlowAction =
             serde_json::from_str(json).expect("a valid ClosedFlowAction");
-         assert_eq!(action, expected);
+         assert_eq!(
+            action, expected,
+            "{json} must decode to {expected:?}"
+         );
       }
 
       // The default config serializes `drop`, and the daemon can read that back: the
@@ -316,27 +320,7 @@ mod tests {
    }
 
    #[test]
-   fn the_default_is_the_old_name() {
-      assert_eq!(Config::default().table_name(), "netshield");
-      assert_eq!(Config::default().table, "netshield");
-
-      // A config written before the field existed must load with the original name, not fail.
-      let json = r#"{
-  "queue_num": 0,
-  "dns_queue_num": 1,
-  "prompt_timeout_secs": 30,
-  "default_action": "prompt",
-  "allowed_uid": null,
-  "log_level": "info",
-  "socket_path": "/run/netshield/control.sock",
-  "rules_path": "/etc/netshield/rules.json"
-}"#;
-      let config: Config = serde_json::from_str(json).expect("the installed config must load");
-      assert_eq!(config.table_name(), "netshield");
-   }
-
-   #[test]
-   fn a_configured_table_name_is_kept() {
+   fn the_table_name_is_configured_and_validated() {
       let json = "{\"table\": \"netshielddiag\", \"queue_num\": 0, \"dns_queue_num\": 1, \
                   \"prompt_timeout_secs\": 30, \"default_action\": \"prompt\", \
                   \"allowed_uid\": null, \"log_level\": \"info\", \
@@ -344,10 +328,7 @@ mod tests {
       let config: Config = serde_json::from_str(json).expect("a valid table name must load");
       assert_eq!(config.table_name(), "netshielddiag");
       assert!(config.validate().is_ok());
-   }
 
-   #[test]
-   fn a_bad_table_name_is_rejected() {
       for bad in ["", " ", "a b", "a;b", "a\"b", "a'b", "a\tb"] {
          let config = Config {
             table: bad.to_owned(),
@@ -367,20 +348,20 @@ mod tests {
    }
 
    #[test]
-   fn validate_rejects_equal_queues() {
-      let config = Config {
+   fn validate_rejects_the_documented_errors() {
+      let equal_queues = Config {
          queue_num: 7,
          dns_queue_num: 7,
          ..Config::default()
       };
-      assert!(matches!(
-         config.validate(),
-         Err(ConfigError::Invalid(_))
-      ));
-   }
+      assert!(
+         matches!(
+            equal_queues.validate(),
+            Err(ConfigError::Invalid(_))
+         ),
+         "equal queue numbers must be rejected"
+      );
 
-   #[test]
-   fn validate_rejects_out_of_range_timeouts() {
       for bad in [0, 601] {
          let config = Config {
             prompt_timeout_secs: bad,
@@ -404,7 +385,7 @@ mod tests {
    }
 
    #[test]
-   fn serde_round_trip_is_lossless() {
+   fn the_config_round_trips_through_serde() {
       let config = Config {
          queue_num: 3,
          dns_queue_num: 4,
@@ -417,10 +398,7 @@ mod tests {
       let json = serde_json::to_string(&config).unwrap();
       let back: Config = serde_json::from_str(&json).unwrap();
       assert_eq!(back, config);
-   }
 
-   #[test]
-   fn enums_serialize_lowercase() {
       assert_eq!(
          serde_json::to_string(&DefaultAction::Prompt).unwrap(),
          "\"prompt\""
@@ -436,7 +414,7 @@ mod tests {
    }
 
    #[test]
-   fn save_atomic_then_load_round_trips_and_leaves_no_tmp() {
+   fn the_store_round_trips_and_refuses_an_invalid_config() {
       let path = temp_path("roundtrip");
       let config = Config {
          queue_num: 5,
@@ -453,20 +431,28 @@ mod tests {
          "temp file must be renamed away"
       );
       let _ = fs::remove_file(&path);
+
+      let path = temp_path("refused");
+      let invalid = Config {
+         prompt_timeout_secs: 0,
+         ..Config::default()
+      };
+      assert!(matches!(
+         invalid.save_atomic(&path),
+         Err(ConfigError::Invalid(_))
+      ));
+      assert!(!path.exists());
    }
 
    #[test]
-   fn load_missing_file_is_default() {
+   fn load_defaults_a_missing_file_and_rejects_a_bad_one() {
       let path = temp_path("missing");
       assert!(!path.exists());
       assert_eq!(
          Config::load(&path).expect("missing is default"),
          Config::default()
       );
-   }
 
-   #[test]
-   fn load_malformed_file_is_an_error() {
       let path = temp_path("malformed");
       fs::write(&path, b"{ not json").expect("write fixture");
       assert!(matches!(
@@ -474,10 +460,7 @@ mod tests {
          Err(ConfigError::Json(_))
       ));
       let _ = fs::remove_file(&path);
-   }
 
-   #[test]
-   fn load_invalid_config_is_an_error() {
       let path = temp_path("invalid");
       let mut config = Config::default();
       config.dns_queue_num = config.queue_num;
@@ -487,19 +470,5 @@ mod tests {
          Err(ConfigError::Invalid(_))
       ));
       let _ = fs::remove_file(&path);
-   }
-
-   #[test]
-   fn save_atomic_refuses_invalid_config() {
-      let path = temp_path("refused");
-      let config = Config {
-         prompt_timeout_secs: 0,
-         ..Config::default()
-      };
-      assert!(matches!(
-         config.save_atomic(&path),
-         Err(ConfigError::Invalid(_))
-      ));
-      assert!(!path.exists());
    }
 }
