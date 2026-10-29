@@ -21,8 +21,12 @@ use crate::{
    work,
 };
 
-/// How many connection rows the history keeps before dropping the oldest.
-const LOG_CAPACITY: usize = 500;
+/// Rows the Connections log keeps per application. One process opening hundreds of flows must
+/// not evict every other process' history.
+const LOG_ROWS_PER_APP: usize = 100;
+
+/// Applications the log tracks at once; the quietest is evicted to make room for a new one.
+const LOG_MAX_APPS: usize = 32;
 
 /// How often the GUI asks the daemon for a status snapshot.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
@@ -255,7 +259,7 @@ impl App {
          socket: cli.socket,
          connected: false,
          connection_logged: false,
-         log: ConnectionLog::new(LOG_CAPACITY),
+         log: ConnectionLog::new(LOG_ROWS_PER_APP, LOG_MAX_APPS),
          mock: cli.mock,
          alert: cli.alert,
          pending: Vec::new(),

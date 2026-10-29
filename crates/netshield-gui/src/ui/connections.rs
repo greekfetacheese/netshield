@@ -6,7 +6,6 @@
 //! height. Collapsing a process therefore costs one rebuild of that vector, not a frame of
 //! hidden widgets.
 
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1313,11 +1312,12 @@ fn detail_pane(ui: &mut Ui, lines: &[Line], selection: &mut Selection) {
       });
 }
 
-/// Groups the log per app, newest first, and flattens the open groups into lines.
+/// Groups the log per app and flattens the open groups into lines.
 ///
-/// The log is scanned newest-first, so each group collects its rows in that order. Groups
-/// are then sorted on their newest event rather than on arrival alone: `at` is what the
-/// page promises to order by, and a burst can reach the log slightly out of order.
+/// The order is entirely the list's own: applications alphabetical and case-insensitive,
+/// destinations the same, and a destination's connections by address. Activity decides no
+/// row's position, only the `at` a group reports, so a burst of flows cannot move a row the
+/// user is about to click.
 ///
 /// Only nodes in `expanded` emit children; a node showing all skips the [`MAX_CHILDREN`]
 /// cap and therefore has no `More` row. The app's own `count` stays its total, the sum over
@@ -1336,7 +1336,7 @@ fn build_lines(
 
    let mut groups: Vec<(&str, Vec<&Row>)> = Vec::new();
    let mut index: HashMap<&str, usize> = HashMap::new();
-   for row in log.rows().rev() {
+   for row in log.rows() {
       match index.get(row.app.as_str()).copied() {
          Some(slot) => groups[slot].1.push(row),
          None => {
@@ -1345,11 +1345,13 @@ fn build_lines(
          }
       }
    }
-   groups.sort_by_key(|(_, rows)| Reverse(rows.first().map_or(0, |row| row.at)));
+   // Applications are alphabetical and case-insensitive, never ordered by activity: a row that
+   // moves the moment a flow arrives cannot be clicked.
+   groups.sort_by_cached_key(|(app, _)| app.to_ascii_lowercase());
 
    let mut lines = Vec::with_capacity(log.len() + groups.len());
    for (app, rows) in &groups {
-      let newest = rows.first().copied();
+      let newest = rows.iter().copied().max_by_key(|row| row.at);
       let app_node = Node::app(app);
       lines.push(Line::Group {
          app: (*app).to_owned(),
@@ -1373,7 +1375,7 @@ fn build_lines(
          MAX_CHILDREN.min(dests.len())
       };
       for (dest, conns) in dests.iter().take(shown) {
-         let newest = conns.first().copied();
+         let newest = conns.iter().copied().max_by_key(|row| row.at);
          let dest_node = Node::dest(app, dest);
          lines.push(Line::Dest {
             app: (*app).to_owned(),
@@ -1416,11 +1418,11 @@ fn build_lines(
    lines
 }
 
-/// Splits one application's rows into destination groups, newest group first.
+/// Splits one application's rows into destination groups, alphabetical and case-insensitive.
 ///
-/// `Row::dest` is already "the resolved name, else the address", so the key needs no
-/// extra resolution; the sort is on the newest connection for the same reason the app
-/// groups are sorted rather than trusted in arrival order.
+/// `Row::dest` is already "the resolved name, else the address", so the key needs no extra
+/// resolution. The order is the destination's own, never its newest connection's: a peer that
+/// appears must not push every other destination down a row.
 fn dest_groups<'a>(rows: &[&'a Row]) -> Vec<(&'a str, Vec<&'a Row>)> {
    let mut groups: Vec<(&str, Vec<&Row>)> = Vec::new();
    let mut index: HashMap<&str, usize> = HashMap::new();
@@ -1433,15 +1435,16 @@ fn dest_groups<'a>(rows: &[&'a Row]) -> Vec<(&'a str, Vec<&'a Row>)> {
          }
       }
    }
-   groups.sort_by_key(|(_, rows)| Reverse(rows.first().map_or(0, |row| row.at)));
+   groups.sort_by_cached_key(|(dest, _)| dest.to_ascii_lowercase());
    groups
 }
 
-/// One destination's connections collapsed to unique flows, newest first.
+/// One destination's connections collapsed to unique flows, sorted by address then protocol.
 ///
 /// A resolver or a browser opens the same `addr:port` flow dozens of times, and dozens of
 /// identical rows bury the one that is new. Each entry is the newest row of its group plus how
-/// many flows it stands for; the destination line keeps the raw total on its own count.
+/// many flows it stands for; the destination line keeps the raw total on its own count. The
+/// representative is chosen by `at`, so this does not depend on the order it is handed.
 fn unique_conns<'a>(conns: &[&'a Row]) -> Vec<(&'a Row, usize)> {
    let mut unique: Vec<(&'a Row, usize)> = Vec::new();
    let mut index: HashMap<(String, String, bool, bool), usize> = HashMap::new();
@@ -1453,13 +1456,28 @@ fn unique_conns<'a>(conns: &[&'a Row]) -> Vec<(&'a Row, usize)> {
          row.via_prompt,
       );
       match index.get(&key).copied() {
-         Some(slot) => unique[slot].1 += 1,
+         Some(slot) => {
+            let (kept, repeat) = unique[slot];
+            unique[slot] = (
+               if row.at > kept.at { row } else { kept },
+               repeat + 1,
+            );
+         }
          None => {
             index.insert(key, unique.len());
             unique.push((row, 1));
          }
       }
    }
+   // Address, then protocol, then a denial before an allow: a stable sort is what makes the
+   // rows stop moving as new flows arrive.
+   unique.sort_by(|(left, _), (right, _)| {
+      left
+         .addr
+         .cmp(&right.addr)
+         .then_with(|| left.proto.cmp(&right.proto))
+         .then_with(|| left.allowed.cmp(&right.allowed))
+   });
    unique
 }
 
@@ -1582,7 +1600,7 @@ mod tests {
    }
 
    fn log(events: &[(u64, &str, &str)]) -> ConnectionLog {
-      let mut log = ConnectionLog::new(100);
+      let mut log = ConnectionLog::new(100, 32);
       for (at, app, domain) in events {
          log.push(&event(*at, app, domain));
       }
@@ -1703,7 +1721,7 @@ mod tests {
       assert_eq!(lines.len(), 1, "only the group line is emitted");
       assert!(matches!(lines[0], Line::Group { .. }));
 
-      // Apps first: newest connection wins, so firefox (40) sits above curl (20).
+      // Apps are alphabetical whatever their activity: curl above firefox.
       let history = log(&[
          (10, "firefox", "a.example"),
          (20, "curl", "b.example"),
@@ -1716,13 +1734,13 @@ mod tests {
          &expanded_set(&[Node::app("firefox"), Node::app("curl")]),
          &ShowingAll::default(),
       );
-      assert_eq!(group(&lines, 0), ("firefox", 3, 40));
-      // Then firefox's own destinations, newest group first: b's newest is 40, c's is 30.
-      assert_eq!(dest(&lines, 1), ("b.example", 1, 40));
-      assert_eq!(dest(&lines, 2), ("c.example", 1, 30));
+      assert_eq!(group(&lines, 0), ("curl", 1, 20));
+      assert_eq!(dest(&lines, 1), ("b.example", 1, 20));
+      assert_eq!(group(&lines, 2), ("firefox", 3, 40));
+      // Then firefox's own destinations, alphabetical: a, b, c.
       assert_eq!(dest(&lines, 3), ("a.example", 1, 10));
-      assert_eq!(group(&lines, 4), ("curl", 1, 20));
-      assert_eq!(dest(&lines, 5), ("b.example", 1, 20));
+      assert_eq!(dest(&lines, 4), ("b.example", 1, 40));
+      assert_eq!(dest(&lines, 5), ("c.example", 1, 30));
       assert_eq!(lines.len(), 6);
 
       // Destinations group under their app, and an open app on its own emits only Dest lines.
@@ -1743,8 +1761,8 @@ mod tests {
          "a closed app emits no connections"
       );
       assert_eq!(group(&lines, 0), ("firefox", 3, 30));
-      assert_eq!(dest(&lines, 1), ("b.example", 1, 30));
-      assert_eq!(dest(&lines, 2), ("a.example", 2, 20));
+      assert_eq!(dest(&lines, 1), ("a.example", 2, 20));
+      assert_eq!(dest(&lines, 2), ("b.example", 1, 30));
       assert!(matches!(lines[1], Line::Dest { .. }));
       assert!(matches!(lines[2], Line::Dest { .. }));
 
@@ -1772,7 +1790,7 @@ mod tests {
          1,
          "only the open destination's rows are drawn, and its identical flows collapse"
       );
-      let listed = conn(&open, 3);
+      let listed = conn(&open, 2);
       assert_eq!(listed.dest, "a.example");
       assert_eq!(
          listed.repeat, 2,
@@ -1788,8 +1806,8 @@ mod tests {
          4,
          "an expanded app shows its destinations"
       );
-      assert_eq!(dest(&open, 1), ("a.example", 1, 20));
-      assert_eq!(dest(&open, 3), ("b.example", 1, 10));
+      assert_eq!(dest(&open, 1), ("b.example", 1, 10));
+      assert_eq!(dest(&open, 3), ("a.example", 1, 20));
 
       expanded.toggle(&Node::dest("firefox", "a.example"));
       let opened = build_lines(&log, &[], &expanded, &ShowingAll::default());
@@ -1798,7 +1816,7 @@ mod tests {
          5,
          "an expanded destination shows its connections"
       );
-      assert_eq!(conn(&opened, 2).dest, "a.example");
+      assert_eq!(conn(&opened, 4).dest, "a.example");
       assert!(
          opened.iter().filter(|line| matches!(line, Line::Conn(_))).count() == 1,
          "curl's destination is still closed"
@@ -1807,23 +1825,118 @@ mod tests {
       expanded.toggle(&Node::app("firefox"));
       let shut = build_lines(&log, &[], &expanded, &ShowingAll::default());
       assert_eq!(shut.len(), 3);
-      assert_eq!(group(&shut, 0), ("firefox", 1, 20));
-      assert_eq!(group(&shut, 1), ("curl", 1, 10));
+      assert_eq!(group(&shut, 0), ("curl", 1, 10));
+      assert_eq!(dest(&shut, 1), ("b.example", 1, 10));
       assert_eq!(
-         dest(&shut, 2),
-         ("b.example", 1, 10),
-         "curl's own destination follows"
+         group(&shut, 2),
+         ("firefox", 1, 20),
+         "curl's destination follows its own group"
       );
 
       expanded.toggle(&Node::app("firefox"));
       let reopened = build_lines(&log, &[], &expanded, &ShowingAll::default());
       assert_eq!(reopened.len(), opened.len());
-      assert_eq!(conn(&reopened, 2).dest, "a.example");
+      assert_eq!(conn(&reopened, 4).dest, "a.example");
+   }
+
+   /// Every line's identity, so a reordering is visible as a changed list.
+   fn identities(lines: &[Line]) -> Vec<String> {
+      lines
+         .iter()
+         .map(|line| match line {
+            Line::Group { app, .. } => format!("group {app}"),
+            Line::Dest { dest, .. } => format!("dest {dest}"),
+            Line::Conn(conn) => format!("conn {}", conn.addr),
+            Line::More { remaining, .. } => format!("more {remaining}"),
+         })
+         .collect()
+   }
+
+   #[test]
+   fn the_app_order_is_alphabetical_and_never_moves() {
+      // Arrival order is deliberately not alphabetical, and the chattiest app speaks last.
+      let mut history = log(&[
+         (10, "spotify", "a.example"),
+         (20, "curl", "b.example"),
+         (30, "Brave", "c.example"),
+         (40, "spotify", "b.example"),
+      ]);
+      let apps = history
+         .rows()
+         .map(|row| row.app.clone())
+         .collect::<std::collections::BTreeSet<_>>();
+      assert_eq!(
+         apps.into_iter().collect::<Vec<_>>(),
+         vec!["Brave".to_owned(), "curl".to_owned(), "spotify".to_owned()],
+         "four flows over three apps"
+      );
+
+      let order = identities(&build_lines(
+         &history,
+         &[],
+         &Expanded::default(),
+         &ShowingAll::default(),
+      ));
+      assert_eq!(
+         order,
+         vec!["group Brave", "group curl", "group spotify"],
+         "the case-insensitive alphabetical order is the drawn order"
+      );
+
+      // A burst of flows for the chattiest app changes its count, not the row order.
+      for at in 50..56 {
+         history.push(&event(at, "spotify", "d.example"));
+      }
+      assert_eq!(
+         identities(&build_lines(
+            &history,
+            &[],
+            &Expanded::default(),
+            &ShowingAll::default()
+         )),
+         order,
+         "no flow can move an application row"
+      );
+   }
+
+   #[test]
+   fn a_destination_lists_its_connections_by_address() {
+      let mut third = event(10, "firefox", "a.example");
+      third.connection.remote_ip = "203.0.113.30".parse().unwrap();
+      let mut first = event(20, "firefox", "a.example");
+      first.connection.remote_ip = "203.0.113.10".parse().unwrap();
+      let mut second = event(30, "firefox", "a.example");
+      second.connection.remote_ip = "203.0.113.20".parse().unwrap();
+
+      let mut history = ConnectionLog::new(100, 32);
+      history.push(&third);
+      history.push(&first);
+      history.push(&second);
+
+      let rows: Vec<&Row> = history.rows().collect();
+      let addrs: Vec<&str> = unique_conns(&rows).iter().map(|(row, _)| row.addr.as_str()).collect();
+      assert_eq!(
+         addrs,
+         vec!["203.0.113.10:443", "203.0.113.20:443", "203.0.113.30:443"],
+         "arrival order does not decide the row order"
+      );
+
+      // The newest row of each flow is still the one kept, so the activity column stays honest.
+      let mut repeated = event(40, "firefox", "a.example");
+      repeated.connection.remote_ip = "203.0.113.10".parse().unwrap();
+      history.push(&repeated);
+      let rows: Vec<&Row> = history.rows().collect();
+      let unique = unique_conns(&rows);
+      assert_eq!(
+         unique[0].0.at, 40,
+         "the newest flow is the row kept"
+      );
+      assert_eq!(unique[0].1, 2, "and both flows are counted");
    }
 
    /// A log of `count` flows to one destination, each with its own address, so none collapse.
    fn distinct_flows(count: u64) -> ConnectionLog {
-      let mut history = ConnectionLog::new(64);
+      let mut history = ConnectionLog::new(64, 32);
       for at in 0..count {
          let mut row = event(at, "firefox", "a.example");
          row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
@@ -1973,7 +2086,7 @@ mod tests {
          "one unique flow fits under the cap"
       );
 
-      let mut distinct = ConnectionLog::new(16);
+      let mut distinct = ConnectionLog::new(16, 32);
       for at in 0..10 {
          let mut row = event(at, "firefox", "a.example");
          row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
@@ -2005,7 +2118,7 @@ mod tests {
       let mut unnamed = event(10, "firefox", "a.example");
       unnamed.connection.domain = None;
       unnamed.connection.remote_ip = "203.0.113.9".parse().unwrap();
-      let mut history = ConnectionLog::new(8);
+      let mut history = ConnectionLog::new(8, 32);
       history.push(&unnamed);
 
       let lines = build_lines(
@@ -2150,7 +2263,7 @@ mod tests {
       let mut second = event(10, "firefox", "a.example");
       second.connection.domain = None;
       second.connection.remote_ip = "203.0.113.10".parse().unwrap();
-      let mut history = ConnectionLog::new(8);
+      let mut history = ConnectionLog::new(8, 32);
       history.push(&first);
       history.push(&second);
       let lines = build_lines(
@@ -2213,7 +2326,7 @@ mod tests {
       udp.connection.remote_ip = "203.0.113.9".parse().unwrap();
       udp.connection.proto = L4Proto::Udp;
       udp.allowed = false;
-      let mut history = ConnectionLog::new(8);
+      let mut history = ConnectionLog::new(8, 32);
       history.push(&tcp);
       history.push(&udp);
       let lines = build_lines(
@@ -2450,7 +2563,7 @@ mod tests {
    fn repeated_flows() -> ConnectionLog {
       let mut udp = event(5, "firefox", "a.example");
       udp.connection.proto = L4Proto::Udp;
-      let mut history = ConnectionLog::new(8);
+      let mut history = ConnectionLog::new(8, 32);
       history.push(&udp);
       for at in [10, 20, 30] {
          history.push(&event(at, "firefox", "a.example"));
@@ -2461,7 +2574,7 @@ mod tests {
    #[test]
    fn repeated_flows_collapse_and_totals_stay_raw() {
       let history = repeated_flows();
-      let rows: Vec<&Row> = history.rows().rev().collect();
+      let rows: Vec<&Row> = history.rows().collect();
       let unique = unique_conns(&rows);
       assert_eq!(unique.len(), 2, "two distinct flows");
       assert_eq!(unique[0].1, 3, "three identical tcp flows");
