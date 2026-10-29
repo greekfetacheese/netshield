@@ -192,7 +192,8 @@ pub enum Selection {
 #[derive(Default)]
 pub struct LinesCache {
    version: u64,
-   rule_count: usize,
+   /// The rule list's revision, bumped by the app whenever it is replaced.
+   rules_rev: u64,
    expanded: HashSet<Node>,
    showing_all: HashSet<Node>,
    lines: Vec<Line>,
@@ -204,11 +205,12 @@ impl LinesCache {
       &mut self,
       log: &ConnectionLog,
       rules: &[Rule],
+      rules_rev: u64,
       expanded: &Expanded,
       showing_all: &ShowingAll,
    ) {
       let unchanged = self.version == log.version()
-         && self.rule_count == rules.len()
+         && self.rules_rev == rules_rev
          && self.expanded == expanded.0
          && self.showing_all == showing_all.0;
       if unchanged {
@@ -216,7 +218,7 @@ impl LinesCache {
       }
       self.lines = build_lines(log, rules, expanded, showing_all);
       self.version = log.version();
-      self.rule_count = rules.len();
+      self.rules_rev = rules_rev;
       self.expanded = expanded.0.clone();
       self.showing_all = showing_all.0.clone();
    }
@@ -276,16 +278,19 @@ pub struct Conn {
 }
 
 /// Draws the heading, the detail pane and the virtualised per-application list.
+// The arguments are distinct pieces of app state; bundling them would obscure that.
+#[allow(clippy::too_many_arguments)]
 pub fn show(
    ui: &mut Ui,
    log: &ConnectionLog,
    rules: &[Rule],
+   rules_rev: u64,
    expanded: &mut Expanded,
    showing_all: &mut ShowingAll,
    cache: &mut LinesCache,
    selection: &mut Selection,
 ) {
-   cache.refresh(log, rules, expanded, showing_all);
+   cache.refresh(log, rules, rules_rev, expanded, showing_all);
 
    let apps = cache.lines.iter().filter(|line| matches!(line, Line::Group { .. })).count();
    heading(ui, log, apps);
@@ -2107,7 +2112,7 @@ mod tests {
       let mut cache = LinesCache::default();
 
       let before = builds();
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(
          cache.lines.len(),
          1,
@@ -2119,7 +2124,7 @@ mod tests {
          "the first frame builds the lines"
       );
 
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 1,
@@ -2127,12 +2132,12 @@ mod tests {
       );
 
       log.push(&event(20, "curl", "b.example"));
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(builds(), before + 2, "a new row rebuilds");
       assert_eq!(cache.lines.len(), 2, "both groups stay collapsed");
 
       expanded.toggle(&Node::app("firefox"));
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(builds(), before + 3, "expanding rebuilds");
       assert_eq!(
          cache.lines.len(),
@@ -2141,7 +2146,7 @@ mod tests {
       );
 
       expanded.toggle(&Node::dest("firefox", "a.example"));
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 4,
@@ -2150,7 +2155,7 @@ mod tests {
       assert_eq!(cache.lines.len(), 4);
 
       showing_all.insert(Node::app("firefox"));
-      cache.refresh(&log, &[], &expanded, &showing_all);
+      cache.refresh(&log, &[], 0, &expanded, &showing_all);
       assert_eq!(
          builds(),
          before + 5,
@@ -2158,8 +2163,34 @@ mod tests {
       );
 
       let rules = vec![rule(DestMatcher::Any, Action::Allow)];
-      cache.refresh(&log, &rules, &expanded, &showing_all);
+      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
       assert_eq!(builds(), before + 6, "a rule list rebuilds too");
+   }
+
+   #[test]
+   fn a_rule_edit_that_keeps_the_count_rebuilds_the_lines() {
+      let log = log(&[(10, "firefox", "a.example")]);
+      let mut cache = LinesCache::default();
+      let rules = vec![rule(DestMatcher::Any, Action::Allow)];
+      let expanded = Expanded::default();
+      let showing_all = ShowingAll::default();
+
+      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
+      let before = builds();
+      cache.refresh(&log, &rules, 1, &expanded, &showing_all);
+      assert_eq!(
+         builds(),
+         before,
+         "the same revision reuses the lines"
+      );
+
+      // A rule switched off, a duration changed: same count, different content.
+      cache.refresh(&log, &rules, 2, &expanded, &showing_all);
+      assert_eq!(
+         builds(),
+         before + 1,
+         "a rule edit rebuilds even at the same count"
+      );
    }
 
    /// Four flows to one destination: one older udp flow and three identical tcp ones.

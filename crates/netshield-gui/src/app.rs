@@ -111,6 +111,9 @@ pub struct App {
    status: Option<StatusInfo>,
    next_refresh: Instant,
    rules: Vec<Rule>,
+   /// Bumped every time the rule list is replaced. The Connections cache keys on it, so an
+   /// edit that keeps the rule count -- a toggled switch, a changed duration -- still rebuilds.
+   rules_rev: u64,
    confirm: ui::rules::Confirm,
    /// Which applications are expanded on the Connections page.
    connections_expanded: ui::connections::Expanded,
@@ -254,6 +257,7 @@ impl App {
          status: None,
          next_refresh: Instant::now() + REFRESH_EVERY,
          rules: Vec::new(),
+         rules_rev: 0,
          confirm: ui::rules::Confirm::default(),
          connections_expanded: ui::connections::Expanded::default(),
          connections_showing_all: ui::connections::ShowingAll::default(),
@@ -348,7 +352,10 @@ impl App {
                   }
                   Response::Prompt(prompt) => arrived.push(prompt),
                   Response::PromptClosed { id, .. } => closed.push(id),
-                  Response::Rules { rules } => self.rules = rules,
+                  Response::Rules { rules } => {
+                     self.rules = rules;
+                     self.rules_rev = self.rules_rev.wrapping_add(1);
+                  }
                   _ => {}
                },
             }
@@ -835,6 +842,7 @@ impl App {
             ui,
             &self.log,
             &self.rules,
+            self.rules_rev,
             &mut self.connections_expanded,
             &mut self.connections_showing_all,
             &mut self.connections_cache,
