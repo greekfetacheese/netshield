@@ -24,9 +24,6 @@ use log::{info, warn};
 
 use crate::conntrack::Flow;
 
-/// The one table this daemon owns, and the only one it ever touches.
-pub const TABLE: &str = "netshield";
-
 /// Marks this daemon writes into conntrack live in the top two bits, so a flush cannot touch a flow
 /// stamped by another tool (Docker and Kubernetes both use conntrack marks).
 pub const OWNER_TAG: u32 = 0x4000_0000;
@@ -68,13 +65,13 @@ impl fmt::Display for FirewallError {
 
 impl std::error::Error for FirewallError {}
 
-/// Renders the ruleset from ARCHITECTURE §2 with the queue numbers substituted.
+/// Renders the ruleset from ARCHITECTURE §2 for `table`, with the queue numbers substituted.
 ///
-/// Pure: no I/O, so the exact text — chain layout, rule order, `bypass` and the
+/// Pure: no I/O, so the exact text — table name, chain layout, rule order, `bypass` and the
 /// attribution comments — is unit-tested as a string.
-pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String {
+pub fn ruleset_text(table: &str, queue: u16, dns_queue: u16, filter_loopback: bool) -> String {
    let mut text = String::new();
-   text.push_str("table inet netshield {\n");
+   text.push_str(&format!("table inet {table} {{\n"));
    // The sets have to be declared at table level, before the chain that references them:
    // nft cannot forward-reference a set, and a set cannot be declared inside a chain.
    text.push_str(&format!(
@@ -144,11 +141,11 @@ pub fn ruleset_text(queue: u16, dns_queue: u16, filter_loopback: bool) -> String
 ///
 /// One `nft -f -` invocation adds every element, because a process per flow would be a
 /// process per connection. An empty `flows` is a no-op success.
-pub fn kill_flows(flows: &[Flow], timeout_secs: u64) -> Result<usize, FirewallError> {
+pub fn kill_flows(table: &str, flows: &[Flow], timeout_secs: u64) -> Result<usize, FirewallError> {
    if flows.is_empty() {
       return Ok(0);
    }
-   let script = element_text(flows, timeout_secs);
+   let script = element_text(table, flows, timeout_secs);
    nft(&["-f", "-"], Some(&script))?;
    info!(
       "rejecting {} flow(s) for {timeout_secs}s",
@@ -161,7 +158,7 @@ pub fn kill_flows(flows: &[Flow], timeout_secs: u64) -> Result<usize, FirewallEr
 ///
 /// Pure, so the exact element syntax — including the per-element timeout, without which
 /// the reject would outlive the revocation — is unit-tested without `nft`.
-fn element_text(flows: &[Flow], timeout_secs: u64) -> String {
+fn element_text(table: &str, flows: &[Flow], timeout_secs: u64) -> String {
    let mut v4 = Vec::new();
    let mut v6 = Vec::new();
    for flow in flows {
@@ -182,7 +179,7 @@ fn element_text(flows: &[Flow], timeout_secs: u64) -> String {
          continue;
       }
       script.push_str(&format!(
-         "add element inet {TABLE} {set} {{ {} }}\n",
+         "add element inet {table} {set} {{ {} }}\n",
          elements.join(", ")
       ));
    }
@@ -191,11 +188,13 @@ fn element_text(flows: &[Flow], timeout_secs: u64) -> String {
 
 /// Installs the table in one `nft -f -` transaction.
 ///
-/// With `force` a stale table of ours is deleted first; without it an existing
-/// `inet netshield` table is an error, because that means a second instance. If the
-/// transaction fails, [`remove`] is attempted so a partial state cannot survive, and the
-/// original error is what the caller sees.
+/// With `force` a stale table of the configured name is deleted first; without it an existing
+/// table of that name is an error, because that means a second instance owns it. A different
+/// name is a different table, so two daemons never share one. If the transaction fails,
+/// [`remove`] is attempted so a partial state cannot survive, and the original error is what
+/// the caller sees.
 pub fn install(
+   table: &str,
    queue: u16,
    dns_queue: u16,
    filter_loopback: bool,
@@ -207,45 +206,45 @@ pub fn install(
    }
 
    if force {
-      remove()?;
-   } else if table_exists()? {
+      remove(table)?;
+   } else if table_exists(table)? {
       return Err(FirewallError::Commands(format!(
-         "table inet {TABLE} already exists; another instance is running or use --force"
+         "table inet {table} already exists; another instance is running or use --force"
       )));
    }
 
-   let ruleset = ruleset_text(queue, dns_queue, filter_loopback);
+   let ruleset = ruleset_text(table, queue, dns_queue, filter_loopback);
    match nft(&["-f", "-"], Some(&ruleset)) {
       Ok(_) => {
          // The transcript should show what the kernel actually holds, not just what we
          // rendered; a listing failure here is not a failed install, but it is not silent.
-         match nft(&["list", "table", "inet", TABLE], None) {
-            Ok(listing) => info!("installed table inet {TABLE}:\n{listing}"),
-            Err(err) => warn!("table inet {TABLE} was installed but could not be listed: {err}"),
+         match nft(&["list", "table", "inet", table], None) {
+            Ok(listing) => info!("installed table inet {table}:\n{listing}"),
+            Err(err) => warn!("table inet {table} was installed but could not be listed: {err}"),
          }
          Ok(())
       }
       Err(err) => {
-         warn!("installing table inet {TABLE} failed, rolling back: {err}");
-         if let Err(rollback) = remove() {
-            warn!("rollback of table inet {TABLE} also failed: {rollback}");
+         warn!("installing table inet {table} failed, rolling back: {err}");
+         if let Err(rollback) = remove(table) {
+            warn!("rollback of table inet {table} also failed: {rollback}");
          }
          Err(err)
       }
    }
 }
 
-/// Deletes only `table inet netshield`; a missing table is success.
-pub fn remove() -> Result<(), FirewallError> {
-   match nft(&["delete", "table", "inet", TABLE], None) {
+/// Deletes only `table inet <table>`; a missing table is success.
+pub fn remove(table: &str) -> Result<(), FirewallError> {
+   match nft(&["delete", "table", "inet", table], None) {
       Ok(_) => Ok(()),
       Err(err @ FirewallError::NftMissing) => Err(err),
       Err(delete_err) => {
          // Delete-then-list, never message matching: if the table still lists, the delete
          // genuinely failed; if it does not, it was already absent.
-         match nft(&["list", "table", "inet", TABLE], None) {
+         match nft(&["list", "table", "inet", table], None) {
             Ok(_) => Err(FirewallError::Commands(format!(
-               "{delete_err}; table inet {TABLE} is still present"
+               "{delete_err}; table inet {table} is still present"
             ))),
             Err(FirewallError::NftMissing) => Err(FirewallError::NftMissing),
             Err(_) => Ok(()),
@@ -258,19 +257,19 @@ pub fn remove() -> Result<(), FirewallError> {
 ///
 /// Failing to list means the table is not installed, as does an `nft` that cannot answer:
 /// either way there is no verified table to trust, so the probe must not proceed.
-pub fn verify(queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
-   let listing = match nft(&["list", "table", "inet", TABLE], None) {
+pub fn verify(table: &str, queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
+   let listing = match nft(&["list", "table", "inet", table], None) {
       Ok(listing) => listing,
       Err(err @ FirewallError::NftMissing) => return Err(err),
       Err(err) => {
          return Err(FirewallError::Verify(format!(
-            "table inet {TABLE} is not installed ({err})"
+            "table inet {table} is not installed ({err})"
          )));
       }
    };
 
-   verify_listing(&listing, queue, dns_queue)?;
-   info!("verified table inet {TABLE}: chains output/dns_in, queues {queue}/{dns_queue}");
+   verify_listing(table, &listing, queue, dns_queue)?;
+   info!("verified table inet {table}: chains output/dns_in, queues {queue}/{dns_queue}");
    Ok(())
 }
 
@@ -278,11 +277,16 @@ pub fn verify(queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
 ///
 /// Split from [`verify`] so the token-level matching is exercised without running `nft`;
 /// this is the same check the live probe performs.
-fn verify_listing(listing: &str, queue: u16, dns_queue: u16) -> Result<(), FirewallError> {
+fn verify_listing(
+   table: &str,
+   listing: &str,
+   queue: u16,
+   dns_queue: u16,
+) -> Result<(), FirewallError> {
    for chain in ["chain output", "chain dns_in"] {
       if !listing.contains(chain) {
          return Err(FirewallError::Verify(format!(
-            "table inet {TABLE} has no `{chain}`"
+            "table inet {table} has no `{chain}`"
          )));
       }
    }
@@ -290,7 +294,7 @@ fn verify_listing(listing: &str, queue: u16, dns_queue: u16) -> Result<(), Firew
    for wanted in [queue, dns_queue] {
       if !queues.iter().any(|listed| *listed == wanted.to_string()) {
          return Err(FirewallError::Verify(format!(
-            "table inet {TABLE} has no rule queueing to {wanted}"
+            "table inet {table} has no rule queueing to {wanted}"
          )));
       }
    }
@@ -316,9 +320,9 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
       .and_then(|effective| effective.parse().ok())
 }
 
-/// Whether `inet netshield` already exists. An unlistable table counts as absent.
-fn table_exists() -> Result<bool, FirewallError> {
-   match nft(&["list", "table", "inet", TABLE], None) {
+/// Whether `inet <table>` already exists. An unlistable table counts as absent.
+fn table_exists(table: &str) -> Result<bool, FirewallError> {
+   match nft(&["list", "table", "inet", table], None) {
       Ok(_) => Ok(true),
       Err(err @ FirewallError::NftMissing) => Err(err),
       Err(_) => Ok(false),
@@ -412,9 +416,12 @@ mod tests {
 
    use super::*;
 
+   /// The name the tests render by default; the configurable name is tested separately.
+   const DEFAULT: &str = "netshield";
+
    #[test]
    fn ruleset_matches_architecture_section_two() {
-      let text = ruleset_text(0, 1, false);
+      let text = ruleset_text(DEFAULT, 0, 1, false);
       let lines: Vec<&str> = text.lines().collect();
       assert_eq!(
          lines,
@@ -451,9 +458,31 @@ mod tests {
       );
    }
 
+   /// The table name is not a constant: the rendered ruleset carries the configured name, so a
+   /// second daemon can install into its own table and never touch the real one.
+   #[test]
+   fn the_table_name_comes_from_config() {
+      let config: netshield_core::Config = serde_json::from_str(
+         r#"{"table": "netshielddiag", "queue_num": 0, "dns_queue_num": 1,
+            "prompt_timeout_secs": 30, "default_action": "prompt", "allowed_uid": null,
+            "log_level": "info", "socket_path": "/run/x", "rules_path": "/etc/x"}"#,
+      )
+      .expect("the config with a table name must load");
+
+      let text = ruleset_text(config.table_name(), 0, 1, false);
+      assert!(
+         text.starts_with("table inet netshielddiag {\n"),
+         "the rendered ruleset must name the configured table, got: {text}"
+      );
+      assert!(
+         !text.contains("table inet netshield {"),
+         "the default table must not be rendered alongside it"
+      );
+   }
+
    #[test]
    fn the_reject_sets_are_declared_before_the_chain_that_uses_them() {
-      let text = ruleset_text(0, 1, false);
+      let text = ruleset_text(DEFAULT, 0, 1, false);
       for set in [KILLED4, KILLED6] {
          let declaration = text
             .find(&format!("set {set} {{"))
@@ -470,7 +499,7 @@ mod tests {
    fn only_established_flows_match_a_reject_rule() {
       // `ct state established` is what lets the app reconnect: without it the handshake
       // of the next connection would be rejected too, and the daemon could never prompt.
-      let text = ruleset_text(0, 1, false);
+      let text = ruleset_text(DEFAULT, 0, 1, false);
       for line in text.lines().filter(|line| line.contains("@killed")) {
          assert!(
             line.trim_start().starts_with("ct state established "),
@@ -495,7 +524,7 @@ mod tests {
             80,
          ),
       ];
-      let script = element_text(&flows, 60);
+      let script = element_text(DEFAULT, &flows, 60);
       assert_eq!(
          script,
          "add element inet netshield killed4 { 10.0.0.1 . 1.2.3.4 . 51234 . 443 timeout 60s }\n\
@@ -512,23 +541,23 @@ mod tests {
          Ipv4Addr::new(10, 0, 0, 2),
          2,
       )];
-      let script = element_text(&flows, 90);
+      let script = element_text(DEFAULT, &flows, 90);
       assert!(script.contains(" timeout 90s"));
       assert_eq!(script.matches("add element").count(), 1);
-      assert_eq!(element_text(&[], 60), "");
+      assert_eq!(element_text(DEFAULT, &[], 60), "");
    }
 
    #[test]
    fn kill_flows_with_no_flows_is_a_successful_no_op() {
       assert_eq!(
-         kill_flows(&[], 60).expect("an empty kill is a success"),
+         kill_flows(DEFAULT, &[], 60).expect("an empty kill is a success"),
          0
       );
    }
 
    #[test]
    fn ruleset_substitutes_both_queues() {
-      let text = ruleset_text(7, 9, false);
+      let text = ruleset_text(DEFAULT, 7, 9, false);
       assert_eq!(text.matches("queue num 7").count(), 2);
       assert_eq!(text.matches("queue num 9").count(), 2);
       assert!(!text.contains("queue num 0"));
@@ -537,9 +566,9 @@ mod tests {
 
    #[test]
    fn loopback_filtering_is_the_only_conditional_rule() {
-      let unfiltered = ruleset_text(0, 1, false);
+      let unfiltered = ruleset_text(DEFAULT, 0, 1, false);
       assert!(unfiltered.contains("oifname \"lo\" return"));
-      let filtered = ruleset_text(0, 1, true);
+      let filtered = ruleset_text(DEFAULT, 0, 1, true);
       assert!(!filtered.contains("oifname"));
       assert_eq!(
          filtered.lines().count(),
@@ -550,7 +579,7 @@ mod tests {
 
    #[test]
    fn every_rule_is_attributed_and_nothing_else_is_flushed() {
-      let text = ruleset_text(3, 4, false);
+      let text = ruleset_text(DEFAULT, 3, 4, false);
       // Six commented rules plus the two set declarations, which are not rules.
       assert_eq!(text.matches("comment \"netshield:").count(), 6);
       assert!(!text.contains("flush ruleset"));
@@ -561,7 +590,7 @@ mod tests {
 
    #[test]
    fn the_owner_is_stamped_before_any_queue_verdict() {
-      let text = ruleset_text(3, 4, false);
+      let text = ruleset_text(DEFAULT, 3, 4, false);
       let stamp = text
          .find(&format!(
             "ct mark set meta skuid | {OWNER_TAG:#010x}"
@@ -581,7 +610,7 @@ mod tests {
 
    #[test]
    fn the_reject_rules_come_after_the_stamp_and_before_the_queues() {
-      let text = ruleset_text(3, 4, false);
+      let text = ruleset_text(DEFAULT, 3, 4, false);
       let stamp = text.find("ct mark set meta skuid").expect("the owner stamp is rendered");
       let first_reject = text.find("@killed4").expect("the v4 reject rules are rendered");
       let first_queue = text.find("queue num 3").expect("the tcp queue rule is rendered");
@@ -626,41 +655,41 @@ mod tests {
          "the captured fixture is tab-indented"
       );
       assert_eq!(listed_queues(FIXTURE), ["0", "0", "1", "1"]);
-      verify_listing(FIXTURE, 0, 1).expect("the table NetShield installed must verify");
+      verify_listing(DEFAULT, FIXTURE, 0, 1).expect("the table NetShield installed must verify");
    }
 
    #[test]
    fn real_nft_listing_rejects_a_missing_queue() {
-      assert!(verify_listing(FIXTURE, 0, 2).is_err());
+      assert!(verify_listing(DEFAULT, FIXTURE, 0, 2).is_err());
    }
 
    #[test]
    fn chains_without_a_queue_verdict_fail() {
       let listing = "table inet netshield {\n\tchain output {\n\t\tct state new return\n\t}\n\tchain dns_in {\n\t\tudp sport 53 return\n\t}\n}\n";
-      assert!(verify_listing(listing, 0, 1).is_err());
+      assert!(verify_listing(DEFAULT, listing, 0, 1).is_err());
    }
 
    #[test]
    fn a_single_digit_queue_is_not_satisfied_by_a_longer_number() {
       let listing = "\tchain output {\n\t\tct state new queue flags bypass to 10\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 10\n\t}\n";
-      assert!(verify_listing(listing, 10, 10).is_ok());
-      assert!(verify_listing(listing, 1, 10).is_err());
+      assert!(verify_listing(DEFAULT, listing, 10, 10).is_ok());
+      assert!(verify_listing(DEFAULT, listing, 1, 10).is_err());
    }
 
    #[test]
    fn a_number_inside_a_comment_is_not_a_queue_verdict() {
       let listing = "\tchain output {\n\t\tct state new return comment \"queue num 1\"\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 0 comment \"queue num 1\"\n\t}\n";
-      assert!(verify_listing(listing, 0, 0).is_ok());
-      assert!(verify_listing(listing, 0, 1).is_err());
+      assert!(verify_listing(DEFAULT, listing, 0, 0).is_ok());
+      assert!(verify_listing(DEFAULT, listing, 0, 1).is_err());
    }
 
    #[test]
    fn renderer_form_queue_num_also_verifies() {
-      let listing = ruleset_text(0, 1, false);
+      let listing = ruleset_text(DEFAULT, 0, 1, false);
       assert!(listing.contains("queue num 0"));
       assert!(!listing.contains("queue flags bypass to"));
       assert_eq!(listed_queues(&listing), ["0", "0", "1", "1"]);
-      verify_listing(&listing, 0, 1).expect("the renderer's own syntax must verify too");
+      verify_listing(DEFAULT, &listing, 0, 1).expect("the renderer's own syntax must verify too");
    }
 
    #[test]

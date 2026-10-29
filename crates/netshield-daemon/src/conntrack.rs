@@ -923,7 +923,7 @@ mod tests {
          eprintln!("skipping: must run as root (CAP_NET_ADMIN is required)");
          return;
       }
-      crate::firewall::install(0, 1, true, false)
+      crate::firewall::install("netshielddiag", 0, 1, true, false)
          .expect("install the ruleset with loopback filtering");
       let _table = TableGuard;
 
@@ -959,7 +959,8 @@ mod tests {
       );
       println!("found established flow {expected:?} for uid {uid}");
 
-      let killed = crate::firewall::kill_flows(&[expected], 30).expect("kill the flow");
+      let killed =
+         crate::firewall::kill_flows("netshielddiag", &[expected], 30).expect("kill the flow");
       assert_eq!(killed, 1);
       println!("killed {killed} flow(s) with {expected:?}");
 
@@ -996,7 +997,7 @@ mod tests {
 
    impl Drop for TableGuard {
       fn drop(&mut self) {
-         if let Err(err) = crate::firewall::remove() {
+         if let Err(err) = crate::firewall::remove("netshielddiag") {
             eprintln!("could not remove the test's nft table: {err}");
          }
       }

@@ -212,13 +212,17 @@ impl From<FirewallError> for ProbeError {
 
 /// Removes the table on drop, so a panic or an early return still cleans up.
 struct FirewallGuard {
+   table: String,
    armed: bool,
 }
 
 impl FirewallGuard {
-   /// Arms cleanup for a table that has just been installed.
-   fn new() -> Self {
-      Self { armed: true }
+   /// Arms cleanup for the table that has just been installed.
+   fn new(table: &str) -> Self {
+      Self {
+         table: table.to_owned(),
+         armed: true,
+      }
    }
 
    /// Disarms after an explicit [`firewall::remove`] succeeded.
@@ -232,11 +236,11 @@ impl Drop for FirewallGuard {
       if !self.armed {
          return;
       }
-      match firewall::remove() {
-         Ok(()) => info!("removed table inet {}", firewall::TABLE),
+      match firewall::remove(&self.table) {
+         Ok(()) => info!("removed table inet {}", self.table),
          Err(err) => error!(
             "could not remove table inet {} during cleanup: {err}",
-            firewall::TABLE
+            self.table
          ),
       }
    }
@@ -327,21 +331,33 @@ fn load_and_run(args: &Args) -> Result<(), String> {
 /// from then on every exit path — including a panic while reading packets — removes the
 /// table.
 fn probe(args: &Args) -> Result<(), ProbeError> {
-   let ruleset = firewall::ruleset_text(args.queue, args.dns_queue, args.filter_loopback);
+   // The probe installs into the configured table, so it never collides with another
+   // daemon's; a missing config file takes the default name, exactly as before.
+   let table = Config::load(&args.config)
+      .map_err(|err| FirewallError::Commands(err.to_string()))?
+      .table_name()
+      .to_owned();
+   let ruleset = firewall::ruleset_text(
+      &table,
+      args.queue,
+      args.dns_queue,
+      args.filter_loopback,
+   );
    info!("rendered ruleset:\n{ruleset}");
 
    firewall::install(
+      &table,
       args.queue,
       args.dns_queue,
       args.filter_loopback,
       false,
    )?;
-   let mut guard = FirewallGuard::new();
-   firewall::verify(args.queue, args.dns_queue)?;
+   let mut guard = FirewallGuard::new(&table);
+   firewall::verify(&table, args.queue, args.dns_queue)?;
 
    read_connections(args)?;
 
-   firewall::remove()?;
+   firewall::remove(&table)?;
    guard.disarm();
    Ok(())
 }

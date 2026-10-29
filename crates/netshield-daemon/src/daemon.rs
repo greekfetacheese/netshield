@@ -218,27 +218,24 @@ fn install_signal_handlers() -> std::io::Result<()> {
 fn adopt_or_install(config: &Config) -> Result<bool, DaemonError> {
    // Verify is the only reliable existence check: it fails both when the table is absent
    // and when it exists but is not the table this configuration describes.
-   if firewall::verify(config.queue_num, config.dns_queue_num).is_ok() {
+   let table = config.table_name();
+   if firewall::verify(table, config.queue_num, config.dns_queue_num).is_ok() {
       info!(
-         "adopting the installed table inet {} (queues {}/{})",
-         firewall::TABLE,
-         config.queue_num,
-         config.dns_queue_num
+         "adopting the installed table inet {table} (queues {}/{})",
+         config.queue_num, config.dns_queue_num
       );
       return Ok(true);
    }
 
-   info!(
-      "table inet {} is absent or does not verify; installing it",
-      firewall::TABLE
-   );
+   info!("table inet {table} is absent or does not verify; installing it");
    firewall::install(
+      table,
       config.queue_num,
       config.dns_queue_num,
       false,
       true,
    )?;
-   firewall::verify(config.queue_num, config.dns_queue_num)?;
+   firewall::verify(table, config.queue_num, config.dns_queue_num)?;
    Ok(true)
 }
 
@@ -392,7 +389,11 @@ impl Daemon {
             }
          }
       }
-      match firewall::kill_flows(&flows, REVOKE_TIMEOUT_SECS) {
+      match firewall::kill_flows(
+         self.config.table_name(),
+         &flows,
+         REVOKE_TIMEOUT_SECS,
+      ) {
          Ok(count) => info!("revoked {count} flow(s): {reason}"),
          Err(err) => warn!("could not revoke the flows for {reason}: {err}"),
       }
@@ -555,7 +556,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    let (ipc, queue, dns_queue) = match start_runtime(&config) {
       Ok(started) => started,
       Err(err) => {
-         remove_table_quietly();
+         remove_table_quietly(config.table_name());
          if let Err(remove_err) = ipc_server::remove_socket_file(&config.socket_path) {
             warn!("could not remove the control socket after a startup failure: {remove_err}");
          }
@@ -569,7 +570,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       Arc::clone(&cache),
       config.dns_queue_num,
    ) {
-      remove_table_quietly();
+      remove_table_quietly(config.table_name());
       if let Err(remove_err) = ipc_server::remove_socket_file(&config.socket_path) {
          warn!("could not remove the control socket at startup failure: {remove_err}");
       }
@@ -604,16 +605,11 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    daemon.tick_loop();
 
    let socket_path = daemon.config.socket_path.clone();
-   if let Err(err) = firewall::remove() {
-      error!(
-         "could not remove table inet {} at shutdown: {err}",
-         firewall::TABLE
-      );
+   let table = daemon.config.table_name();
+   if let Err(err) = firewall::remove(table) {
+      error!("could not remove table inet {table} at shutdown: {err}");
    } else {
-      info!(
-         "removed table inet {} at shutdown",
-         firewall::TABLE
-      );
+      info!("removed table inet {table} at shutdown");
    }
    if let Err(err) = ipc_server::remove_socket_file(&socket_path) {
       warn!("could not remove the control socket {socket_path:?}: {err}");
@@ -647,12 +643,9 @@ fn open_queue(queue: u16) -> Result<NfQueue, DaemonError> {
 }
 
 /// Removes the table without turning a startup failure into a cleanup failure.
-fn remove_table_quietly() {
-   if let Err(err) = firewall::remove() {
-      error!(
-         "could not roll back table inet {} after a startup failure: {err}",
-         firewall::TABLE
-      );
+fn remove_table_quietly(table: &str) {
+   if let Err(err) = firewall::remove(table) {
+      error!("could not roll back table inet {table} after a startup failure: {err}");
    }
 }
 
@@ -2051,13 +2044,13 @@ pub fn check(config: Config, rules_path: &Path) -> Result<(), DaemonError> {
       Ok::<_, DaemonError>((queue, dns_queue))
    })();
 
-   let removed = firewall::remove();
+   let table = config.table_name();
+   let removed = firewall::remove(table);
    match (queues, removed) {
       (Ok(_), Ok(())) => {
          println!(
-            "netshieldd --check: table inet {} verified (queues {}/{}), {} rule(s) loaded{}, \
+            "netshieldd --check: table inet {table} verified (queues {}/{}), {} rule(s) loaded{}, \
              DNS queue open; table removed",
-            firewall::TABLE,
             config.queue_num,
             config.dns_queue_num,
             store.rules().len(),
@@ -2068,10 +2061,7 @@ pub fn check(config: Config, rules_path: &Path) -> Result<(), DaemonError> {
       (Ok(_), Err(err)) => Err(DaemonError::Firewall(err)),
       (Err(err), Ok(())) => Err(err),
       (Err(err), Err(remove_err)) => {
-         error!(
-            "--check could not remove table inet {}: {remove_err}",
-            firewall::TABLE
-         );
+         error!("--check could not remove table inet {table}: {remove_err}");
          Err(err)
       }
    }
