@@ -25,6 +25,7 @@ use log::{debug, warn};
 use netshield_core::{Attribution, Family, L4Proto, ProcessInfo};
 
 use crate::ebpf::SenderLookup;
+use crate::firewall::Flow;
 
 /// How long an inode→pid, pid→fd or flow→owner answer may be reused.
 ///
@@ -98,6 +99,9 @@ type FlowKey = (L4Proto, (IpAddr, u16), (IpAddr, u16));
 
 /// The flow class whose consecutive misses are tracked for the operator warning.
 type MissKey = (Option<u32>, L4Proto, u16);
+
+/// One socket-table row, keyed by inode: its endpoints and the protocol that printed it.
+type SocketRow = ((IpAddr, u16), (IpAddr, u16), L4Proto);
 
 /// The identity of one process, learned while its `/proc` entry was still readable.
 ///
@@ -1118,6 +1122,120 @@ fn socket_rows(
    })
 }
 
+/// Which live sockets a revocation covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowOwner<'a> {
+   /// Every socket held by a process running this executable.
+   Exe(&'a Path),
+   /// Every socket on the machine.
+   All,
+}
+
+/// One live socket, with the process that holds it.
+///
+/// A revocation that must *judge* a flow (a mode change, a fresh start) needs the same evidence a
+/// rule is matched against, so the holder's identity travels with the flow rather than being
+/// re-derived by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveFlow {
+   pub flow: Flow,
+   pub proto: L4Proto,
+   pub identity: CachedIdentity,
+   pub pid: u32,
+}
+
+/// The flows a revocation should reject, in the shape `firewall::kill_flows` takes.
+///
+/// The socket table is the source of truth, not conntrack: conntrack only knows a flow this
+/// daemon stamped at birth, so a flow established while the table was not installed — the
+/// daemon was not running yet, or restarting — is invisible to it and would outlive every
+/// decision change. `/proc/net` prints the same tuple the reject sets match on, for every
+/// socket that exists, whoever created it.
+///
+/// The descriptor scan is what pairs a flow with its holder, so this is a full `/proc` sweep and
+/// belongs on a decision change, never on the packet path.
+pub fn live_flows(owner: FlowOwner<'_>) -> Vec<LiveFlow> {
+   let mut rows: HashMap<u32, SocketRow> = HashMap::new();
+   for (proto, family) in [
+      (L4Proto::Tcp, Family::V4),
+      (L4Proto::Tcp, Family::V6),
+      (L4Proto::Udp, Family::V4),
+      (L4Proto::Udp, Family::V6),
+   ] {
+      let Some(table) = socket_table(proto, family) else {
+         continue;
+      };
+      let Ok(text) = fs::read_to_string(Path::new(PROC).join("net").join(table)) else {
+         continue;
+      };
+      for (local, remote, inode) in socket_rows(&text, family) {
+         if let Ok(inode) = u32::try_from(inode) {
+            rows.insert(inode, (local, remote, proto));
+         }
+      }
+   }
+   if rows.is_empty() {
+      return Vec::new();
+   }
+
+   let Some(pids) = numeric_pids() else {
+      return Vec::new();
+   };
+   let mut flows: Vec<LiveFlow> = Vec::new();
+   for pid in pids {
+      let Some(identity) = identity_at(pid, Path::new(PROC)) else {
+         continue;
+      };
+      if let FlowOwner::Exe(path) = owner
+         && identity.exe.as_deref() != Some(path)
+      {
+         continue;
+      }
+      let held = match socket_inodes(pid) {
+         Ok(held) => held,
+         // A truncated scan still found the freshest descriptors; a vanished process has
+         // nothing left to revoke.
+         Err(ScanError::Budget(held)) => held,
+         Err(ScanError::Unreadable) => continue,
+      };
+      for inode in held {
+         let Some((local, remote, proto)) = rows.get(&inode) else {
+            continue;
+         };
+         let Some(flow) = revocable(*local, *remote, inode) else {
+            continue;
+         };
+         if flows.iter().any(|live| live.flow == flow) {
+            continue;
+         }
+         flows.push(LiveFlow {
+            flow,
+            proto: *proto,
+            identity: identity.clone(),
+            pid,
+         });
+      }
+   }
+   flows
+}
+
+/// The flow a socket-table row describes, when a reject rule could match it.
+///
+/// Three rows are unusable and are dropped here rather than shipped to `nft`: inode 0 is a row
+/// that outlived its socket (TIME_WAIT), so no element could ever match a live flow; an
+/// unspecified remote is an unconnected socket with no peer tuple to reject; and loopback is
+/// never filtered, because the output chain returns on `oifname "lo"`.
+fn revocable(local: (IpAddr, u16), remote: (IpAddr, u16), inode: u32) -> Option<Flow> {
+   if inode == 0 || remote.0.is_unspecified() || local.0.is_loopback() || remote.0.is_loopback() {
+      return None;
+   }
+   match (local.0, remote.0) {
+      (IpAddr::V4(from), IpAddr::V4(to)) => Some(Flow::V4(from, local.1, to, remote.1)),
+      (IpAddr::V6(from), IpAddr::V6(to)) => Some(Flow::V6(from, local.1, to, remote.1)),
+      _ => None,
+   }
+}
+
 /// Returns the inode candidates for a flow, best match first.
 ///
 /// TCP is exact-only: an unconnected socket is indistinguishable from another flow on the
@@ -1520,6 +1638,79 @@ mod tests {
    use super::*;
    use std::net::UdpSocket;
    use std::sync::atomic::{AtomicUsize, Ordering};
+
+   /// Only a row a reject rule could match becomes a flow.
+   #[test]
+   fn a_row_becomes_a_flow_only_when_a_reject_could_match_it() {
+      let local = (
+         IpAddr::V4(Ipv4Addr::new(192, 168, 1, 4)),
+         51234u16,
+      );
+      let remote = (IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443u16);
+      assert_eq!(
+         revocable(local, remote, 4242),
+         Some(Flow::V4(
+            Ipv4Addr::new(192, 168, 1, 4),
+            51234,
+            Ipv4Addr::new(1, 2, 3, 4),
+            443
+         ))
+      );
+
+      // TIME_WAIT: the row outlived its socket, so no process can hold it.
+      assert_eq!(revocable(local, remote, 0), None);
+      // Unconnected: there is no peer tuple to reject.
+      assert_eq!(
+         revocable(
+            local,
+            (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            4242
+         ),
+         None
+      );
+      // Loopback is never filtered (the output chain returns on `oifname "lo"`).
+      assert_eq!(
+         revocable(
+            (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 51234),
+            (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 53)), 53),
+            4242
+         ),
+         None
+      );
+      // IPv6 has its own set and its own shape.
+      assert_eq!(
+         revocable(
+            (
+               IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+               51235
+            ),
+            (
+               IpAddr::V6(Ipv6Addr::new(
+                  0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
+               )),
+               80
+            ),
+            4243
+         ),
+         Some(Flow::V6(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            51235,
+            Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+            80
+         ))
+      );
+   }
+
+   /// An executable no process is running holds no flows: the revocation is a no-op.
+   #[test]
+   fn an_executable_with_no_process_revokes_nothing() {
+      assert!(
+         live_flows(FlowOwner::Exe(Path::new(
+            "/nonexistent/netshield-test-binary"
+         )))
+         .is_empty()
+      );
+   }
 
    /// `/proc/net/tcp` captured on the development machine (kernel 7.0.0-38-generic,
    /// Ubuntu) with two listening sockets, plus the matching `/proc/net/tcp6` loopback
