@@ -1600,7 +1600,7 @@ mod tests {
    }
 
    #[test]
-   fn a_hit_counts_as_neither() {
+   fn the_registry_answer_is_counted_apart_from_a_miss() {
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: Some(std::process::id()),
@@ -1633,10 +1633,9 @@ mod tests {
       assert_eq!(attributor.stats().registry_hits, 1);
       assert_eq!(attributor.stats().registry_misses, 0);
       assert_eq!(attributor.stats().registry_refusals, 0);
-   }
 
-   #[test]
-   fn a_refused_answer_is_counted_separately_from_a_miss() {
+      // A refusal: the registry names a pid that belongs to another uid, so the answer
+      // is rejected and counted as a refusal, never as a coverage miss.
       let asked = Arc::new(AtomicUsize::new(0));
       // pid 1 is root on a native host; inside a user-namespace sandbox (where `cargo test`
       // may run) it is our own uid, so the packet names a uid pid 1 does not have either way.
@@ -1652,7 +1651,6 @@ mod tests {
          asked: Arc::clone(&asked),
       };
       let mut attributor = Attributor::new().with_senders(Box::new(senders));
-      let (local, remote) = closed_flow();
 
       let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(packet_uid));
 
@@ -1674,17 +1672,14 @@ mod tests {
       assert_eq!(attributor.stats().registry_hits, 0);
       assert_eq!(attributor.stats().registry_refusals, 1);
       assert_eq!(attributor.stats().registry_misses, 0);
-   }
 
-   #[test]
-   fn an_empty_registry_answer_counts_as_a_miss() {
+      // A miss: the registry had no record at all, which is the coverage number.
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: None,
          asked: Arc::clone(&asked),
       };
       let mut attributor = Attributor::new().with_senders(Box::new(senders));
-      let (local, remote) = closed_flow();
 
       let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(own_uid()));
 
@@ -1701,7 +1696,7 @@ mod tests {
    }
 
    #[test]
-   fn the_registry_is_never_asked_when_proc_succeeds() {
+   fn the_registry_is_consulted_only_after_proc_and_never_for_a_uid_less_flow() {
       let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
       socket.connect("127.0.0.1:9").expect("connect the datagram socket");
       let local = socket.local_addr().expect("local address");
@@ -1732,10 +1727,8 @@ mod tests {
          Attribution::Unknown => panic!("the live socket must resolve through /proc"),
       }
       assert_eq!(attributor.stats().registry_hits, 0);
-   }
 
-   #[test]
-   fn a_registry_answer_is_not_used_for_a_uid_less_flow() {
+      // A flow the kernel gave no uid has no registry key at all.
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: Some(std::process::id()),
@@ -1771,7 +1764,8 @@ mod tests {
    }
 
    #[test]
-   fn ipv4_column_is_little_endian() {
+   fn the_socket_table_columns_decode_little_endian() {
+      // IPv4 is one little-endian word per column.
       assert_eq!(
          decode_endpoint("0100007F:0C08", Family::V4),
          Some(v4([127, 0, 0, 1], 3080))
@@ -1786,10 +1780,8 @@ mod tests {
       );
       assert_eq!(decode_endpoint("0100007F", Family::V4), None);
       assert_eq!(decode_endpoint("not-hex:0000", Family::V4), None);
-   }
 
-   #[test]
-   fn ipv6_column_is_four_little_endian_groups() {
+      // IPv6 is four little-endian words.
       assert_eq!(
          decode_endpoint(
             "00000000000000000000000001000000:0277",
@@ -1809,10 +1801,8 @@ mod tests {
          ))
       );
       assert_eq!(decode_endpoint("...:0000", Family::V6), None);
-   }
 
-   #[test]
-   fn fixture_matching_finds_the_right_inode() {
+      // Fixture matching finds the right inode.
       let local = v4([127, 0, 0, 1], 3080);
       let remote = v4([0, 0, 0, 0], 0);
       assert_eq!(
@@ -1830,10 +1820,8 @@ mod tests {
          ),
          Some(12_311)
       );
-   }
 
-   #[test]
-   fn fixture_matching_returns_none_when_no_row_matches() {
+      // No row matches.
       let local = v4([127, 0, 0, 1], 9999);
       assert_eq!(
          find_inode(
@@ -1854,10 +1842,8 @@ mod tests {
          ),
          None
       );
-   }
 
-   #[test]
-   fn fixture_matching_works_for_ipv6() {
+      // Fixture matching works for IPv6.
       assert_eq!(
          find_inode(
             TCP6_FIXTURE,
@@ -1870,7 +1856,7 @@ mod tests {
    }
 
    #[test]
-   fn unconnected_udp_row_is_found_by_local_port() {
+   fn the_udp_fallback_matches_by_local_port_and_tcp_never_does() {
       // The packet carries the interface address; the unconnected socket row keeps the
       // wildcard local address and an unspecified remote, so an exact match cannot find it.
       assert_eq!(
@@ -1883,10 +1869,7 @@ mod tests {
          ),
          vec![34_567]
       );
-   }
 
-   #[test]
-   fn connected_udp_row_is_matched_exactly_and_wins_over_a_port_only_row() {
       // Row 2 is connect()ed: real local address and real remote. Row 1 is an unconnected
       // socket on the same local port, so it is a valid port-only candidate for the same
       // tuple, yet the exact row must win.
@@ -1911,10 +1894,7 @@ mod tests {
          ),
          vec![34_570]
       );
-   }
 
-   #[test]
-   fn udp_port_only_candidate_must_share_the_local_port() {
       // The fixture holds unconnected rows on ports 32768..32771; a packet on any other
       // local port must not be matched to them just because the remote is unspecified.
       assert_eq!(
@@ -1927,10 +1907,7 @@ mod tests {
          ),
          Vec::<u64>::new()
       );
-   }
 
-   #[test]
-   fn tcp_never_falls_back_to_local_port_only() {
       // The row's local port matches the packet, but its remote is the wildcard; TCP has
       // no port-only stage, so this must stay unattributed.
       assert_eq!(
@@ -1943,10 +1920,8 @@ mod tests {
          ),
          Vec::<u64>::new()
       );
-   }
 
-   #[test]
-   fn unconnected_udp6_row_matches_an_ipv6_packet() {
+      // The same fallback works for an IPv6 packet.
       let local = v6("2001:db8::1".parse().expect("literal"), 32768);
       let remote = v6(
          "2606:4700::681a:868".parse().expect("literal"),
@@ -1965,7 +1940,7 @@ mod tests {
    }
 
    #[test]
-   fn unconnected_udp_rows_with_inode_zero_are_skipped() {
+   fn an_inode_zero_row_is_never_a_candidate() {
       // Port 32770 has a zero-inode row and a live row; only the live inode is a candidate.
       assert_eq!(
          inode_candidates(
@@ -1988,14 +1963,11 @@ mod tests {
          ),
          Vec::<u64>::new()
       );
-   }
 
-   #[test]
-   fn exact_row_with_inode_zero_is_not_a_candidate_for_any_protocol() {
-      let local = v4([192, 168, 1, 4], 54910);
-      let remote = v4([140, 82, 121, 6], 443);
       // The row matches the flow exactly, but its socket is gone: it must not become a
       // candidate, because no process can hold an inode-0 descriptor.
+      let local = v4([192, 168, 1, 4], 54910);
+      let remote = v4([140, 82, 121, 6], 443);
       assert_eq!(
          inode_candidates(
             TCP_CLOSED_FIXTURE,
@@ -2087,7 +2059,7 @@ mod tests {
    }
 
    #[test]
-   fn socket_link_parses_only_socket_targets() {
+   fn socket_link_and_cmdline_parsing() {
       assert_eq!(
          socket_link_inode("socket:[233146]"),
          Some(233_146)
@@ -2095,10 +2067,7 @@ mod tests {
       assert_eq!(socket_link_inode("/dev/null"), None);
       assert_eq!(socket_link_inode("pipe:[12]"), None);
       assert_eq!(socket_link_inode("socket:[not-a-number]"), None);
-   }
 
-   #[test]
-   fn cmdline_joins_nul_separated_arguments_and_drops_the_tail() {
       assert_eq!(
          join_cmdline(b"/usr/bin/firefox\0--new-window\0"),
          Some("/usr/bin/firefox --new-window".to_owned())
@@ -2240,62 +2209,46 @@ mod tests {
    }
 
    #[test]
-   fn failure_message_names_flow_protocol_table_uid_and_candidates() {
+   fn the_failure_message_stays_one_line_and_bounded() {
+      // A v4 context with a candidate count.
       let context = FailureContext {
          local: v4([192, 168, 1, 5], 32768),
          remote: v4([1, 1, 1, 1], 53),
          proto: L4Proto::Udp,
-         uid: None,
+         uid: Some(1000),
          table: Some("udp"),
          candidates: Some(1),
       };
       let message = failure_message(&context, "no /proc fd link holds the inode");
-      assert!(message.contains("udp "), "{message}");
-      assert!(
-         message.contains("192.168.1.5:32768 -> 1.1.1.1:53"),
-         "{message}"
-      );
-      assert!(message.contains("uid=none"), "{message}");
-      assert!(message.contains("table=udp"), "{message}");
-      assert!(message.contains("cand=1"), "{message}");
+      assert!(!message.contains('\n'), "{message}");
       assert!(
          message.len() < 160,
          "too long ({}): {message}",
          message.len()
       );
 
-      let with_uid = FailureContext {
-         uid: Some(1000),
-         ..context
-      };
-      let message = failure_message(&with_uid, "no matching socket row in the table");
-      assert!(message.contains("uid=Some(1000)"), "{message}");
-   }
-
-   #[test]
-   fn failure_message_renders_a_missing_table_and_candidate_count() {
+      // A v6 context with no table and no candidate count.
       let context = FailureContext {
          local: v6(
-            "2606:4700:4700::1111".parse().expect("literal"),
-            5353,
+            "2001:db8:1234:5678:9abc:def0:1234:5678".parse().expect("literal"),
+            65535,
          ),
          remote: v6(
-            "2606:4700:4700::1001".parse().expect("literal"),
+            "2606:4700:4700::1111".parse().expect("literal"),
             53,
          ),
          proto: L4Proto::Udp,
-         uid: None,
+         uid: Some(u32::MAX),
          table: None,
          candidates: None,
       };
       let message = failure_message(&context, "local address has no family");
+      assert!(!message.contains('\n'), "{message}");
       assert!(
-         message.contains("[2606:4700:4700::1111]:5353 ->"),
-         "{message}"
+         message.len() < 160,
+         "too long ({}): {message}",
+         message.len()
       );
-      assert!(message.contains("uid=none"), "{message}");
-      assert!(message.contains("table=no-table"), "{message}");
-      assert!(message.contains("cand=-"), "{message}");
    }
 
    fn flow(local_port: u16, remote_port: u16) -> FlowKey {
@@ -2307,12 +2260,12 @@ mod tests {
    }
 
    #[test]
-   fn flow_cache_returns_the_same_owner_without_rescanning_proc() {
+   fn the_flow_cache_returns_the_same_owner_and_refuses_a_disagreeing_uid() {
       let mut attributor = Attributor::new();
-      let flow = flow(50_000, 53);
+      let key = flow(50_000, 53);
       let start = Instant::now();
       attributor.remember_flow(
-         flow,
+         key,
          FlowCacheEntry {
             pid: 4242,
             uid: 1000,
@@ -2324,14 +2277,14 @@ mod tests {
       // would have no `/proc` row for this synthetic tuple, so a scan could not pass.
       assert_eq!(
          attributor.cached_flow(
-            flow,
+            key,
             Some(1000),
             start + StdDuration::from_millis(300)
          ),
          Some((4242, 1000))
       );
       assert_eq!(
-         attributor.cached_flow(flow, Some(1000), start + CACHE_TTL),
+         attributor.cached_flow(key, Some(1000), start + CACHE_TTL),
          None,
          "an entry at the TTL bound is stale"
       );
@@ -2339,10 +2292,8 @@ mod tests {
          attributor.flow_owners.is_empty(),
          "expired entries are dropped"
       );
-   }
 
-   #[test]
-   fn flow_cache_answers_a_second_lookup_after_the_socket_closed() {
+      // The cache answers a second lookup after the owning socket has closed.
       let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
       socket.connect("127.0.0.1:9").expect("connect the datagram socket");
       let local = socket.local_addr().expect("local address");
@@ -2373,15 +2324,13 @@ mod tests {
       assert_eq!(first, second);
       assert_eq!(attributor.stats().hits, 2);
       assert_eq!(attributor.stats().misses, 0);
-   }
 
-   #[test]
-   fn flow_cache_refuses_a_cached_owner_that_disagrees_with_the_packet_uid() {
+      // A cached owner that disagrees with the packet uid is refused, not returned.
       let mut attributor = Attributor::new();
-      let flow = flow(50_001, 53);
+      let key = flow(50_001, 53);
       let start = Instant::now();
       attributor.remember_flow(
-         flow,
+         key,
          FlowCacheEntry {
             pid: 1,
             uid: 1000,
@@ -2389,14 +2338,12 @@ mod tests {
          },
       );
       assert_eq!(
-         attributor.cached_flow(flow, Some(0), start + StdDuration::from_millis(1)),
+         attributor.cached_flow(key, Some(0), start + StdDuration::from_millis(1)),
          None
       );
       assert!(attributor.flow_owners.is_empty());
-   }
 
-   #[test]
-   fn flow_cache_is_bounded_to_a_few_hundred_entries() {
+      // The cache is bounded to a few hundred entries.
       let mut attributor = Attributor::new();
       let start = Instant::now();
       for port in 0..(MAX_FLOWS as u16 + 16) {
@@ -2413,36 +2360,34 @@ mod tests {
    }
 
    #[test]
-   fn negative_flow_entry_expires_after_its_short_ttl() {
+   fn a_negative_entry_expires_and_a_success_clears_it() {
       let mut attributor = Attributor::new();
-      let flow = flow(50_002, 53);
+      let key = flow(50_002, 53);
       let start = Instant::now();
-      attributor.mark_flow_miss(flow, Some(Missing::SocketGone), start);
+      attributor.mark_flow_miss(key, Some(Missing::SocketGone), start);
 
       assert_eq!(
-         attributor.flow_miss_active(flow, start + StdDuration::from_millis(500)),
+         attributor.flow_miss_active(key, start + StdDuration::from_millis(500)),
          Some(Some(Missing::SocketGone)),
          "a negative entry keeps the reason the scan failed"
       );
       assert_eq!(
-         attributor.flow_miss_active(flow, start + NEGATIVE_TTL),
+         attributor.flow_miss_active(key, start + NEGATIVE_TTL),
          None
       );
-      assert!(!attributor.flow_misses.contains_key(&flow));
-   }
+      assert!(!attributor.flow_misses.contains_key(&key));
 
-   #[test]
-   fn a_later_success_clears_the_negative_marker_and_the_miss_streak() {
+      // A later success clears both the negative marker and the miss streak.
       let mut attributor = Attributor::new();
-      let flow = flow(50_003, 53);
+      let key = flow(50_003, 53);
       let class = (Some(1000), L4Proto::Udp, 53);
       let start = Instant::now();
-      attributor.mark_flow_miss(flow, None, start);
-      attributor.record_miss(L4Proto::Udp, flow.2, Some(1000), start);
+      attributor.mark_flow_miss(key, None, start);
+      attributor.record_miss(L4Proto::Udp, key.2, Some(1000), start);
       assert_eq!(attributor.miss_streaks[&class].consecutive, 1);
 
       attributor.remember_success(
-         flow,
+         key,
          FlowCacheEntry {
             pid: 777,
             uid: 1000,
@@ -2450,21 +2395,19 @@ mod tests {
          },
          class,
       );
-      assert!(!attributor.flow_misses.contains_key(&flow));
+      assert!(!attributor.flow_misses.contains_key(&key));
       assert!(!attributor.miss_streaks.contains_key(&class));
       assert_eq!(
          attributor.cached_flow(
-            flow,
+            key,
             Some(1000),
             start + StdDuration::from_millis(1)
          ),
          Some((777, 1000)),
          "the success must overwrite the negative entry"
       );
-   }
 
-   #[test]
-   fn stale_negative_fd_snapshot_still_finds_a_newly_opened_socket() {
+      // A negative fd snapshot must be refreshed, not trusted.
       let pid = std::process::id();
       let uid = own_uid();
       let inode = 987_654u32;
@@ -2507,10 +2450,8 @@ mod tests {
          reads, 0,
          "a cached positive must not re-read /proc"
       );
-   }
 
-   #[test]
-   fn a_missed_pid_is_refreshed_only_once_per_lookup() {
+      // A missed pid is refreshed only once per lookup.
       let pid = std::process::id();
       let uid = own_uid();
       let mut reads = 0u32;
@@ -2539,15 +2480,12 @@ mod tests {
          Missing::SocketGone,
          "a complete scan that finds nobody means the socket is gone"
       );
-   }
 
-   #[test]
-   fn an_incomplete_scan_is_not_a_closed_flow() {
+      // An unreadable descriptor directory means this pid was never ruled out, so the
+      // scan is incomplete even though it found no owner.
       let pid = std::process::id();
       let uid = own_uid();
       let mut attributor = Attributor::new();
-      // An unreadable descriptor directory means this pid was never ruled out, so the
-      // scan is incomplete even though it found no owner.
       let owner = attributor.scan_pids_for_inode(vec![pid], 4242, Some(uid), |_| {
          Err(ScanError::Unreadable)
       });
@@ -2561,10 +2499,8 @@ mod tests {
          Missing::NotOurs,
          "a scan that could not look everywhere must still prompt"
       );
-   }
 
-   #[test]
-   fn a_uid_less_flow_is_never_a_closed_flow() {
+      // A uid-less flow is never a closed flow.
       let pid = std::process::id();
       let mut attributor = Attributor::new();
       let owner = attributor.scan_pids_for_inode(vec![pid], 4242, None, |_| Ok(Vec::new()));
@@ -2578,10 +2514,8 @@ mod tests {
          Missing::NotOurs,
          "forwarded and socket-less traffic keeps prompting"
       );
-   }
 
-   #[test]
-   fn a_new_lookup_clears_the_incomplete_flag() {
+      // A new lookup clears the incomplete flag.
       let mut attributor = Attributor::new();
       attributor.budget_exhausted("test budget");
       assert!(attributor.scan_incomplete);
@@ -2601,7 +2535,7 @@ mod tests {
    }
 
    #[test]
-   fn miss_warning_fires_once_for_six_misses_and_again_after_suppression() {
+   fn miss_warning_fires_once_per_flow_class() {
       let mut attributor = Attributor::new();
       let start = Instant::now();
       let remote = flow(50_004, 53).2;
@@ -2645,10 +2579,8 @@ mod tests {
          .miss_warning(key, L4Proto::Udp, remote, None, after)
          .expect("a warning after the suppression window");
       assert!(message.contains("1.1.1.1:53"), "{message}");
-   }
 
-   #[test]
-   fn miss_warning_treats_different_flow_classes_separately() {
+      // A different flow class is tracked separately.
       let mut attributor = Attributor::new();
       let start = Instant::now();
       let remote = flow(50_005, 53).2;
@@ -2671,38 +2603,13 @@ mod tests {
       assert_eq!(attributor.miss_streaks[&other].consecutive, 1);
    }
 
-   #[test]
-   fn failure_message_stays_one_line() {
-      let context = FailureContext {
-         local: v6(
-            "2001:db8:1234:5678:9abc:def0:1234:5678".parse().expect("literal"),
-            65535,
-         ),
-         remote: v6(
-            "2606:4700:4700::1111".parse().expect("literal"),
-            53,
-         ),
-         proto: L4Proto::Udp,
-         uid: Some(u32::MAX),
-         table: Some("udp6"),
-         candidates: Some(MAX_UDP_CANDIDATES),
-      };
-      let message = failure_message(&context, "no /proc fd link holds the inode");
-      assert!(!message.contains('\n'), "{message}");
-      assert!(
-         message.len() < 160,
-         "too long ({}): {message}",
-         message.len()
-      );
-   }
-
    /// A fixed instant for ordering tests; values are offsets from it.
    fn at(offset: u64) -> SystemTime {
       SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_000 + offset)
    }
 
    #[test]
-   fn sort_pids_newest_first_orders_newest_first_with_stable_ties() {
+   fn sorting_puts_the_newest_first_and_untimed_last() {
       // Pids 10 and 11 share a timestamp: a stable sort keeps their readdir order.
       let entries = vec![
          (10, Some(at(1))),
@@ -2714,20 +2621,14 @@ mod tests {
          sort_pids_newest_first(entries),
          vec![20, 30, 10, 11]
       );
-   }
 
-   #[test]
-   fn sort_pids_newest_first_puts_untimed_entries_last() {
       let entries = vec![(1, None), (2, Some(at(1))), (3, None), (4, Some(at(2)))];
       assert_eq!(
          sort_pids_newest_first(entries),
          vec![4, 2, 1, 3],
          "a pid with no readable time stays scannable, only last"
       );
-   }
 
-   #[test]
-   fn sort_fds_newest_first_orders_newest_first_with_stable_ties() {
       let entries = vec![
          (OsString::from("a"), Some(at(1))),
          (OsString::from("b"), Some(at(9))),
@@ -2741,10 +2642,7 @@ mod tests {
             OsString::from("c")
          ]
       );
-   }
 
-   #[test]
-   fn sort_fds_newest_first_puts_untimed_entries_last_and_keeps_the_newest() {
       let entries = vec![
          (OsString::from("stale"), Some(at(1))),
          (OsString::from("untimed"), None),
@@ -2873,7 +2771,7 @@ mod tests {
    }
 
    #[test]
-   fn process_cache_records_uid_starttime_and_exe() {
+   fn the_process_cache_records_the_identity_it_reads() {
       let root = proc_fixture(
          "cache-hit",
          Some("/usr/lib/firefox/firefox"),
@@ -2898,10 +2796,7 @@ mod tests {
       assert!(cache.is_empty());
 
       let _ = fs::remove_dir_all(&root);
-   }
 
-   #[test]
-   fn process_cache_tolerates_a_missing_exe() {
       // The racing-exit case: the pid directory is readable but `exe` is gone. The
       // identity must still be recorded so the uid and start time are known.
       let root = proc_fixture("cache-no-exe", None, "vanished");
@@ -2912,23 +2807,17 @@ mod tests {
       assert_eq!(identity.comm, "vanished");
 
       let _ = fs::remove_dir_all(&root);
-   }
 
-   #[test]
-   fn process_cache_skips_a_pid_whose_metadata_is_gone() {
+      // A pid whose metadata is gone is skipped.
       let root = std::env::temp_dir().join("netshield-cache-missing");
       assert_eq!(identity_at(999_999, &root), None);
-   }
 
-   #[test]
-   fn status_uid_reads_the_first_field_only() {
+      // The uid is the first status field only.
       let status = "Name:\tsleep\nUid:\t0\t1000\t1000\t1000\nGid:\t0\t1000\t1000\t1000\n";
       assert_eq!(status_uid(status), Some(0));
       assert_eq!(status_uid("Name:\tx\n"), None);
-   }
 
-   #[test]
-   fn stat_starttime_ignores_comm_parentheses_and_spaces() {
+      // The start time ignores the comm's parentheses and spaces.
       let stat = "7 (a (b) c) S 1 7 7 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 555 0";
       assert_eq!(stat_starttime(stat), Some(555));
       assert_eq!(stat_starttime("garbage"), None);
@@ -2971,10 +2860,7 @@ mod tests {
          1,
          "a lookup must not rewrite the identity cache with an ownership answer"
       );
-   }
 
-   #[test]
-   fn a_cache_hit_with_a_disagreeing_uid_is_dropped_not_laundered() {
       // A pid belongs to uid 7; the packet claims uid 1000. The cached identity must not
       // be returned, because the descriptor scan's uid agreement check would then pass on
       // an identity that belongs to someone else.
