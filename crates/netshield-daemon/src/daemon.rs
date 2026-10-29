@@ -1006,16 +1006,27 @@ impl Daemon {
    ) -> (usize, usize) {
       let mut created = 0;
       let mut updated = 0;
+      let mut forever = Vec::new();
       for rule in rules_for(record, decide, now) {
-         let forever = rule.duration == RuleDuration::Forever;
+         // Read before the move: `policy.apply` takes the rule by value.
+         let persist = rule.duration == RuleDuration::Forever;
          let (rule, applied) = self.policy.apply(rule);
          match applied {
             Applied::Created => created += 1,
             Applied::Refreshed => updated += 1,
          }
-         if forever && let Err(err) = self.store.upsert(rule) {
-            error!("could not persist a forever rule: {err}");
+         if persist {
+            forever.push(rule);
          }
+      }
+      // One answer can create a rule per destination; one transaction instead of one commit each.
+      if !forever.is_empty()
+         && let Err(err) = self.store.upsert_many(&forever)
+      {
+         error!(
+            "could not persist {} forever rule(s): {err}",
+            forever.len()
+         );
       }
       (created, updated)
    }

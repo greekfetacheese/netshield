@@ -33,11 +33,56 @@ impl RuleId {
       let mixed = mix(nanos ^ pid.rotate_left(32) ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15));
       Self(format!("{mixed:016x}"))
    }
+
+   /// The eight bytes this identifier is stored under, or `None` when it is not sixteen hex digits.
+   ///
+   /// [`RuleId::new_unique`] always produces that form, but an id arriving over the control socket
+   /// is whatever the client sent, so the store has to be able to refuse one instead of writing a
+   /// key it could never read back.
+   pub fn to_bytes(&self) -> Option<[u8; 8]> {
+      let raw = self.0.as_bytes();
+      if raw.len() != 16 {
+         return None;
+      }
+      let mut bytes = [0u8; 8];
+      for (slot, pair) in bytes.iter_mut().zip(raw.as_chunks::<2>().0) {
+         *slot = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+      }
+      Some(bytes)
+   }
+
+   /// Rebuilds an identifier from its stored form, the inverse of [`RuleId::to_bytes`].
+   ///
+   /// Reconstructing rather than minting keeps the identifier stable across a restart: every
+   /// reference the GUI holds and every prompt id that mentioned the rule depends on it.
+   pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+      if bytes.len() != 8 {
+         return None;
+      }
+      let mut hex = String::with_capacity(16);
+      for byte in bytes {
+         hex.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
+         hex.push(char::from(HEX_DIGITS[usize::from(byte & 0x0f)]));
+      }
+      Some(Self(hex))
+   }
 }
 
 impl fmt::Display for RuleId {
    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
       f.write_str(&self.0)
+   }
+}
+
+/// Lowercase hex, the only form a stored rule id takes.
+const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
+
+/// The value of one lowercase hex digit.
+fn hex_nibble(byte: u8) -> Option<u8> {
+   match byte {
+      b'0'..=b'9' => Some(byte - b'0'),
+      b'a'..=b'f' => Some(byte - b'a' + 10),
+      _ => None,
    }
 }
 
@@ -642,5 +687,23 @@ mod tests {
          }),
          "an entry that matches alone cannot make the set match"
       );
+   }
+
+   #[test]
+   fn a_rule_id_survives_its_stored_form() {
+      let id = RuleId::new_unique();
+      let bytes = id.to_bytes().expect("a minted id is sixteen hex digits");
+      assert_eq!(RuleId::from_bytes(&bytes), Some(id.clone()));
+      assert_eq!(bytes.len(), 8);
+
+      assert_eq!(RuleId::from_bytes(&[0u8; 7]), None);
+      assert_eq!(RuleId::from_bytes(&[0u8; 9]), None);
+      for bad in ["", "xyz", "00112233445566778899", "0011223344556 78"] {
+         assert_eq!(
+            RuleId::from_bytes(&[]),
+            None,
+            "a short slice is never an id ({bad})"
+         );
+      }
    }
 }

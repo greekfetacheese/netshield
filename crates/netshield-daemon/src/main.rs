@@ -31,7 +31,7 @@ USAGE:
 
 OPTIONS (daemon and --check):
     --config PATH        daemon configuration (default /etc/netshield/config.json)
-    --rules PATH         rule store (default /etc/netshield/rules.json)
+    --rules PATH         rule database (default /etc/netshield/rules.db)
     --socket PATH        control socket (default from the configuration)
 
 OPTIONS (--probe):
@@ -460,17 +460,14 @@ mod tests {
          "--config",
          "/tmp/config.json",
          "--rules",
-         "/tmp/rules.json",
+         "/tmp/rules.db",
          "--socket",
          "/tmp/control.sock",
       ])
       .unwrap();
       assert_eq!(parsed.mode, Mode::Check);
       assert_eq!(parsed.config, PathBuf::from("/tmp/config.json"));
-      assert_eq!(
-         parsed.rules,
-         Some(PathBuf::from("/tmp/rules.json"))
-      );
+      assert_eq!(parsed.rules, Some(PathBuf::from("/tmp/rules.db")));
       assert_eq!(
          parsed.socket,
          Some(PathBuf::from("/tmp/control.sock"))

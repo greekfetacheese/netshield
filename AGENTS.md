@@ -11,8 +11,8 @@ which phase is current.
    and report the contradiction — do not pick one.
 2. **No new dependencies.** The dependency set is a design decision, not an
    implementation detail: `netshield-core` has `serde` + `serde_json` and nothing else; the
-   daemon adds `libc`, `log`, and `serde`/`serde_json` (the rule store and the control
-   protocol are JSON, and both crates are already in the tree via core); the GUI adds the
+   daemon adds `libc`, `log`, `redb` (the rule store) and `serde`/`serde_json` (the control
+   protocol is JSON, and both crates are already in the tree via core); the GUI adds the
    egui stack pinned to the versions in `Cargo.toml`. Anything else needs the orchestrator's
    approval first.
 3. **No async runtime.** Threads and blocking I/O. Never introduce `tokio`/`async-std`.

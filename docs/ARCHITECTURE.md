@@ -322,7 +322,10 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 ## 9. Storage and packaging
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
-- `/etc/netshield/rules.json` — `Forever` rules, same atomic-write path, hot-reloaded.
+- `/etc/netshield/rules.db` — a redb database keyed by rule id, one record per `Forever`
+  rule, written per record (never rewritten wholesale) and committed with
+  `Durability::Immediate`. A legacy `rules.json` is imported once and renamed
+  `rules.json.migrated`.
 - `/run/netshield/control.sock` — `0660`, owned by `allowed_uid` and that user's primary
   group when `allowed_uid` is set (chown after bind; the `SO_PEERCRED` check is still
   enforced), `root:root` otherwise. `/run/netshield` itself is mode `0711`: traversal
@@ -348,9 +351,8 @@ Workspace, three crates, no async runtime (blocking threads are correct here and
 - `netshield-core` — no I/O: models, rule engine, DNS/​packet parsers, config, IPC types.
   Deps: `serde`, `serde_json`.
 - `netshield-daemon` — netlink, nftables, `/proc`, IPC server. Deps: `netshield-core`,
-  `libc`, `log`, plus `serde`/`serde_json` for the rule store and the control protocol
-  (both already in the tree through core; the store is JSON by design so it can be read and
-  hand-edited).
+  `libc`, `log`, `redb` (the rule store), plus `serde`/`serde_json` for the control protocol
+  (both already in the tree through core).
 - `netshield-gui` — eframe/egui + `egui-elements`, `egui-elegance`, `egui-lucide`
   (pinned to the versions Zeus uses), `netshield-core`, `log`.
 
