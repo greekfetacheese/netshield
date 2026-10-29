@@ -18,10 +18,12 @@ pub const WIDTH: f32 = 480.0;
 
 /// The host window's height. [`layout_height_estimate`] must stay below it.
 ///
-/// Grown from 404 when the rule preview line was added: the measured stack (with a queued
-/// prompt) is 410pt, and a fixed viewport silently clips rather than scrolls. A grouped
-/// prompt fits the same height: its destination list replaces the taller scope picker.
-pub const HEIGHT: f32 = 440.0;
+/// Grown from 404 when the rule preview line was added, and from 440 when a grouped prompt
+/// got the scope picker back: a group now draws the list *and* one scope row, so its stack is
+/// no longer the shorter shape. The measured stack (with a queued prompt) is 410pt, and a
+/// fixed viewport silently clips rather than scrolls, so the window grows once here instead
+/// of resizing per prompt.
+pub const HEIGHT: f32 = 462.0;
 
 /// Inner margin of the alert panel, in points, applied on all four sides.
 const PANEL_MARGIN: i8 = 14;
@@ -64,7 +66,11 @@ const APP_NAME_CHARS: usize = 30;
 const RULE_PREVIEW_CHARS: usize = 60;
 
 /// How many destinations the group list shows before the `+N more` remainder.
-pub const DEST_LINES: usize = 4;
+///
+/// Three, not four: the scope control is drawn for a group too and costs one row, so the
+/// list gives that row back. The panel is a fixed size, and a longer list would push the
+/// action buttons past [`HEIGHT`] on the tallest shape.
+pub const DEST_LINES: usize = 3;
 
 /// Longest app name kept in the rule preview before it is elided.
 const PREVIEW_APP_CHARS: usize = 20;
@@ -87,6 +93,8 @@ const BUTTON_TEXT: Color32 = Color32::WHITE;
 /// `DestMatcher::Any`. It is only offered for an attributed app, because for an
 /// unattributed one it would allow every unattributed flow. `Address` is the fallback
 /// that always works: it names the exact remote address of the flow being answered.
+/// `TheseDestinations` is only offered for a group, where the daemon writes one rule per
+/// listed destination instead of a rule for the whole app.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
    /// Any destination for this app; the default for an identified app.
@@ -96,6 +104,59 @@ pub enum Scope {
    Domain,
    /// The exact remote address of this flow.
    Address,
+   /// Every destination the prompt listed, each scoped to itself; groups only.
+   TheseDestinations,
+}
+
+/// One row of the scope picker: what selecting it writes, and the word it uses.
+///
+/// The list is derived from the prompt, never from how many destinations there are alone:
+/// a group swaps the single-destination scopes for [`Scope::TheseDestinations`], and an
+/// unattributed flow drops [`Scope::Any`] because the rule it writes would allow every
+/// unattributed flow rather than that app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeOption {
+   pub scope: Scope,
+   pub label: String,
+}
+
+/// The scope rows offered for `prompt`, in display order.
+///
+/// The first row is the default and is what an untouched alert answers. A single
+/// destination keeps its three scopes; a group offers the app-wide scope and the explicit
+/// "these destinations" one, which is the only pair a grouped answer can honour.
+pub fn scope_options(prompt: &PromptRequest) -> Vec<ScopeOption> {
+   let mut options = Vec::new();
+   if broad_scope_available(prompt) {
+      options.push(ScopeOption {
+         scope: Scope::Any,
+         label: format!(
+            "Any connection by {}",
+            elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS)
+         ),
+      });
+   }
+   if is_group(prompt) {
+      options.push(ScopeOption {
+         scope: Scope::TheseDestinations,
+         label: format!(
+            "These {} destinations",
+            destinations(prompt).len()
+         ),
+      });
+      return options;
+   }
+   if let Some(host) = offered_domain(prompt) {
+      options.push(ScopeOption {
+         scope: Scope::Domain,
+         label: format!("Only {}", elide(host, PREVIEW_HOST_CHARS)),
+      });
+   }
+   options.push(ScopeOption {
+      scope: Scope::Address,
+      label: "Only this address".to_owned(),
+   });
+   options
 }
 
 /// One answer to a prompt, ready to be turned into a [`DecideRequest`].
@@ -133,24 +194,42 @@ impl AlertState {
 
    /// The selection that is actually available for `prompt`.
    ///
-   /// `Scope::Any` is not available when the app was not attributed, and a domain scope is
-   /// only expressible when the daemon learned a hostname and offered it. Resolving here
-   /// rather than in the constructor keeps the default correct even though the host constructs
-   /// the state before it sees the prompt.
+   /// `Scope::Any` is not available when the app was not attributed, a domain scope is only
+   /// expressible when the daemon learned a hostname and offered it, and `TheseDestinations`
+   /// only exists for a group. Resolving here rather than in the constructor keeps the default
+   /// correct even though the host constructs the state before it sees the prompt, and keeps a
+   /// selection made on one shape from sending a scope the current prompt cannot honour when a
+   /// group growth replaces the payload under it.
    fn effective_scope(&self, prompt: &PromptRequest) -> Scope {
-      match self.scope {
-         Scope::Any if !broad_scope_available(prompt) => match offered_domain(prompt) {
-            Some(_) => Scope::Domain,
-            None => Scope::Address,
-         },
-         Scope::Domain if offered_domain(prompt).is_none() => {
-            if broad_scope_available(prompt) {
-               Scope::Any
-            } else {
-               Scope::Address
-            }
+      let group = is_group(prompt);
+      let broad = broad_scope_available(prompt);
+      // What a selection the prompt cannot honour resolves to: the default shape of this
+      // prompt. A group's default is the app-wide rule when the app is identified, because
+      // that is the single rule that ends the prompting for the app.
+      let fallback = || {
+         if broad {
+            Scope::Any
+         } else if group {
+            Scope::TheseDestinations
+         } else if offered_domain(prompt).is_some() {
+            Scope::Domain
+         } else {
+            Scope::Address
          }
-         scope => scope,
+      };
+      // A group cannot express a single host or address: both rows it offers cover every
+      // destination, so a narrow pick that arrives with a group growth (the payload is
+      // replaced under the selection) resolves to the group's default rather than sending a
+      // scope the picker cannot show.
+      match self.scope {
+         Scope::Any if !broad => fallback(),
+         Scope::Any => Scope::Any,
+         Scope::Domain if group || offered_domain(prompt).is_none() => fallback(),
+         Scope::Domain => Scope::Domain,
+         Scope::Address if group => fallback(),
+         Scope::Address => Scope::Address,
+         Scope::TheseDestinations if !group => fallback(),
+         Scope::TheseDestinations => Scope::TheseDestinations,
       }
    }
 
@@ -158,12 +237,9 @@ impl AlertState {
    ///
    /// A domain scope is only expressible when the daemon learned a hostname *and* offered
    /// it; otherwise the answer falls back to the scope [`AlertState::effective_scope`]
-   /// resolved, never to a scope the user could not select.
-   ///
-   /// A grouped prompt hides the picker, but the request still carries the scope: the
-   /// default `AnyConnection` is exactly what the daemon's group semantics need, because it
-   /// creates one rule per destination of the group and never a rule for anywhere. The GUI
-   /// does not decide rule shape.
+   /// resolved, never to a scope the user could not select. The scope alone decides the rule:
+   /// [`Scope::Any`] is one rule for the app even on a group, and
+   /// [`Scope::TheseDestinations`] is the only scope that writes one rule per destination.
    pub fn decision(&self, prompt: &PromptRequest, action: Action) -> DecideRequest {
       let scope = match self.effective_scope(prompt) {
          Scope::Any => ScopeChoice::AnyConnection,
@@ -177,6 +253,7 @@ impl AlertState {
             None => ScopeChoice::Address,
          },
          Scope::Address => ScopeChoice::Address,
+         Scope::TheseDestinations => ScopeChoice::TheseDestinations,
       };
 
       DecideRequest {
@@ -304,21 +381,17 @@ impl AlertModel {
 ///
 /// It renders exactly what [`AlertState::decision`] will send, never what the radios look
 /// like: a scope that is not available for this prompt reads as the scope the decision
-/// actually produces. Pure, so the wording is testable without a window.
+/// actually produces. On a group the list above the picker still shows what prompted the
+/// question, but the sentence names the grant: `anywhere` for the app-wide default, `these N
+/// destinations` only when that is the scope the click sends. Pure, so the wording is
+/// testable without a window.
 pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) -> String {
    let verb = match action {
       Action::Allow => "allow",
       Action::Deny => "deny",
    };
    let app = elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS);
-   let scope = if is_group(prompt) {
-      // A group never writes a rule for anywhere: one rule per listed destination, so the
-      // preview names the reach of the answer instead.
-      let count = destinations(prompt).len();
-      format!("these {count} destinations")
-   } else {
-      preview_scope(prompt, state)
-   };
+   let scope = preview_scope(prompt, state);
    let duration = duration_label(state.duration);
    elide(
       &format!("{verb} {app} → {scope} · {duration}"),
@@ -337,8 +410,10 @@ fn duration_label(duration: Duration) -> &'static str {
 
 /// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
 ///
-/// The address scope renders as the bare address, matching what `DestMatcher::Ip` holds:
-/// there is no name to prefix and no subdomain question, so `only` would add nothing.
+/// The app-wide scope reads as `anywhere`, which is what its rule holds. The address scope
+/// renders as the bare address, matching what `DestMatcher::Ip` holds: there is no name to
+/// prefix and no subdomain question, so `only` would add nothing. The group scope names the
+/// count, because the click writes one rule for each of them.
 fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
    match state.effective_scope(prompt) {
       Scope::Any => "anywhere".to_owned(),
@@ -356,6 +431,10 @@ fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
          // address scope it resolves to rather than inventing a name.
          None => prompt.connection.remote_ip.to_string(),
       },
+      Scope::TheseDestinations => format!(
+         "these {} destinations",
+         destinations(prompt).len()
+      ),
    }
 }
 
@@ -392,33 +471,25 @@ pub fn destinations(prompt: &PromptRequest) -> Vec<&ConnectionView> {
 
 /// Whether the answer covers more than one destination.
 ///
-/// A group drops the per-destination scope picker: the daemon creates one rule per
-/// destination shown, so there is no single host or address a scope could narrow to, and
-/// `anywhere` is a rule the group's answer never writes.
+/// A group offers the app-wide scope and the explicit "these destinations" one. It has no
+/// single host or address the narrower scopes could name, because the answer covers every
+/// destination shown, so those scopes would silently drop the rest of the list.
 pub fn is_group(prompt: &PromptRequest) -> bool {
    destinations(prompt).len() > 1
 }
 
-/// Whether the panel draws the per-destination scope picker.
-///
-/// A group must not offer one: its answer covers exactly the destinations listed above, so
-/// a scope radio would either narrow to a host the group does not name or promise a rule for
-/// anywhere, which the daemon's group semantics never write. A single destination keeps the
-/// picker, unchanged.
-pub fn has_scope_picker(prompt: &PromptRequest) -> bool {
-   !is_group(prompt)
-}
-
 /// What the Allow button says the click grants.
 ///
-/// A group names the number of destinations, because the click writes a rule for each of
-/// them; a single destination keeps the plain `Allow`, whose scope the picker below states.
-pub fn allow_label(prompt: &PromptRequest) -> String {
-   let count = destinations(prompt).len();
-   if count > 1 {
-      format!("Allow {count} destinations")
-   } else {
-      "Allow".to_owned()
+/// It follows the selected scope, not the number of destinations the prompt listed: the
+/// app-wide default on a group is one rule for the app and keeps the plain `Allow`, while
+/// only an explicit "these N destinations" makes the click write one rule per destination.
+pub fn allow_label(prompt: &PromptRequest, state: &AlertState) -> String {
+   match state.effective_scope(prompt) {
+      Scope::TheseDestinations => format!(
+         "Allow {} destinations",
+         destinations(prompt).len()
+      ),
+      Scope::Any | Scope::Domain | Scope::Address => "Allow".to_owned(),
    }
 }
 
@@ -460,13 +531,14 @@ fn destination_label(view: &ConnectionView) -> String {
 
 /// Draws the whole alert into `ui`. Returns the chosen decision, if any button was pressed.
 ///
-/// The fixed layout is sized for the 480x440 host: app name, destination, duration, scope,
+/// The fixed layout is sized for the 480x462 host: app name, destination, duration, scope,
 /// countdown and the two action buttons all fit without scrolling. The app row is drawn
 /// first so a future section cannot push it off the top again; [`layout_height_estimate`]
-/// is the budget that guards that. A grouped prompt replaces the scope picker with a capped
-/// destination list and states the grant under the buttons, because its answer writes one
-/// rule per destination and never one for anywhere. There are no keyboard shortcuts; Escape
-/// deliberately does nothing, because a stray key must not decide a firewall rule.
+/// is the budget that guards that. The scope picker is always drawn, a group included: a
+/// group's list is visibly capped, and its default row is the app-wide rule that ends the
+/// prompting for the app instead of writing one rule per address. There are no keyboard
+/// shortcuts; Escape deliberately does nothing, because a stray key must not decide a
+/// firewall rule.
 pub fn ui(
    ui: &mut Ui,
    prompt: &PromptRequest,
@@ -504,12 +576,8 @@ pub fn ui(
       ui.add_space(SECTION_GAP);
       duration_section(ui, state);
 
-      // A group has no per-destination scope: its answer covers exactly the destinations
-      // listed above, so the picker that could promise a narrower or broader rule is gone.
-      if has_scope_picker(prompt) {
-         ui.add_space(SECTION_GAP);
-         scope_section(ui, prompt, state);
-      }
+      ui.add_space(SECTION_GAP);
+      scope_section(ui, prompt, state);
 
       ui.add_space(SECTION_GAP);
       let width = ui.available_width();
@@ -524,19 +592,6 @@ pub fn ui(
       );
 
       ui.add_space(SECTION_GAP);
-      // The sentence that used to sit under the scope radios. A group has no scope picker,
-      // so it states the grant here instead: one rule per destination listed above, never a
-      // rule for anywhere.
-      if is_group(prompt) {
-         ui.label(
-            RichText::new(rule_preview(prompt, state, Action::Allow))
-               .small()
-               .monospace()
-               .weak(),
-         );
-         ui.add_space(SECTION_GAP);
-      }
-
       ui.columns(2, |columns| {
          let deny =
             egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
@@ -545,9 +600,10 @@ pub fn ui(
             decision = Some(decision_for(state, prompt, Action::Deny));
          }
 
-         let allow =
-            egui::Button::new(RichText::new(allow_label(prompt)).color(BUTTON_TEXT).strong())
-               .fill(ALLOW_FILL);
+         let allow = egui::Button::new(
+            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
+         )
+         .fill(ALLOW_FILL);
          let allow_width = columns[1].available_width();
          if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
             decision = Some(decision_for(state, prompt, Action::Allow));
@@ -564,17 +620,16 @@ pub fn ui(
 /// spare, and the test below keeps a future section from silently clipping the app row.
 /// The `pending` line is always counted, even though it only appears when prompts queue.
 ///
-/// Two shapes share the fixed window. A single destination draws the whole scope picker and
-/// its preview; a group drops that block (a label, three radio rows and the preview) and
-/// draws the capped destination list plus its grant sentence instead. The list is shorter
-/// than the block it replaces, so this budget is the single-destination stack and the group
-/// is asserted against it below.
+/// Every shape draws the scope picker now, so the group is no longer the shorter one: it
+/// adds the capped destination list to a scope block that is a row shorter than the single
+/// destination's (no domain checkbox). The budget is the taller of the two stacks, so neither
+/// shape can outgrow the window the other one was sized for.
 pub fn layout_height_estimate() -> f32 {
-   layout_height(false)
+   layout_height(false).max(layout_height(true))
 }
 
-/// The stack of every section one prompt shape can draw; `group` trades the scope picker
-/// for the destination list and the sentence under the buttons.
+/// The stack of every section one prompt shape can draw; `group` adds the destination list
+/// and drops the domain checkbox row from the scope block.
 fn layout_height(group: bool) -> f32 {
    let mut sections = PENDING_ROW
       + SECTION_GAP
@@ -587,10 +642,13 @@ fn layout_height(group: bool) -> f32 {
       + SMALL_ROW
       + RADIO_ROW;
    if group {
-      // Four destination lines, the `+N more` remainder and the grant sentence.
-      sections += DEST_LINES as f32 * SMALL_ROW + SMALL_ROW + SECTION_GAP + SMALL_ROW;
+      // The capped destination list plus its remainder line, and the scope block below it:
+      // two radio rows (app-wide and "these N destinations"), no domain checkbox.
+      sections += DEST_LINES as f32 * SMALL_ROW + SMALL_ROW;
+      sections += SECTION_GAP + SMALL_ROW + 2.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    } else {
-      // The scope label, its three radio rows and the rule preview.
+      // The scope label, its three radio rows (with the domain checkbox and the address
+      // row) and the rule preview.
       sections += SECTION_GAP + SMALL_ROW + 3.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    }
    sections
@@ -702,76 +760,51 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
    });
 }
 
-/// The scope radios, the domain `Only <host>` applies to, the subdomain opt-in and the
-/// rule preview.
+/// The scope radios, the subdomain opt-in when the domain row is offered, and the rule
+/// preview.
 ///
-/// The muted `Scope` label keeps `Any connection by this app` from reading as a fourth
-/// duration option. That first label is deliberately app-wide: the daemon turns
-/// `ScopeChoice::AnyConnection` into `DestMatcher::Any`, i.e. *any destination for this
-/// app*, so calling it "This connection" would promise a narrower rule than it writes.
-/// For an unattributed flow it is disabled and carries a muted reason: with
-/// `AppMatcher::Unknown` that rule would allow *every* unattributed flow, not this app.
-/// `Only this address` is then the narrow scope that always works. The domain label shares
-/// the radio's line so the choice reads as one sentence. The subdomain checkbox is
-/// indented to the radio's *text*, not its circle, and stays disabled until the domain
-/// scope is both offered and selected.
+/// The rows come from [`scope_options`], so the control is the same for one destination and
+/// for a group and its first row is always the default. The muted `Scope` label keeps
+/// `Any connection by <app>` from reading as a fourth duration option. That first label is
+/// deliberately app-wide: the daemon turns `ScopeChoice::AnyConnection` into
+/// `DestMatcher::Any`, i.e. *any destination for this app*, so calling it "This connection"
+/// would promise a narrower rule than it writes. An unattributed flow gets no such row at
+/// all, because with `AppMatcher::Unknown` that rule would allow *every* unattributed flow,
+/// not this app. On a group the narrow row names the count instead of a host, because the
+/// click writes one rule per listed destination. The subdomain checkbox follows the domain
+/// row, indented to the radio's *text* rather than its circle, and stays disabled until that
+/// scope is selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
    ui.label(RichText::new("Scope").small().weak());
    let selected = state.effective_scope(prompt);
 
-   ui.horizontal(|ui| {
-      let broad = ui.add_enabled(
-         broad_scope_available(prompt),
-         egui::RadioButton::new(
-            selected == Scope::Any,
-            "Any connection by this app",
-         ),
-      );
-      if broad.clicked() {
-         state.scope = Scope::Any;
-      }
-      if !broad_scope_available(prompt) {
-         ui.label(RichText::new("app not identified").small().weak());
-      }
-   });
-
-   if let Some(host) = offered_domain(prompt) {
+   for option in scope_options(prompt) {
       ui.horizontal(|ui| {
-         let domain = ui.add(egui::RadioButton::new(
-            selected == Scope::Domain,
-            format!("Only {}", elide(host, PREVIEW_HOST_CHARS)),
+         let row = ui.add(egui::RadioButton::new(
+            selected == option.scope,
+            option.label,
          ));
-         if domain.clicked() {
-            state.scope = Scope::Domain;
+         if row.clicked() {
+            state.scope = option.scope;
          }
       });
 
-      let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
-      ui.horizontal(|ui| {
-         ui.add_space(indent);
-         ui.add_enabled(
-            selected == Scope::Domain,
-            egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
-         );
-      });
+      // Directly under its radio, so the opt-in reads as part of that choice.
+      if option.scope == Scope::Domain {
+         let indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+         ui.horizontal(|ui| {
+            ui.add_space(indent);
+            ui.add_enabled(
+               selected == Scope::Domain,
+               egui::Checkbox::new(&mut state.subdomains, "include subdomains"),
+            );
+         });
+      }
    }
 
-   ui.horizontal(|ui| {
-      let label = format!(
-         "Only this address ({})",
-         prompt.connection.remote_ip
-      );
-      let address = ui.add(egui::RadioButton::new(
-         selected == Scope::Address,
-         label,
-      ));
-      if address.clicked() {
-         state.scope = Scope::Address;
-      }
-   });
-
    // The line below the radios states the rule the current selections would write, so the
-   // app-wide scope above cannot be mistaken for a single flow.
+   // app-wide scope above cannot be mistaken for a single flow, and a group's default says
+   // `anywhere` even though its destination list above still explains what was asked.
    ui.label(
       RichText::new(rule_preview(prompt, state, Action::Allow))
          .small()
@@ -1165,49 +1198,134 @@ mod tests {
       );
    }
 
-   /// The required example: a six-destination group says what the click grants.
-   ///
-   /// The button names the count and the sentence under it names the app and the reach;
-   /// neither claims a rule for anywhere, which the daemon's group answer never writes.
+   /// A group offers the choice that ends the prompting for the app, and the default is
+   /// that choice: one rule for the app, never one rule per address.
    #[test]
-   fn a_group_states_what_the_click_grants() {
+   fn a_group_offers_any_connection_and_only_these_destinations() {
       let request = group_of_six();
-      let mut state = AlertState::new();
-      state.duration = Duration::Forever;
+      let state = AlertState::new();
 
-      assert_eq!(allow_label(&request), "Allow 6 destinations");
+      let options = scope_options(&request);
       assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow brave → these 6 destinations · forever"
+         options.len(),
+         2,
+         "a group offers exactly two scopes"
       );
-      assert!(
-         !has_scope_picker(&request),
-         "a group must not offer a per-destination scope picker"
+      assert_eq!(
+         options.iter().map(|option| option.scope).collect::<Vec<_>>(),
+         vec![Scope::Any, Scope::TheseDestinations],
+         "the app-wide grant is first and the list scope second"
+      );
+      assert_eq!(options[0].label, "Any connection by brave");
+      assert_eq!(options[1].label, "These 6 destinations");
+      assert_eq!(
+         state.effective_scope(&request),
+         Scope::Any,
+         "the app-wide grant is selected by default"
+      );
+
+      let decision = state.decision(&request, Action::Allow);
+      assert_eq!(decision.scope, ScopeChoice::AnyConnection);
+      assert_eq!(
+         serde_json::to_value(&decision.scope).expect("serialisable scope"),
+         serde_json::json!({ "kind": "any_connection" })
       );
    }
 
-   /// The required example: one destination renders exactly as before, picker included.
+   /// The default on a group states the grant the click makes: the whole app, not the list.
    #[test]
-   fn a_single_destination_keeps_the_plain_labels() {
-      let request = prompt(Some("www.google.com"), true);
+   fn the_default_on_a_group_grants_the_whole_app() {
+      let request = group_of_six();
       let state = AlertState::new();
 
-      assert_eq!(allow_label(&request), "Allow");
+      assert_eq!(allow_label(&request, &state), "Allow");
+      assert_eq!(
+         rule_preview(&request, &state, Action::Allow),
+         "allow brave → anywhere · until restart"
+      );
       assert!(
-         has_scope_picker(&request),
-         "a single destination keeps the scope picker"
+         !destination_lines(&request).is_empty(),
+         "the list stays visible: it is what prompted the question"
+      );
+   }
+
+   /// Switching to the list scope names the count in the button and the sentence, and sends
+   /// the one scope that writes a rule per destination.
+   #[test]
+   fn choosing_these_destinations_states_the_list() {
+      let request = group_of_six();
+      let mut state = AlertState::new();
+      state.scope = Scope::TheseDestinations;
+
+      assert_eq!(
+         allow_label(&request, &state),
+         "Allow 6 destinations"
       );
       assert_eq!(
          rule_preview(&request, &state, Action::Allow),
-         "allow firefox → anywhere · until restart"
+         "allow brave → these 6 destinations · until restart"
       );
+      let decision = state.decision(&request, Action::Allow);
+      assert_eq!(decision.scope, ScopeChoice::TheseDestinations);
+      assert_eq!(
+         serde_json::to_value(&decision.scope).expect("serialisable scope"),
+         serde_json::json!({ "kind": "these_destinations" })
+      );
+   }
+
+   /// One destination with a learned name keeps all three scopes, unchanged.
+   #[test]
+   fn a_single_destination_keeps_its_three_scopes() {
+      let request = prompt(Some("www.google.com"), true);
+      let mut state = AlertState::new();
+
+      let options = scope_options(&request);
+      assert_eq!(options.len(), 3);
+      assert_eq!(
+         options.iter().map(|option| option.scope).collect::<Vec<_>>(),
+         vec![Scope::Any, Scope::Domain, Scope::Address]
+      );
+      assert_eq!(options[0].label, "Any connection by firefox");
+      assert_eq!(options[1].label, "Only www.google.com");
+      assert_eq!(options[2].label, "Only this address");
+      assert_eq!(allow_label(&request, &state), "Allow");
       assert!(
          destination_lines(&request).is_empty(),
          "one destination needs no list under the header"
       );
+
+      state.scope = Scope::Domain;
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Domain {
+            host: "www.google.com".to_owned(),
+            subdomains: false,
+         }
+      );
+      state.scope = Scope::Address;
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Address
+      );
    }
 
-   /// The required example: four named lines and a remainder, never more.
+   /// Without a learned name there is no domain row to offer, so the picker has two.
+   #[test]
+   fn a_single_destination_without_a_name_offers_two() {
+      let request = prompt(None, false);
+      let options = scope_options(&request);
+
+      assert_eq!(options.len(), 2);
+      assert_eq!(
+         options.iter().map(|option| option.scope).collect::<Vec<_>>(),
+         vec![Scope::Any, Scope::Address],
+         "no domain row without a name"
+      );
+      assert_eq!(options[0].label, "Any connection by firefox");
+      assert_eq!(options[1].label, "Only this address");
+   }
+
+   /// The required example: three named lines and a remainder, never more.
    #[test]
    fn the_list_is_capped_with_a_remainder() {
       let lines = destination_lines(&group_of_six());
@@ -1217,8 +1335,7 @@ mod tests {
             "· accounts.google.com",
             "· ssl.gstatic.com",
             "· 142.250.184.76:443",
-            "· www.google.com",
-            "· +2 more",
+            "· +3 more",
          ]
       );
    }
@@ -1231,8 +1348,7 @@ mod tests {
       assert!(request.dests.is_empty());
 
       assert_eq!(destinations(&request).len(), 1);
-      assert_eq!(allow_label(&request), "Allow");
-      assert!(has_scope_picker(&request));
+      assert_eq!(allow_label(&request, &AlertState::new()), "Allow");
       assert!(destination_lines(&request).is_empty());
       assert_eq!(
          rule_preview(&request, &AlertState::new(), Action::Allow),
@@ -1349,8 +1465,8 @@ mod tests {
    ///
    /// [`layout_height_estimate`] counts every section but not this spare margin, so a
    /// section added without growing [`HEIGHT`] fails here instead of clipping the app row.
-   /// A group is measured too: its destination list must stay inside the same fixed window
-   /// as the scope picker it replaces.
+   /// A group is measured too: its capped destination list and its one-row-shorter scope
+   /// block must stay inside the same fixed window as the full single-destination stack.
    #[test]
    fn layout_estimate_leaves_headroom_in_the_host_window() {
       const MARGIN: f32 = 24.0;
@@ -1367,6 +1483,12 @@ mod tests {
       assert!(
          HEIGHT > group + MARGIN,
          "grouped stack {group} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+      );
+      // The list cap is part of the budget: a fourth line would outgrow the fixed window.
+      assert_eq!(
+         destination_lines(&group_of_six()).len(),
+         DEST_LINES + 1,
+         "three lines plus the remainder is what the estimate counts"
       );
    }
 
@@ -1447,12 +1569,15 @@ mod tests {
 
    /// The daemon re-broadcasts a prompt as destinations join its group: the newer payload
    /// must reach the panel while the user's selection and countdown stay put.
+   ///
+   /// A growth also changes which scopes are offered, so a narrow pick made on the single
+   /// destination must not survive as a scope the group's picker cannot show.
    #[test]
    fn replacing_a_prompt_keeps_the_selection_and_shows_the_grown_group() {
       let mut model = AlertModel::new();
       let now = clock();
       let single = prompt(Some("accounts.google.com"), true);
-      assert_eq!(allow_label(&single), "Allow");
+      assert_eq!(allow_label(&single, &AlertState::new()), "Allow");
       model.present(single, std::time::Duration::from_secs(30), now);
       model.state_mut().duration = Duration::Forever;
 
@@ -1470,10 +1595,15 @@ mod tests {
          Some(30.0),
          "a growth must not restart the countdown"
       );
-      assert_eq!(allow_label(&presented), "Allow 6 destinations");
+      assert_eq!(model.state_mut().scope, Scope::Any);
+      assert_eq!(
+         allow_label(&presented, model.state_mut()),
+         "Allow",
+         "the app-wide default on a group writes one rule for the app"
+      );
       assert_eq!(
          rule_preview(&presented, model.state_mut(), Action::Allow),
-         "allow brave → these 6 destinations · forever"
+         "allow brave → anywhere · forever"
       );
    }
 

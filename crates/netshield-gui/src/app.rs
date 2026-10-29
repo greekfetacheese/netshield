@@ -966,6 +966,7 @@ fn scope_kind(scope: &ScopeChoice) -> &'static str {
       ScopeChoice::AnyConnection => "any connection",
       ScopeChoice::Domain { .. } => "domain",
       ScopeChoice::Address => "address",
+      ScopeChoice::TheseDestinations => "these destinations",
    }
 }
 
@@ -1077,6 +1078,19 @@ mod tests {
          "the deadline bookkeeping is not duplicated"
       );
       assert_eq!(app.alerts.len(), 1);
+
+      // A group growth keeps the single-destination default: the app-wide rule, which is
+      // the choice that stops the rule list from filling with one rule per address.
+      let presented = app.model().prompt().cloned().expect("presented");
+      assert_eq!(
+         app.model().state_mut().decision(&presented, Action::Allow).scope,
+         ScopeChoice::AnyConnection
+      );
+      assert_eq!(
+         scope_kind(&ScopeChoice::TheseDestinations),
+         "these destinations",
+         "the log names the scope that writes a rule per destination"
+      );
    }
 
    /// A reordered or duplicated broadcast must not shrink a group the user is answering.

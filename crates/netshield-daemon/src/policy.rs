@@ -42,6 +42,15 @@ struct Grant {
    expires_at: u64,
 }
 
+/// How an inserted rule related to the rules already present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+   /// No equivalent rule existed, so a new one was added.
+   Created,
+   /// An equivalent rule existed and was updated in place.
+   Refreshed,
+}
+
 /// The rule engine plus the state that sits in front of it.
 #[derive(Debug)]
 pub struct Policy {
@@ -108,9 +117,40 @@ impl Policy {
    /// Inserts or replaces a rule in the in-memory set.
    ///
    /// Persistence is the caller's job: the store write may fail, and a rule the user just
-   /// approved should still govern traffic for this run.
+   /// approved should still govern traffic for this run. This is the plain upsert by id;
+   /// [`Policy::apply`] is what refuses to add a duplicate.
    pub fn upsert_rule(&mut self, rule: Rule) {
       self.ruleset.upsert(rule);
+   }
+
+   /// Inserts `rule`, or refreshes an equivalent rule already in the set.
+   ///
+   /// A rule is equivalent when its application matcher, destination matcher, action and
+   /// duration all match exactly. Answering the same prompt twice must not leave two rules
+   /// that can disagree, so an equivalent incumbent keeps its id and its place in the
+   /// insertion order, gets `updated_at`, and is enabled again if the user had disabled it.
+   /// The caller persists whichever rule comes back: a refresh replaces the stored copy.
+   pub fn apply(&mut self, rule: Rule) -> (Rule, Applied) {
+      let existing = self
+         .ruleset
+         .iter()
+         .find(|existing| {
+            existing.app == rule.app
+               && existing.dest == rule.dest
+               && existing.action == rule.action
+               && existing.duration == rule.duration
+         })
+         .cloned();
+
+      let Some(mut existing) = existing else {
+         self.ruleset.upsert(rule.clone());
+         return (rule, Applied::Created);
+      };
+
+      existing.enabled = true;
+      existing.updated_at = rule.updated_at;
+      self.ruleset.upsert(existing.clone());
+      (existing, Applied::Refreshed)
    }
 
    /// Removes a rule, leaving the flow grants untouched.
@@ -197,6 +237,63 @@ mod tests {
       let mut rule = allow_rule(updated_at);
       rule.action = Action::Deny;
       rule
+   }
+
+   #[test]
+   fn an_equivalent_rule_is_refreshed_and_re_enabled() {
+      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
+      let first = allow_rule(10);
+      assert_eq!(policy.apply(first.clone()).1, Applied::Created);
+
+      let mut disabled = first.clone();
+      disabled.enabled = false;
+      policy.upsert_rule(disabled);
+
+      let refreshed = allow_rule(20);
+      let (applied, outcome) = policy.apply(refreshed);
+      assert_eq!(outcome, Applied::Refreshed);
+      assert_eq!(policy.ruleset().len(), 1);
+      assert_eq!(
+         applied.id, first.id,
+         "the existing rule keeps its id"
+      );
+      assert_eq!(
+         applied.created_at, 10,
+         "creation is not rewritten"
+      );
+      assert_eq!(applied.updated_at, 20);
+      assert!(
+         applied.enabled,
+         "a refreshed rule is enabled again"
+      );
+   }
+
+   #[test]
+   fn a_rule_with_a_different_matcher_is_a_new_rule() {
+      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
+      let mut domain = allow_rule(10);
+      domain.dest = DestMatcher::Domain {
+         host: "api.github.com".to_owned(),
+         subdomains: false,
+      };
+      let mut ip = allow_rule(10);
+      ip.dest = DestMatcher::Ip("140.82.121.78/32".parse().expect("a network"));
+
+      assert_eq!(policy.apply(domain).1, Applied::Created);
+      assert_eq!(
+         policy.apply(ip).1,
+         Applied::Created,
+         "a domain rule must not absorb an ip rule"
+      );
+
+      let mut deny = allow_rule(20);
+      deny.action = Action::Deny;
+      assert_eq!(
+         policy.apply(deny).1,
+         Applied::Created,
+         "a different action is a different rule"
+      );
+      assert_eq!(policy.ruleset().len(), 3);
    }
 
    #[test]
