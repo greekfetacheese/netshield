@@ -52,6 +52,14 @@ pub enum LogLevel {
 /// lossy strings; the defaults match the paths in ARCHITECTURE §9.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+   /// The nftables table this daemon owns and the only one it ever touches.
+   ///
+   /// Configurable so a second daemon can take its own table instead of colliding with the
+   /// real one. The name is interpolated into an `nft` command, so it must be a plain
+   /// nftables table name: no whitespace, quotes or semicolons. `#[serde(default)]` keeps
+   /// every config written before this field existed loading with the original name.
+   #[serde(default = "default_table")]
+   pub table: String,
    /// NFQUEUE number for connection packets.
    pub queue_num: u16,
    /// NFQUEUE number for DNS answers; must differ from `queue_num`.
@@ -78,9 +86,15 @@ pub struct Config {
    pub rules_path: PathBuf,
 }
 
+/// The nftables table name used when the configuration does not name one.
+fn default_table() -> String {
+   "netshield".to_owned()
+}
+
 impl Default for Config {
    fn default() -> Self {
       Self {
+         table: default_table(),
          queue_num: 0,
          dns_queue_num: 1,
          prompt_timeout_secs: 30,
@@ -135,6 +149,11 @@ impl From<serde_json::Error> for ConfigError {
 }
 
 impl Config {
+   /// The nftables table this daemon owns.
+   pub fn table_name(&self) -> &str {
+      &self.table
+   }
+
    /// Rejects settings the daemon cannot run with.
    ///
    /// Two queues sharing a number would make DNS answers compete with connection
@@ -151,6 +170,20 @@ impl Config {
          return Err(ConfigError::Invalid(format!(
             "prompt_timeout_secs must be in 1..=600, got {}",
             self.prompt_timeout_secs
+         )));
+      }
+      // The name goes straight into an `nft` command, so anything that could be read as
+      // syntax — or as a second argument — must be refused rather than quoted away.
+      if self.table.is_empty()
+         || self
+            .table
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == ';')
+      {
+         return Err(ConfigError::Invalid(format!(
+            "table must be a plain nftables table name (no whitespace, quotes or semicolon), \
+             got {:?}",
+            self.table
          )));
       }
       Ok(())
@@ -280,6 +313,57 @@ mod tests {
          ClosedFlowAction::Drop
       );
       assert_eq!(back, Config::default());
+   }
+
+   #[test]
+   fn the_default_is_the_old_name() {
+      assert_eq!(Config::default().table_name(), "netshield");
+      assert_eq!(Config::default().table, "netshield");
+
+      // A config written before the field existed must load with the original name, not fail.
+      let json = r#"{
+  "queue_num": 0,
+  "dns_queue_num": 1,
+  "prompt_timeout_secs": 30,
+  "default_action": "prompt",
+  "allowed_uid": null,
+  "log_level": "info",
+  "socket_path": "/run/netshield/control.sock",
+  "rules_path": "/etc/netshield/rules.json"
+}"#;
+      let config: Config = serde_json::from_str(json).expect("the installed config must load");
+      assert_eq!(config.table_name(), "netshield");
+   }
+
+   #[test]
+   fn a_configured_table_name_is_kept() {
+      let json = "{\"table\": \"netshielddiag\", \"queue_num\": 0, \"dns_queue_num\": 1, \
+                  \"prompt_timeout_secs\": 30, \"default_action\": \"prompt\", \
+                  \"allowed_uid\": null, \"log_level\": \"info\", \
+                  \"socket_path\": \"/run/x\", \"rules_path\": \"/etc/x\"}";
+      let config: Config = serde_json::from_str(json).expect("a valid table name must load");
+      assert_eq!(config.table_name(), "netshielddiag");
+      assert!(config.validate().is_ok());
+   }
+
+   #[test]
+   fn a_bad_table_name_is_rejected() {
+      for bad in ["", " ", "a b", "a;b", "a\"b", "a'b", "a\tb"] {
+         let config = Config {
+            table: bad.to_owned(),
+            ..Config::default()
+         };
+         let err = config.validate().expect_err("a bad table name must be refused");
+         assert!(
+            matches!(err, ConfigError::Invalid(_)),
+            "{bad:?} must be a config error"
+         );
+         let message = err.to_string();
+         assert!(
+            message.contains("table"),
+            "the message must name the field, got: {message}"
+         );
+      }
    }
 
    #[test]
