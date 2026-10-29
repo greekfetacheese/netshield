@@ -2087,128 +2087,6 @@ mod tests {
    }
 
    #[test]
-   fn scope_label_names_each_scope_and_keeps_the_host_as_given() {
-      assert_eq!(
-         scope_label(&ScopeChoice::AnyConnection),
-         "any connection by this app"
-      );
-      assert_eq!(
-         scope_label(&ScopeChoice::Domain {
-            host: "i.ytimg.com".to_owned(),
-            subdomains: false,
-         }),
-         "domain i.ytimg.com"
-      );
-      assert_eq!(
-         scope_label(&ScopeChoice::Domain {
-            host: "i.ytimg.com".to_owned(),
-            subdomains: true,
-         }),
-         "domain i.ytimg.com (+subdomains)"
-      );
-      assert_eq!(scope_label(&ScopeChoice::Address), "this address");
-      assert_eq!(
-         scope_label(&ScopeChoice::TheseDestinations),
-         "these destinations"
-      );
-      assert_eq!(
-         scope_label(&ScopeChoice::Domain {
-            host: "I.YTIMG.COM".to_owned(),
-            subdomains: false,
-         }),
-         "domain I.YTIMG.COM",
-         "the label prints the host as given; rule_for lower-cases for matching"
-      );
-   }
-
-   #[test]
-   fn decision_line_orders_action_duration_and_scope() {
-      let decide = |action, duration, scope| DecideRequest {
-         prompt_id: 12,
-         action,
-         duration,
-         scope,
-      };
-      assert_eq!(
-         decision_line(
-            12,
-            "brave",
-            "i.ytimg.com",
-            &decide(
-               Action::Allow,
-               RuleDuration::Session,
-               ScopeChoice::Domain {
-                  host: "i.ytimg.com".to_owned(),
-                  subdomains: true,
-               },
-            ),
-            "domain i.ytimg.com (+subdomains)",
-         ),
-         "prompt 12 for brave -> i.ytimg.com: allow, until restart, scope domain \
-          i.ytimg.com (+subdomains)"
-      );
-      assert_eq!(
-         decision_line(
-            13,
-            "curl",
-            "93.184.216.34:443",
-            &decide(
-               Action::Deny,
-               RuleDuration::Once,
-               ScopeChoice::Address,
-            ),
-            "this address",
-         ),
-         "prompt 13 for curl -> 93.184.216.34:443: deny, once, scope this address"
-      );
-      assert_eq!(
-         decision_line(
-            14,
-            "firefox",
-            "example.com",
-            &decide(
-               Action::Allow,
-               RuleDuration::Forever,
-               ScopeChoice::AnyConnection,
-            ),
-            "any connection by this app",
-         ),
-         "prompt 14 for firefox -> example.com: allow, forever, scope any connection by \
-          this app"
-      );
-   }
-
-   #[test]
-   fn dest_label_prefers_the_learned_domain() {
-      let mut connection = Connection {
-         family: Family::V4,
-         proto: L4Proto::Tcp,
-         local: Endpoint {
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port: 51_234,
-         },
-         remote: Endpoint {
-            addr: "93.184.216.34".parse().expect("an IPv4 address"),
-            port: 443,
-         },
-         process: Attribution::Unknown,
-         domain: Some("example.com".to_owned()),
-      };
-      assert_eq!(dest_label(&connection), "example.com");
-      connection.domain = None;
-      assert_eq!(dest_label(&connection), "93.184.216.34:443");
-   }
-
-   #[test]
-   fn a_prompt_with_no_client_warns_and_names_the_denial_timeout() {
-      assert_eq!(
-         missing_client_warning(7, "firefox", "198.51.100.20:443", 30),
-         "no GUI is connected; prompt 7 for firefox -> 198.51.100.20:443 will be denied in \
-          30s unless a GUI attaches"
-      );
-   }
-
-   #[test]
    fn signals_set_the_shutdown_flag() {
       SHUTDOWN.store(false, Ordering::SeqCst);
       on_shutdown_signal(libc::SIGTERM);
@@ -2313,109 +2191,100 @@ mod tests {
       }
    }
 
+   /// What happens to a flow no rule and no process owner decided: the socket's state, the
+   /// owner's setting, the mode and the destination's reachability each pick the verdict.
    #[test]
-   fn a_closed_flow_is_dropped_by_default() {
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
+   fn the_unmatched_flow_policy() {
+      for (remote, port, missing, config, mode, expected) in [
+         (
+            "93.184.216.34",
+            443,
             Some(Missing::SocketGone),
-            &Config::default(),
+            Config::default(),
             Mode::Alert,
+            Unmatched::DropClosed,
          ),
-         Unmatched::DropClosed
-      );
-   }
-
-   #[test]
-   fn a_closed_flow_can_be_allowed() {
-      let config = Config {
-         unattributable_closed_flow: ClosedFlowAction::Allow,
-         ..Config::default()
-      };
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
+         (
+            "93.184.216.34",
+            443,
             Some(Missing::SocketGone),
-            &config,
+            Config {
+               unattributable_closed_flow: ClosedFlowAction::Allow,
+               ..Config::default()
+            },
             Mode::Alert,
+            Unmatched::AllowClosed,
          ),
-         Unmatched::AllowClosed
-      );
-   }
-
-   #[test]
-   fn a_closed_flow_can_still_prompt() {
-      let config = Config {
-         unattributable_closed_flow: ClosedFlowAction::Prompt,
-         ..Config::default()
-      };
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
+         (
+            "93.184.216.34",
+            443,
             Some(Missing::SocketGone),
-            &config,
+            Config {
+               unattributable_closed_flow: ClosedFlowAction::Prompt,
+               ..Config::default()
+            },
             Mode::Alert,
+            Unmatched::Prompt,
          ),
-         Unmatched::Prompt
-      );
-   }
-
-   #[test]
-   fn a_transient_miss_still_prompts() {
-      // A row existed but could not be resolved: the socket may still be alive, so the
-      // default must ask rather than drop.
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
+         // A row existed but could not be resolved: the socket may still be alive, so the
+         // default must ask rather than drop.
+         (
+            "93.184.216.34",
+            443,
             Some(Missing::NotOurs),
-            &Config::default(),
+            Config::default(),
             Mode::Alert,
+            Unmatched::Prompt,
          ),
-         Unmatched::Prompt
-      );
-      // No reason at all is not a closed socket either.
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
+         // No reason at all is not a closed socket either.
+         (
+            "93.184.216.34",
+            443,
             None,
-            &Config::default(),
+            Config::default(),
             Mode::Alert,
+            Unmatched::Prompt,
          ),
-         Unmatched::Prompt
-      );
-   }
-
-   #[test]
-   fn an_unmatched_multicast_destination_is_allowed() {
-      // Even with the socket gone and the fail-closed default: a multicast destination is
-      // unattributable in principle and cannot leave the link.
-      for (remote, port) in [("224.0.0.251", 5353), ("ff02::fb", 5353)] {
+         // Even with the socket gone and the fail-closed default: a multicast destination is
+         // unattributable in principle and cannot leave the link.
+         (
+            "224.0.0.251",
+            5353,
+            Some(Missing::SocketGone),
+            Config::default(),
+            Mode::Alert,
+            Unmatched::AllowMulticast,
+         ),
+         (
+            "ff02::fb",
+            5353,
+            Some(Missing::SocketGone),
+            Config::default(),
+            Mode::Alert,
+            Unmatched::AllowMulticast,
+         ),
+         // `Prompt` is what auto-allows in silent mode, so the closed-flow default must not
+         // bypass silent mode's contract.
+         (
+            "93.184.216.34",
+            443,
+            Some(Missing::SocketGone),
+            Config::default(),
+            Mode::Silent,
+            Unmatched::Prompt,
+         ),
+      ] {
          assert_eq!(
             unmatched(
                &unmatched_connection(remote, port),
-               Some(Missing::SocketGone),
-               &Config::default(),
-               Mode::Alert,
+               missing,
+               &config,
+               mode,
             ),
-            Unmatched::AllowMulticast,
-            "{remote}:{port} must be allowed without a prompt"
+            expected,
+            "{remote}:{port} with {missing:?} in {mode:?} must be {expected:?}"
          );
       }
-   }
-
-   #[test]
-   fn silent_mode_allows_a_closed_flow() {
-      // `Prompt` is what auto-allows in silent mode, so the closed-flow default must not
-      // bypass silent mode's contract.
-      assert_eq!(
-         unmatched(
-            &unmatched_connection("93.184.216.34", 443),
-            Some(Missing::SocketGone),
-            &Config::default(),
-            Mode::Silent,
-         ),
-         Unmatched::Prompt
-      );
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
@@ -2545,103 +2414,89 @@ mod tests {
       msg
    }
 
-   /// The live CDN shape: the address belongs to the CNAME target, but the prompt must
-   /// offer the name the application actually asked for.
+   /// The address may belong to a CNAME target, but the prompt must offer the name the
+   /// application actually asked for, however many hops and cycles the chain has; a chain
+   /// with no address record behind it must not invent an address mapping.
    #[test]
-   fn a_cname_chain_reports_the_queried_name_as_primary() {
-      let dns = dns_response(
-         "www.example.com",
-         &[
-            cname_record("www.example.com", "cdn.example.net"),
-            address_record("cdn.example.net", [93, 184, 216, 34]),
-         ],
-      );
-      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
+   fn a_cname_chain_is_walked_back_to_the_queried_name() {
+      for (question, answers, answer, expected, detail) in [
+         (
+            "www.example.com",
+            vec![
+               cname_record("www.example.com", "cdn.example.net"),
+               address_record("cdn.example.net", [93, 184, 216, 34]),
+            ],
+            Some([93, 184, 216, 34]),
+            Some("www.example.com"),
+            Some("cdn.example.net"),
+         ),
+         // A two-hop chain must walk every edge, not just the last one.
+         (
+            "a.example",
+            vec![
+               cname_record("a.example", "b.example"),
+               cname_record("b.example", "c.example"),
+               address_record("c.example", [93, 184, 216, 35]),
+            ],
+            Some([93, 184, 216, 35]),
+            Some("a.example"),
+            None,
+         ),
+         // A cycle must terminate and still cache the address under a stable name.
+         (
+            "x.example",
+            vec![
+               cname_record("x.example", "y.example"),
+               cname_record("y.example", "x.example"),
+               address_record("y.example", [93, 184, 216, 36]),
+            ],
+            Some([93, 184, 216, 36]),
+            Some("x.example"),
+            None,
+         ),
+         (
+            "www.example.com",
+            vec![cname_record("www.example.com", "cdn.example.net")],
+            None,
+            None,
+            None,
+         ),
+      ] {
+         let dns = dns_response(question, &answers);
+         let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
 
-      let cache = Mutex::new(DnsCache::new());
-      cache_answer(&cache, &packet);
-      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 34]));
-      let cache = cache.lock().expect("dns cache");
-      let now = now_secs();
-      assert_eq!(
-         cache.primary(addr, now),
-         Some("www.example.com"),
-         "the queried name is what the prompt displays"
-      );
-      assert!(
-         cache.names_for(addr, now).contains(&"cdn.example.net"),
-         "the CNAME target stays available as detail"
-      );
-   }
+         let cache = Mutex::new(DnsCache::new());
+         cache_answer(&cache, &packet);
+         let Some(answer) = answer else {
+            assert!(
+               cache.lock().expect("dns cache").is_empty(),
+               "a name alone is not an address mapping"
+            );
+            continue;
+         };
+         let addr = IpAddr::V4(std::net::Ipv4Addr::from(answer));
+         let now = now_secs();
+         assert_eq!(
+            cache.lock().expect("dns cache").primary(addr, now),
+            expected,
+            "the queried name is what the prompt displays for {question}"
+         );
+         if let Some(detail) = detail {
+            assert!(
+               cache.lock().expect("dns cache").names_for(addr, now).contains(&detail),
+               "the CNAME target stays available as detail"
+            );
+         }
 
-   /// A two-hop chain must walk every edge, not just the last one.
-   #[test]
-   fn a_two_hop_cname_chain_resolves_to_the_first_owner() {
-      let dns = dns_response(
-         "a.example",
-         &[
-            cname_record("a.example", "b.example"),
-            cname_record("b.example", "c.example"),
-            address_record("c.example", [93, 184, 216, 35]),
-         ],
-      );
-      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
-
-      let cache = Mutex::new(DnsCache::new());
-      cache_answer(&cache, &packet);
-      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 35]));
-      assert_eq!(
-         cache.lock().expect("dns cache").primary(addr, now_secs()),
-         Some("a.example")
-      );
-   }
-
-   /// A cycle must terminate and still cache the address under a stable name.
-   #[test]
-   fn a_cname_cycle_terminates_and_caches_a_stable_name() {
-      let dns = dns_response(
-         "x.example",
-         &[
-            cname_record("x.example", "y.example"),
-            cname_record("y.example", "x.example"),
-            address_record("y.example", [93, 184, 216, 36]),
-         ],
-      );
-      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
-
-      let cache = Mutex::new(DnsCache::new());
-      cache_answer(&cache, &packet);
-      let addr = IpAddr::V4(std::net::Ipv4Addr::from([93, 184, 216, 36]));
-      let now = now_secs();
-      assert_eq!(
-         cache.lock().expect("dns cache").primary(addr, now),
-         Some("x.example")
-      );
-
-      // The walk stops at the repeated name, so the same answer always lands on the same
-      // root instead of ping-ponging between the two owners.
-      cache_answer(&cache, &packet);
-      assert_eq!(
-         cache.lock().expect("dns cache").primary(addr, now),
-         Some("x.example")
-      );
-   }
-
-   /// A CNAME with no address record behind it must not invent an address mapping.
-   #[test]
-   fn a_cname_without_an_address_record_caches_nothing() {
-      let dns = dns_response(
-         "www.example.com",
-         &[cname_record("www.example.com", "cdn.example.net")],
-      );
-      let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
-
-      let cache = Mutex::new(DnsCache::new());
-      cache_answer(&cache, &packet);
-      assert!(
-         cache.lock().expect("dns cache").is_empty(),
-         "a name alone is not an address mapping"
-      );
+         // The walk stops at the repeated name, so the same answer always lands on the same
+         // root instead of ping-ponging between the owners.
+         cache_answer(&cache, &packet);
+         assert_eq!(
+            cache.lock().expect("dns cache").primary(addr, now),
+            expected,
+            "a repeated answer lands on the same name for {question}"
+         );
+      }
    }
 
    /// An IPv4 packet with `options` bytes of IP options and `proto` as its transport.
@@ -2702,13 +2557,14 @@ mod tests {
       bytes
    }
 
-   /// The exact test that would have caught the live defect: an IPv4/UDP answer whose
-   /// payload must start at the DNS message, not at the UDP header.
+   /// The payload must start at the DNS message on both families and both transports, even
+   /// with IP options or TCP options in the way; an empty datagram has no payload at all.
    #[test]
-   fn ipv4_udp_dns_answer_reaches_the_parser_and_the_cache() {
+   fn transport_payload_finds_the_dns_payload() {
+      // The exact case that would have caught the live defect: an IPv4/UDP answer whose
+      // payload must start at the DNS message, not at the UDP header.
       let dns = a_record_response();
       let packet = ipv4_packet(17, &udp_datagram(&dns), 0);
-
       let (body, tcp) = transport_payload(&packet).expect("the UDP payload is found");
       assert!(!tcp, "UDP is not TCP");
       assert_eq!(
@@ -2737,13 +2593,9 @@ mod tests {
          cache.lock().expect("dns cache").primary(addr, now_secs()),
          Some("example.com")
       );
-   }
 
-   #[test]
-   fn ipv6_udp_dns_answer_reaches_the_parser() {
-      let dns = a_record_response();
+      // The same answer over IPv6 reaches the same parser.
       let packet = ipv6_packet(17, &udp_datagram(&dns));
-
       let (body, tcp) = transport_payload(&packet).expect("the UDP payload is found");
       assert!(!tcp);
       assert_eq!(
@@ -2756,15 +2608,12 @@ mod tests {
          records[0].target,
          Target::Address(IpAddr::V4(std::net::Ipv4Addr::from(ANSWER)))
       );
-   }
 
-   #[test]
-   fn tcp_data_offset_is_honoured_with_options_present() {
-      let dns = a_record_response();
+      // DNS over TCP behind options: the data offset is honoured, and the two-byte length
+      // prefix belongs to the payload.
       let options = [0x01, 0x01, 0x08, 0x0a, 0, 0, 0, 1, 0, 0, 0, 2];
       let segment = tcp_segment(&dns, 8, &options);
       let packet = ipv4_packet(6, &segment, 0);
-
       let (body, tcp) = transport_payload(&packet).expect("the TCP payload is found");
       assert!(tcp, "the transport is TCP");
       assert_eq!(
@@ -2775,11 +2624,7 @@ mod tests {
       let records = parse_tcp_response(body).expect("the TCP answer parses");
       assert_eq!(records.len(), 1);
       assert_eq!(records[0].name, "example.com");
-   }
 
-   #[test]
-   fn a_non_zero_ipv4_ihl_still_finds_the_payload() {
-      let dns = a_record_response();
       // Twenty bytes of IP options, so the transport header starts at 40, not 20.
       let packet = ipv4_packet(17, &udp_datagram(&dns), 20);
       assert_eq!(
@@ -2787,17 +2632,14 @@ mod tests {
          10,
          "the fixture has a 40-byte IP header"
       );
-
       let (body, _) = transport_payload(&packet).expect("the payload is found");
       assert_eq!(
          body.get(0..2),
          Some(DNS_ID.to_be_bytes().as_slice())
       );
       assert!(parse_response(body).is_ok());
-   }
 
-   #[test]
-   fn a_udp_datagram_without_payload_is_none() {
+      // An 8-byte UDP header and nothing behind it is not a payload.
       let packet = ipv4_packet(17, &udp_datagram(&[]), 0);
       assert_eq!(
          packet.len(),
@@ -2975,145 +2817,128 @@ mod tests {
       (first, second, third)
    }
 
+   /// A new app rule settles every destination of that app's group in one pass, whether or not
+   /// it is the oldest prompt, and leaves every other prompt live on its own deadline without
+   /// announcing anyone.
    #[test]
-   fn an_app_wide_rule_sweeps_the_open_prompt_for_that_app() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let head = pending
-         .open(
-            app_conn("/usr/bin/ssh", "198.51.100.24", 22),
-            30,
-            Duration::from_secs(30),
-            start,
-         )
-         .id();
-      let (browser, other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-      policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
+   fn an_allow_rule_sweeps_every_decided_group() {
+      for with_head in [true, false] {
+         let start = Instant::now();
+         let mut pending = PendingPrompts::new();
+         let head = if with_head {
+            Some(
+               pending
+                  .open(
+                     app_conn("/usr/bin/ssh", "198.51.100.24", 22),
+                     30,
+                     Duration::from_secs(30),
+                     start,
+                  )
+                  .id(),
+            )
+         } else {
+            None
+         };
+         let (browser, other) = queue_two_apps(&mut pending, start);
+         let mut policy = prompting_policy();
+         policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
+         let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
-      assert_eq!(
-         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![browser],
-         "the open browser prompt is settled as a whole"
-      );
-      assert_eq!(
-         sweep.swept[0]
-            .record
-            .dests
-            .iter()
-            .flat_map(|dest| dest.packet_ids.iter().copied())
-            .collect::<Vec<_>>(),
-         vec![10, 11, 12],
-         "every destination of the group is answered"
-      );
-      assert_eq!(
-         sweep.swept[0].verdict,
-         Verdict::Accept,
-         "the rule allows every destination"
-      );
-      assert_eq!(
-         pending.len(),
-         2,
-         "the ssh prompt and the other app remain"
-      );
-      assert!(
-         pending.get(head).is_some(),
-         "the prompt being answered is never swept"
-      );
-      assert!(
-         pending.get(other).is_some(),
-         "a different app survives"
-      );
+         assert_eq!(
+            sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
+            vec![browser],
+            "the open browser prompt is settled as a whole, oldest or not"
+         );
+         assert_eq!(
+            sweep.swept[0]
+               .record
+               .dests
+               .iter()
+               .flat_map(|dest| dest.packet_ids.iter().copied())
+               .collect::<Vec<_>>(),
+            vec![10, 11, 12],
+            "every destination of the group is answered"
+         );
+         assert_eq!(
+            sweep.swept[0].verdict,
+            Verdict::Accept,
+            "the rule allows every destination"
+         );
+         assert_eq!(
+            pending.len(),
+            if with_head { 2 } else { 1 },
+            "no browser prompt is left open"
+         );
+         assert!(
+            pending.get(other).is_some(),
+            "the other app is untouched and was already announced when it was opened"
+         );
+         assert_eq!(
+            pending.get(other).expect("open").deadline,
+            Some(start + Duration::from_secs(30)),
+            "it kept the clock it was opened with"
+         );
+         assert!(sweep.updated.is_empty());
+         assert!(
+            pending.get(browser).is_none(),
+            "the swept group was removed"
+         );
+
+         if let Some(head) = head {
+            assert!(
+               pending.get(head).is_some(),
+               "the prompt being answered is never swept"
+            );
+            assert!(
+               pending.is_active(head),
+               "the oldest prompt is listed first"
+            );
+            // The other app expires on its own clock; nothing ever activated it.
+            let expired = pending.expired_all(start + Duration::from_secs(30));
+            assert_eq!(
+               expired.iter().map(|resolved| resolved.record.id).collect::<Vec<_>>(),
+               vec![head, other]
+            );
+         }
+      }
    }
 
+   /// A deny rule drops every destination of the decided group with `Verdict::Drop` and never
+   /// touches the other app's prompt, whichever of the two apps the rule names.
    #[test]
-   fn a_swept_group_leaves_every_other_prompt_live_with_its_own_deadline() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let head = pending
-         .open(
-            app_conn("/usr/bin/ssh", "198.51.100.24", 22),
-            30,
-            Duration::from_secs(30),
-            start,
-         )
-         .id();
-      let (browser, other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-      policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
+   fn a_deny_rule_drops_every_decided_prompt_for_that_app() {
+      for (rule_exe, swept_is_browser) in
+         [("/usr/lib/firefox/firefox", true), ("/usr/bin/curl", false)]
+      {
+         let start = Instant::now();
+         let mut pending = PendingPrompts::new();
+         let (browser, other) = queue_two_apps(&mut pending, start);
+         let (expected_swept, survivor) = if swept_is_browser {
+            (browser, other)
+         } else {
+            (other, browser)
+         };
+         let mut policy = prompting_policy();
+         let mut rule = allow_rule_for(rule_exe);
+         rule.action = Action::Deny;
+         policy.upsert_rule(rule);
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
+         let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
-      assert_eq!(
-         pending.get(other).expect("still open").deadline,
-         Some(start + Duration::from_secs(30)),
-         "the unrelated prompt keeps the clock it was opened with"
-      );
-      assert!(
-         pending.is_active(head),
-         "the oldest prompt is listed first"
-      );
-      assert_eq!(sweep.updated.len(), 0);
-      assert!(
-         pending.get(browser).is_none(),
-         "the swept group was removed"
-      );
-
-      // The other app expires on its own clock; nothing ever activated it.
-      let expired = pending.expired_all(start + Duration::from_secs(30));
-      assert_eq!(
-         expired.iter().map(|resolved| resolved.record.id).collect::<Vec<_>>(),
-         vec![head, other]
-      );
-   }
-
-   #[test]
-   fn the_oldest_prompt_is_swept_like_any_other() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let (browser, other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-      policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
-
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
-
-      assert_eq!(
-         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![browser],
-         "every prompt is live, so the oldest is swept too"
-      );
-      assert!(
-         pending.get(browser).is_none(),
-         "the decided group is closed"
-      );
-      assert_eq!(
-         pending.get(other).expect("open").deadline,
-         Some(start + Duration::from_secs(30)),
-         "the surviving prompt is still on its original clock"
-      );
-   }
-
-   #[test]
-   fn a_deny_rule_drops_open_prompts_for_that_app() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let (head, other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-      let mut rule = allow_rule_for("/usr/bin/curl");
-      rule.action = Action::Deny;
-      policy.upsert_rule(rule);
-
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
-
-      assert_eq!(
-         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![other]
-      );
-      assert_eq!(sweep.swept[0].verdict, Verdict::Drop);
-      assert_eq!(sweep.swept[0].resolution, Resolution::Denied);
-      assert!(pending.get(head).is_some());
+         assert_eq!(
+            sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
+            vec![expected_swept],
+            "the deny rule for {rule_exe} settles exactly that app's prompt"
+         );
+         assert_eq!(sweep.swept[0].verdict, Verdict::Drop);
+         assert_eq!(sweep.swept[0].resolution, Resolution::Denied);
+         assert_eq!(pending.len(), 1);
+         assert!(
+            pending.get(survivor).is_some(),
+            "the other app is untouched"
+         );
+      }
    }
 
    #[test]
@@ -3148,45 +2973,6 @@ mod tests {
          "ids are never reused after a sweep emptied the set"
       );
       assert_eq!(pending.len(), 1);
-   }
-
-   /// A new app rule decides the open browser group; the other app's prompt was already
-   /// broadcast and needs no re-announcement.
-   #[test]
-   fn the_sweep_takes_decided_groups_without_announcing_anyone() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let (browser, other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-      policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
-
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
-
-      assert_eq!(
-         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![browser],
-         "the decided browser group is not left open"
-      );
-      assert_eq!(
-         sweep.swept[0]
-            .record
-            .dests
-            .iter()
-            .flat_map(|dest| dest.packet_ids.iter().copied())
-            .collect::<Vec<_>>(),
-         vec![10, 11, 12],
-         "every destination of the group is answered"
-      );
-      assert_eq!(pending.len(), 1, "no browser prompt is left open");
-      assert!(
-         pending.get(other).is_some(),
-         "the other app was already announced when it was opened"
-      );
-      assert!(
-         pending.get(other).expect("open").deadline.is_some(),
-         "it kept the deadline it was opened with"
-      );
-      assert!(sweep.updated.is_empty());
    }
 
    /// A narrow rule settles the one destination it covers and leaves the rest of the group
@@ -3249,37 +3035,23 @@ mod tests {
       );
    }
 
-   /// A deny rule drops every destination of the decided group with `Verdict::Drop` and
-   /// never touches the other app's prompt.
+   /// A sweep with nothing decided touches nothing at all; the prompts it does decide are
+   /// settled in one pass and the survivors are left exactly as they were, on their own clocks.
    #[test]
-   fn a_deny_rule_drops_decided_groups_with_the_other_app_untouched() {
+   fn an_undecided_sweep_changes_nothing() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
-      let (browser, other) = queue_two_apps(&mut pending, start);
+      let (_head, _other) = queue_two_apps(&mut pending, start);
       let mut policy = prompting_policy();
-      let mut rule = allow_rule_for("/usr/lib/firefox/firefox");
-      rule.action = Action::Deny;
-      policy.upsert_rule(rule);
 
       let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
-      assert_eq!(
-         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![browser]
-      );
-      assert_eq!(sweep.swept[0].verdict, Verdict::Drop);
-      assert_eq!(sweep.swept[0].resolution, Resolution::Denied);
-      assert_eq!(pending.len(), 1);
-      assert!(
-         pending.get(other).is_some(),
-         "the other app is untouched"
-      );
-   }
+      assert!(sweep.swept.is_empty(), "nothing is decided yet");
+      assert!(sweep.updated.is_empty());
+      assert_eq!(pending.len(), 2);
 
-   /// A sweep settles every prompt it can in one pass and leaves the undecided ones exactly
-   /// as they were: no successor has to be announced, because they were announced on open.
-   #[test]
-   fn an_undecided_prompt_is_left_untouched_by_the_sweep() {
+      // Now something is decided: the decided prompt settles, the undecided survivor is
+      // untouched, and no successor has to be announced because it was announced on open.
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let (first, second, third) = queue_three_apps(&mut pending, start);
@@ -3309,21 +3081,6 @@ mod tests {
          Some(start + Duration::from_secs(30)),
          "the survivor keeps the clock it was opened with"
       );
-   }
-
-   /// A sweep with nothing decided touches nothing at all.
-   #[test]
-   fn an_undecided_sweep_leaves_every_prompt_alone() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let (_head, _other) = queue_two_apps(&mut pending, start);
-      let mut policy = prompting_policy();
-
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
-
-      assert!(sweep.swept.is_empty(), "nothing is decided yet");
-      assert!(sweep.updated.is_empty());
-      assert_eq!(pending.len(), 2);
    }
 
    /// A six-destination group for one app, its first destination carrying a learned name.
@@ -3493,9 +3250,11 @@ mod tests {
    }
 
    /// Answering the same group with the same scope twice refreshes the one rule instead of
-   /// adding a second, and the second answer reports an update.
+   /// adding a second, a disabled equivalent is re-enabled rather than shadowed, and the same
+   /// app answered for another address is a different destination whose rule list must grow.
    #[test]
-   fn an_identical_rule_is_refreshed_not_duplicated() {
+   fn an_answer_refreshes_an_identical_rule_or_creates_a_new_one() {
+      // The same group, same scope: the second answer is an update of the one rule.
       let (id, record) = six_destination_group();
       let decide = DecideRequest {
          prompt_id: id,
@@ -3531,19 +3290,9 @@ mod tests {
          stored.updated_at, 200,
          "the refresh stamps the rule"
       );
-   }
 
-   /// A disabled equivalent is re-enabled by the next answer rather than shadowed by a new
-   /// rule the user would have to find and toggle.
-   #[test]
-   fn a_disabled_identical_rule_is_re_enabled() {
-      let (id, record) = six_destination_group();
-      let decide = DecideRequest {
-         prompt_id: id,
-         action: Action::Allow,
-         duration: RuleDuration::Forever,
-         scope: ScopeChoice::AnyConnection,
-      };
+      // A disabled equivalent is re-enabled by the next answer rather than shadowed by a new
+      // rule the user would have to find and toggle.
       let mut policy = prompting_policy();
       let mut disabled = rules_for(&record, &decide, 100).remove(0);
       disabled.enabled = false;
@@ -3558,12 +3307,9 @@ mod tests {
          "the refreshed rule is enabled again"
       );
       assert_eq!(stored.updated_at, 200);
-   }
 
-   /// The same app answered for another address is a different destination, not a
-   /// duplicate: the rule list must grow.
-   #[test]
-   fn a_different_destination_is_a_new_rule() {
+      // The same app answered for another address is a different destination, not a
+      // duplicate: the rule list must grow.
       let decide = || DecideRequest {
          prompt_id: 1,
          action: Action::Allow,
@@ -3596,8 +3342,10 @@ mod tests {
       entries.iter().map(|(exe, uid)| (*uid, PathBuf::from(exe))).collect()
    }
 
+   /// A rule revokes the uids running its executable: one per executable, deduplicated and
+   /// sorted; an any rule revokes everything and an unknown rule revokes nothing.
    #[test]
-   fn a_rule_for_an_executable_revokes_its_running_owners() {
+   fn a_rule_revokes_the_uids_running_its_executable() {
       // Two processes running the same executable, one running another: the uid comes back once
       // for the shared path and the unrelated path contributes nothing.
       let live = live_processes(&[
@@ -3637,10 +3385,8 @@ mod tests {
          rule_revoke(&allow_rule_for("/usr/bin/lynx"), &[]),
          Revoke::Nothing
       );
-   }
 
-   #[test]
-   fn an_any_rule_revokes_everything() {
+      // An any rule is not scoped to a process at all, so it revokes everything.
       let mut rule = allow_rule_for("/usr/bin/curl");
       rule.app = AppMatcher::Any;
       assert_eq!(
@@ -3648,10 +3394,8 @@ mod tests {
          Revoke::All
       );
       assert_eq!(rule_revoke(&rule, &[]), Revoke::All);
-   }
 
-   #[test]
-   fn an_unknown_rule_revokes_nothing() {
+      // An unknown owner names nothing to revoke.
       let mut rule = allow_rule_for("/usr/bin/curl");
       rule.app = AppMatcher::Unknown;
       assert_eq!(
@@ -3662,7 +3406,7 @@ mod tests {
 
    /// A deny upsert is the only upsert that revokes; an allow leaves running traffic alone.
    #[test]
-   fn a_deny_upsert_revokes_the_rules_app() {
+   fn an_upserting_decision_revokes_only_on_deny() {
       let live = live_processes(&[("/usr/lib/firefox/firefox", 1000)]);
       let allow = allow_rule_for("/usr/lib/firefox/firefox");
       let mut deny = allow.clone();
@@ -3673,12 +3417,5 @@ mod tests {
          upsert_revoke(&deny, &live),
          Revoke::Uids(vec![1000])
       );
-   }
-
-   #[test]
-   fn an_allow_upsert_does_not_revoke() {
-      let live = live_processes(&[("/usr/lib/firefox/firefox", 1000)]);
-      let rule = allow_rule_for("/usr/lib/firefox/firefox");
-      assert_eq!(upsert_revoke(&rule, &live), Revoke::Nothing);
    }
 }

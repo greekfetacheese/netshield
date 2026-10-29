@@ -459,17 +459,16 @@ mod tests {
    }
 
    #[test]
-   fn packet_without_header_is_a_protocol_error() {
+   fn a_malformed_packet_is_a_protocol_error() {
+      // No packet header at all: the reader must name the missing attribute.
       let datagram = packet_datagram(&[(NFQA_PAYLOAD, b"IP datagram")]);
       let msg = MessageIter::new(&datagram).next().unwrap().unwrap();
       match parse_packet(msg.payload) {
          Err(NfqError::Protocol(reason)) => assert!(reason.contains("NFQA_PACKET_HDR")),
          other => panic!("expected a protocol error, got {other:?}"),
       }
-   }
 
-   #[test]
-   fn missing_payload_is_a_protocol_error() {
+      // A header without its payload attribute.
       let mut hdr = [0u8; PACKET_HDR_LEN];
       hdr[0..4].copy_from_slice(&7u32.to_be_bytes());
       hdr[6] = 2;
@@ -479,18 +478,13 @@ mod tests {
          Err(NfqError::Protocol(reason)) => assert!(reason.contains("NFQA_PAYLOAD")),
          other => panic!("expected a protocol error, got {other:?}"),
       }
-   }
 
-   #[test]
-   fn truncated_mid_attribute_is_a_protocol_error() {
-      let mut hdr = [0u8; PACKET_HDR_LEN];
-      hdr[0..4].copy_from_slice(&7u32.to_be_bytes());
-      let mut payload = nfgenmsg(AF_INET, 3).to_vec();
-      push_attr(&mut payload, NFQA_PACKET_HDR, &hdr);
-      push_attr(&mut payload, NFQA_PAYLOAD, b"abcdef");
       // Drop three bytes from the payload attribute while leaving `nlmsg_len` honest,
       // so the message framing is sound and the attribute reader is the one that sees
       // the cut.
+      let mut payload = nfgenmsg(AF_INET, 3).to_vec();
+      push_attr(&mut payload, NFQA_PACKET_HDR, &hdr);
+      push_attr(&mut payload, NFQA_PAYLOAD, b"abcdef");
       payload.truncate(payload.len() - 3);
       let datagram = frame(queue_msg(NFQNL_MSG_PACKET), 0, 1, &payload);
       let msg = MessageIter::new(&datagram).next().unwrap().unwrap();
@@ -615,7 +609,8 @@ mod tests {
    }
 
    #[test]
-   fn pf_bind_carries_the_family() {
+   fn the_pf_messages_bind_and_unbind_both_families() {
+      // PF_BIND names the family it binds.
       let msg = frame(
          queue_msg(NFQNL_MSG_CONFIG),
          5,
@@ -627,10 +622,8 @@ mod tests {
          &msg[24..28],
          &[NFQNL_CFG_CMD_PF_BIND, 0, 0, AF_INET6]
       );
-   }
 
-   #[test]
-   fn pf_unbind_is_command_four_for_both_families() {
+      // PF_UNBIND is command 4, for either family.
       for pf in [AF_INET, AF_INET6] {
          let msg = frame(
             queue_msg(NFQNL_MSG_CONFIG),

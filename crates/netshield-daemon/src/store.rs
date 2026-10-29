@@ -295,7 +295,7 @@ mod tests {
    }
 
    #[test]
-   fn second_load_is_authoritative_and_never_reseeds() {
+   fn an_existing_file_is_authoritative_and_never_reseeded() {
       let path = temp_path("authoritative");
       let rule = sample_rule("user edited");
       let mut store = RuleStore {
@@ -308,10 +308,7 @@ mod tests {
       assert!(!seeded, "an existing file is not a first run");
       assert_eq!(loaded.rules(), [rule]);
       let _ = fs::remove_file(&path);
-   }
 
-   #[test]
-   fn empty_existing_file_is_not_reseeded() {
       let path = temp_path("empty");
       let store = RuleStore {
          path: path.clone(),
@@ -326,7 +323,7 @@ mod tests {
    }
 
    #[test]
-   fn load_rejects_a_future_version() {
+   fn load_rejects_a_bad_file() {
       let path = temp_path("version");
       fs::write(&path, br#"{"version":2,"rules":[]}"#).expect("write fixture");
       assert!(matches!(
@@ -334,10 +331,7 @@ mod tests {
          Err(StoreError::Version(2))
       ));
       let _ = fs::remove_file(&path);
-   }
 
-   #[test]
-   fn load_rejects_malformed_json() {
       let path = temp_path("malformed");
       fs::write(&path, b"{ not json").expect("write fixture");
       assert!(matches!(
@@ -348,23 +342,7 @@ mod tests {
    }
 
    #[test]
-   fn file_format_is_version_one_with_a_rules_array() {
-      let path = temp_path("format");
-      let mut store = RuleStore {
-         path: path.clone(),
-         rules: Vec::new(),
-      };
-      store.upsert(sample_rule("format")).expect("save");
-
-      let value: serde_json::Value =
-         serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
-      assert_eq!(value["version"], 1);
-      assert_eq!(value["rules"].as_array().map(Vec::len), Some(1));
-      let _ = fs::remove_file(&path);
-   }
-
-   #[test]
-   fn upsert_replaces_by_id_and_persists() {
+   fn upsert_replaces_by_id_and_writes_the_documented_file() {
       let path = temp_path("upsert");
       let mut store = RuleStore {
          path: path.clone(),
@@ -380,6 +358,11 @@ mod tests {
       assert_eq!(store.rules(), [changed.clone()]);
       let (reloaded, _) = RuleStore::load_or_seed(&path).expect("reload");
       assert_eq!(reloaded.rules(), [changed]);
+
+      let value: serde_json::Value =
+         serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+      assert_eq!(value["version"], 1);
+      assert_eq!(value["rules"].as_array().map(Vec::len), Some(1));
       let _ = fs::remove_file(&path);
    }
 
