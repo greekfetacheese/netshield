@@ -8,7 +8,8 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use egui::{Color32, RichText, Ui};
+use egui::{Color32, RichText, TextStyle, Ui};
+use egui_elements::Theme;
 use netshield_core::connection::Family;
 use netshield_core::ipc::{ConnectionView, DecideRequest, PromptRequest, ScopeChoice};
 use netshield_core::rule::{Action, Duration};
@@ -627,7 +628,16 @@ pub fn ui(
       app_row(ui, view, waiting_label(waiting));
 
       ui.add_space(SECTION_GAP);
-      ui.label(RichText::new("wants to connect to").weak());
+      // The caption belongs to the address below it, not to the section above: xs, not the
+      // section gap, so the two read as one sentence.
+      let theme = Theme::current(ui.ctx());
+      ui.spacing_mut().item_spacing.y = theme.spacing.xs;
+      ui.label(
+         RichText::new("wants to connect to")
+            .text_style(TextStyle::Body)
+            .color(theme.colors.text_muted),
+      );
+      ui.spacing_mut().item_spacing.y = SECTION_GAP;
       destination(ui, view);
       if is_group(prompt) {
          destination_list(ui, prompt);
@@ -889,8 +899,11 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
 /// keeps a large group from pushing the fixed panel past [`HEIGHT`]; the remainder line
 /// still states how many destinations are not named.
 fn destination_list(ui: &mut Ui, prompt: &PromptRequest) {
+   let muted = Theme::current(ui.ctx()).colors.text_muted;
    for line in destination_lines(prompt) {
-      ui.label(RichText::new(line).small().weak());
+      // One style and one bullet for every row, so the indent never depends on the
+      // address family.
+      ui.label(RichText::new(line).text_style(TextStyle::Small).color(muted));
    }
 }
 
@@ -907,12 +920,19 @@ fn protocol_line(view: &ConnectionView) -> String {
    line
 }
 
-/// The duration radios, under a muted `Duration` label.
+/// The duration radios, under a `Duration` heading.
 ///
 /// Radios rather than a pill row: they say the three choices are mutually exclusive, and
 /// there is no orphan `For` label left over from the old layout.
 fn duration_section(ui: &mut Ui, state: &mut AlertState) {
-   ui.label(RichText::new("Duration").small().weak());
+   let theme = Theme::current(ui.ctx());
+   ui.label(
+      RichText::new("Duration")
+         .text_style(TextStyle::Body)
+         .color(theme.colors.text)
+         .strong(),
+   );
+   ui.add_space(theme.spacing.xs);
    ui.horizontal(|ui| {
       for (value, label) in [
          (Duration::Once, "Once"),
@@ -927,7 +947,7 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
 /// The scope radios and the subdomain opt-in when the domain row is offered.
 ///
 /// The rows come from [`scope_options`], so the control is the same for one destination and
-/// for a group and its first row is always the default. The muted `Scope` label keeps
+/// for a group and its first row is always the default. The `Scope` heading keeps
 /// `Any connection by <app>` from reading as a fourth duration option. That first label is
 /// deliberately app-wide: the daemon turns `ScopeChoice::AnyConnection` into
 /// `DestMatcher::Any`, i.e. *any destination for this app*, so calling it "This connection"
@@ -938,7 +958,14 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
 /// row, indented to the radio's *text* rather than its circle, and stays disabled until that
 /// scope is selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
-   ui.label(RichText::new("Scope").small().weak());
+   let theme = Theme::current(ui.ctx());
+   ui.label(
+      RichText::new("Scope")
+         .text_style(TextStyle::Body)
+         .color(theme.colors.text)
+         .strong(),
+   );
+   ui.add_space(theme.spacing.xs);
    let selected = state.effective_scope(prompt);
 
    for option in scope_options(prompt) {
@@ -1446,6 +1473,186 @@ mod tests {
          text.contains("142.250.185.78:443"),
          "the address itself still names the destination: {text}"
       );
+   }
+
+   /// One painted text run: what it says, where it starts, and how it was styled.
+   #[derive(Debug)]
+   struct PaintedText {
+      text: String,
+      pos: egui::Pos2,
+      font: egui::FontId,
+      color: Color32,
+   }
+
+   /// Renders the whole panel and returns every text run it painted.
+   fn painted(ctx: &egui::Context, request: &PromptRequest) -> Vec<PaintedText> {
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, 0);
+      });
+      let mut painted = Vec::new();
+      fn collect(shape: &egui::Shape, out: &mut Vec<PaintedText>) {
+         match shape {
+            egui::Shape::Text(text) => {
+               let section = text.galley.job.sections.first().expect("one section");
+               out.push(PaintedText {
+                  text: text.galley.text().to_owned(),
+                  pos: text.pos,
+                  font: section.format.font_id.clone(),
+                  color: section.format.color,
+               });
+            }
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in &output.shapes {
+         collect(&clipped.shape, &mut painted);
+      }
+      output.drop_without_applying_deltas();
+      painted
+   }
+
+   /// A group whose rows cover a named host, an IPv4 endpoint, an IPv6 endpoint and a
+   /// remainder: enough shapes to catch a per-row indent.
+   fn mixed_group() -> PromptRequest {
+      let mut request = prompt(Some("www.google.com"), true);
+      request.connection = dest_view("firefox", "www.google.com", 74);
+      let mut v6 = dest_view("firefox", "", 75);
+      v6.family = Family::V6;
+      v6.remote_ip = IpAddr::V6("2001:4860:482c:400::1".parse().expect("ipv6"));
+      request.dests = vec![
+         request.connection.clone(),
+         dest_view("firefox", "ssl.gstatic.com", 75),
+         v6,
+         dest_view("firefox", "", 76),
+         dest_view("firefox", "fonts.gstatic.com", 77),
+      ];
+      request
+   }
+
+   #[test]
+   fn the_caption_reads_at_body_size() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let body = TextStyle::Body.resolve(&style);
+      let small = TextStyle::Small.resolve(&style);
+
+      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
+      let caption = painted
+         .iter()
+         .find(|run| run.text == "wants to connect to")
+         .expect("the caption is painted");
+      assert_eq!(
+         caption.font, body,
+         "the caption uses the body style"
+      );
+      assert_ne!(
+         caption.font, small,
+         "the caption no longer reads small"
+      );
+      assert_eq!(
+         caption.color, theme.colors.text_muted,
+         "the caption uses the theme's muted colour"
+      );
+   }
+
+   #[test]
+   fn additional_destinations_use_small_typography() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let small = TextStyle::Small.resolve(&style);
+
+      let mut request = prompt(Some("www.google.com"), true);
+      request.dests = vec![
+         request.connection.clone(),
+         dest_view("firefox", "ssl.gstatic.com", 75),
+      ];
+      let painted = painted(&ctx, &request);
+      let rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
+      assert_eq!(rows.len(), 2, "one list row per destination");
+      for row in rows {
+         assert_eq!(
+            row.font, small,
+            "the list row {} is small: {row:?}",
+            row.text
+         );
+         assert_eq!(
+            row.color, theme.colors.text_muted,
+            "the list row {} is muted",
+            row.text
+         );
+      }
+
+      let primary = painted
+         .iter()
+         .find(|run| run.text == "www.google.com")
+         .expect("the primary destination is painted");
+      assert_ne!(
+         primary.font, small,
+         "the primary destination keeps its size"
+      );
+   }
+
+   #[test]
+   fn every_destination_row_shares_one_indent() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let painted = painted(&ctx, &mixed_group());
+      let mut rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
+      rows.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
+      assert_eq!(
+         rows.len(),
+         DEST_LINES + 1,
+         "three rows and the remainder"
+      );
+      let left = rows[0].pos.x;
+      for row in &rows {
+         assert_eq!(
+            row.pos.x, left,
+            "row {} starts at the shared indent",
+            row.text
+         );
+      }
+   }
+
+   #[test]
+   fn section_labels_outrank_their_options() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let body = TextStyle::Body.resolve(&style);
+      let small = TextStyle::Small.resolve(&style);
+
+      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
+      for label in ["Duration", "Scope"] {
+         let run = painted
+            .iter()
+            .find(|run| run.text == label)
+            .unwrap_or_else(|| panic!("the {label} label is painted"));
+         assert_eq!(run.font, body, "{label} uses the body style");
+         assert_ne!(run.font, small, "{label} is no longer small");
+         assert_eq!(
+            run.color, theme.colors.text,
+            "{label} uses the body colour"
+         );
+      }
    }
 
    #[test]
