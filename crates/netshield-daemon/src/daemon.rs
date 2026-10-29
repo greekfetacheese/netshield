@@ -65,6 +65,12 @@ const DNS_MISS_LIMIT: usize = 1024;
 /// destination; past the bound the line is skipped and the packet is still allowed.
 const MAX_MULTICAST_APPS: usize = 64;
 
+/// How many prompts may be open before a single warning reports the storm.
+///
+/// Not a cap: nothing silently denies a flow the user was never shown. A pathological burst is
+/// made visible instead, because every one of those prompts now has its own clock.
+const MAX_OPEN_PROMPTS: usize = 6;
+
 /// How long the proc connector receive may block before the shutdown flag is checked.
 ///
 /// Matches the packet loop's receive bound: a kernel without `CONFIG_PROC_EVENTS` must not
@@ -393,15 +399,13 @@ impl Daemon {
    }
 }
 
-/// One prompt a new rule already decides, ready to be answered and announced.
+/// One prompt a new rule already decides, ready to be answered.
 struct SweptPrompt {
    /// The settled prompt. Only the destinations the rule decided are left in `dests`; a
    /// group keeps the destinations that still need the user, with the same prompt id.
    record: PromptRecord,
    verdict: Verdict,
    resolution: Resolution,
-   /// The prompt made the head, when removing this record happened to activate it.
-   activated: Option<PromptRecord>,
 }
 
 /// Whether a connection decided by policy allows or denies it, or still needs the user.
@@ -433,7 +437,6 @@ fn sweep_dests(
    policy: &mut Policy,
    id: u64,
    now: u64,
-   at: Instant,
 ) -> Option<SweptDests> {
    let record = pending.get(id)?;
    let mut flows = Vec::new();
@@ -451,7 +454,7 @@ fn sweep_dests(
       flows.push(dest.connection.flow_key());
    }
    let (verdict, resolution) = verdict?;
-   let taken = pending.take_dests(id, &flows, at)?;
+   let taken = pending.take_dests(id, &flows)?;
    Some(SweptDests {
       dests: taken.dests,
       verdict,
@@ -460,148 +463,56 @@ fn sweep_dests(
    })
 }
 
-/// Removes and settles every queued prompt the policy already decides.
-///
-/// Split from [`Daemon::sweep_decided_prompts`] so the queue and rule interaction is
-/// unit-tested without a root-owned netlink queue to answer packets on. The caller owns
-/// the side effects: the packet verdicts, the broadcast and the log line, in that order.
-fn sweep_queued(
-   pending: &mut PendingPrompts,
-   policy: &mut Policy,
-   now: u64,
-   at: Instant,
-) -> Vec<SweptPrompt> {
-   let mut swept = Vec::new();
-   for record in pending.queued_records() {
-      let Some(swept_dests) = sweep_dests(pending, policy, record.id, now, at) else {
-         continue;
-      };
-      let (record, activated) = match swept_dests.removal {
-         DestRemoval::Resolved(resolved) => (resolved.record, resolved.activated),
-         DestRemoval::Remaining(_) => (record, None),
-      };
-      swept.push(SweptPrompt {
-         record: record.with_dests(swept_dests.dests),
-         verdict: swept_dests.verdict,
-         resolution: swept_dests.resolution,
-         activated,
-      });
-   }
-   swept
-}
-
-/// The prompts a sweep settled, the prompts it must announce, and whether its guard tripped.
+/// The prompts a sweep settled, and the open prompts it shrank.
 struct PromptSweep {
-   /// The settled prompts in the order they were removed: the swept head first, then the
-   /// swept tail.
+   /// The settled prompts in arrival order, with only the destinations the rule decided.
    swept: Vec<SweptPrompt>,
-   /// The prompts left to broadcast after every side effect has run: the head the sweep
-   /// stopped on, when the sweep is what activated it, plus anything a tail removal
-   /// unexpectedly activated. A prompt that was already the head before the sweep is *not*
-   /// announced again; it is on screen already.
-   announced: Vec<PromptRecord>,
-   /// Prompts that are already the head and lost destinations to the sweep, so the clients'
-   /// list is refreshed with the smaller group.
+   /// Open prompts that lost destinations to the sweep, so the clients' list is refreshed
+   /// with the smaller group.
    updated: Vec<PromptRecord>,
-   /// Whether the head loop reached its iteration bound instead of stopping on a prompt.
-   bounded: bool,
 }
 
-/// Removes every destination the policy already decides, head first, then the queued tail.
+/// Removes every destination the policy already decides from every open prompt.
 ///
-/// The head is swept too: answering a prompt applies its rule *before* the prompt is
-/// resolved, so the prompt activated behind it is very often another flow from the same app
-/// and already decided. The loop settles the head repeatedly and stops on the first head
-/// the policy asks about; that survivor is returned in `announced` and is broadcast by the
-/// caller only after the whole sweep has run, so a prompt that a later iteration could
-/// settle is never shown. The queue shrinks on every settled head, so `pending.len() + 1`
-/// iterations is a hard bound; reaching it sets `bounded` rather than looping forever.
-/// A head that keeps some destinations stops the loop but is returned in `updated` when the
-/// sweep shrank it.
+/// The prompts are visited in arrival order, so the oldest is settled first. Every prompt is
+/// live from the moment it is opened, so a sweep no longer has to walk a queue or announce a
+/// successor: each record it touched is either closed or refreshed by the caller, and the
+/// records it could not decide stay exactly as they are. A record a previous iteration
+/// removed is skipped by [`sweep_dests`] returning `None`.
 ///
-/// Split from [`Daemon::sweep_decided_prompts`] so the queue and rule interaction is
+/// Split from [`Daemon::sweep_decided_prompts`] so the prompt and rule interaction is
 /// unit-tested without a root-owned netlink queue to answer packets on. The caller owns the
 /// side effects: the packet verdicts, the broadcast and the log line, in that order.
-fn sweep_decided(
-   pending: &mut PendingPrompts,
-   policy: &mut Policy,
-   now: u64,
-   at: Instant,
-) -> PromptSweep {
-   let bound = pending.len() + 1;
+fn sweep_decided(pending: &mut PendingPrompts, policy: &mut Policy, now: u64) -> PromptSweep {
    let mut swept = Vec::new();
    let mut updated = Vec::new();
-   let mut head_swept = false;
-   let mut survivor = None;
-   let mut bounded = true;
-   for _ in 0..bound {
-      let Some(head_id) = pending.head_id() else {
-         bounded = false;
-         break;
-      };
-      let Some(record) = pending.get(head_id).cloned() else {
-         bounded = false;
-         break;
-      };
-      let Some(swept_dests) = sweep_dests(pending, policy, head_id, now, at) else {
-         // This prompt genuinely needs the user; everything behind it is settled below. It
-         // is announced only when the sweep activated it, not when it was already the head.
-         if head_swept {
-            survivor = Some(record);
-         } else if let Some(remaining) = pending.get(head_id)
-            && remaining.dests.len() < record.dests.len()
-         {
-            // The sweep shrank the visible head; refresh the clients' list with it.
-            updated.push(remaining.clone());
-         }
-         bounded = false;
-         break;
+   for record in pending.queued_records() {
+      let Some(swept_dests) = sweep_dests(pending, policy, record.id, now) else {
+         continue;
       };
       match swept_dests.removal {
-         DestRemoval::Remaining(remaining) => {
-            // A destination the policy does not decide keeps the group — and its prompt —
-            // alive and on screen, so the clients are sent the smaller list instead.
-            updated.push(remaining.clone());
-            swept.push(SweptPrompt {
-               record: remaining.with_dests(swept_dests.dests),
-               verdict: swept_dests.verdict,
-               resolution: swept_dests.resolution,
-               activated: None,
-            });
-            survivor = None;
-            bounded = false;
-            break;
-         }
          DestRemoval::Resolved(resolved) => {
-            head_swept = true;
             swept.push(SweptPrompt {
                record: resolved.record.with_dests(swept_dests.dests),
                verdict: swept_dests.verdict,
                resolution: swept_dests.resolution,
-               activated: resolved.activated,
+            });
+         }
+         DestRemoval::Remaining(_) => {
+            // A destination the policy does not decide keeps the group — and its prompt —
+            // alive and on screen, so the clients are sent the smaller list.
+            if let Some(remaining) = pending.get(record.id) {
+               updated.push(remaining.clone());
+            }
+            swept.push(SweptPrompt {
+               record: record.with_dests(swept_dests.dests),
+               verdict: swept_dests.verdict,
+               resolution: swept_dests.resolution,
             });
          }
       }
    }
-
-   let mut announced = Vec::new();
-   for prompt in sweep_queued(pending, policy, now, at) {
-      // A queued prompt is not the head, so removing it activates nothing; the field is
-      // still honoured so a prompt can never become the head without being announced.
-      if let Some(activated) = &prompt.activated {
-         announced.push(activated.clone());
-      }
-      swept.push(prompt);
-   }
-   if let Some(survivor) = survivor {
-      announced.push(survivor);
-   }
-   PromptSweep {
-      swept,
-      announced,
-      updated,
-      bounded,
-   }
+   PromptSweep { swept, updated }
 }
 
 /// A rule set view of the store, in insertion order so the tie-break is preserved.
@@ -818,8 +729,8 @@ impl Daemon {
             }
             // Prompts already on screen are answered by the mode switch rather than left
             // to time out and deny a connection the user has just stopped being asked
-            // about. `take_all` also empties the queue, so a silent switch has nothing left
-            // for a policy sweep; queued prompts get `SilentAutoAllowed` right here.
+            // about. `take_all` also empties the set, so a silent switch has nothing left
+            // for a policy sweep; every open prompt gets `SilentAutoAllowed` right here.
             for record in self.pending.take_all() {
                for dest in &record.dests {
                   if let Err(err) = self.answer_packets(&dest.packet_ids, Verdict::Accept) {
@@ -934,10 +845,10 @@ impl Daemon {
          );
       }
 
-      // The rule is in place before the prompt is resolved, because resolving it activates
-      // the next prompt and that one must already be judged by the rule the user just
-      // created. The answered prompt is settled here with the user's own verdict, so an
-      // older rule cannot override an explicit answer.
+      // The rule is in place before the prompt is resolved, because the prompts opened
+      // alongside it must already be judged by the rule the user just created. The answered
+      // prompt is settled here with the user's own verdict, so an older rule cannot override
+      // an explicit answer.
       let now = now_secs();
       let app = record.app_name();
       let dest = match record.dests.as_slice() {
@@ -1009,7 +920,7 @@ impl Daemon {
          record.id
       );
 
-      let Some(resolved) = self.pending.resolve(record.id, Instant::now()) else {
+      let Some(resolved) = self.pending.resolve(record.id) else {
          // A `None` here means the prompt was already settled; answering its packets twice
          // would be a double verdict.
          warn!(
@@ -1031,23 +942,15 @@ impl Daemon {
          self.broadcast_connection(&dest.connection, decide.action, None, true);
       }
 
-      // The prompt activated behind the answer is very often another flow from the same app
-      // and the new rule already decides it, so the sweep settles it (and any decided head
-      // behind it) and announces only the head it stops on. The answered prompt is already
-      // resolved, so it can never be announced here.
+      // Another flow from the same app, or from an app the new rule covers, may already have
+      // its own open prompt; the new rule already decides it, so the sweep settles every
+      // prompt it can and refreshes the ones it shrank. The answered prompt is already
+      // resolved, so it can never be swept here.
       let swept = self.sweep_decided_prompts();
       debug!(
-         "prompt {}: {} (dest {}); {} queued prompt(s) swept",
+         "prompt {}: {} (dest {}); {} open prompt(s) swept",
          record.id, mechanism, rule_dest, swept
       );
-      // Resolve first, then inspect the new head: announce the activated prompt only when it
-      // survived the sweep. When the sweep settled it, it has already announced the head the
-      // queue stops on, and nothing else is visible.
-      if let Some(next) = resolved.activated
-         && self.pending.is_active(next.id)
-      {
-         self.announce_prompt(&next);
-      }
       self.publish_status();
    }
 
@@ -1078,44 +981,21 @@ impl Daemon {
       (created, updated)
    }
 
-   /// Answers the head and the queued prompts that the current policy already decides, so
-   /// the user is not asked about a flow a rule they just created covers.
+   /// Answers the open prompts that the current policy already decides, so the user is not
+   /// asked about a flow a rule they just created covers.
    ///
-   /// The head is swept too: answering a prompt applies its rule *before* the prompt is
-   /// resolved, so the prompt activated behind it is very often another flow from the same
-   /// app and already decided. The surviving head is announced only after the loop stops on
-   /// it, so a prompt that is settled in the same pass is never broadcast.
+   /// Every prompt is live from the moment it is opened, so this sweep visits all of them in
+   /// arrival order and needs no head loop: a prompt the policy decides is answered, one it
+   /// partly decides is refreshed with the destinations still waiting.
    fn sweep_decided_prompts(&mut self) -> usize {
-      let PromptSweep {
-         swept,
-         announced,
-         updated,
-         bounded,
-      } = sweep_decided(
-         &mut self.pending,
-         &mut self.policy,
-         now_secs(),
-         Instant::now(),
-      );
-      if bounded {
-         warn!(
-            "prompt sweep stopped after {} iteration(s) with {} prompt(s) still open; not \
-             looping further",
-            swept.len(),
-            self.pending.len()
-         );
-      }
+      let PromptSweep { swept, updated } =
+         sweep_decided(&mut self.pending, &mut self.policy, now_secs());
       let count = swept.len();
       for swept in swept {
-         // The survivors are announced below, once every prompt has been settled, so this
-         // loop never announces a prompt that a later iteration could settle too.
          self.settle_swept(swept);
       }
       for record in updated {
          self.update_prompt(&record);
-      }
-      for head in announced {
-         self.announce_prompt(&head);
       }
       count
    }
@@ -1130,7 +1010,7 @@ impl Daemon {
       let packets: Vec<u32> = swept.record.packet_ids().collect();
       if let Err(err) = self.answer_packets(&packets, swept.verdict) {
          warn!(
-            "could not answer queued prompt {}'s packets: {err}",
+            "could not answer swept prompt {}'s packets: {err}",
             swept.record.id
          );
       }
@@ -1153,7 +1033,7 @@ impl Daemon {
    }
 
    /// The wire request for `record`: every destination its answer covers, plus the count of
-   /// prompts still queued behind it.
+   /// other prompts open right now.
    fn prompt_request(&self, record: &PromptRecord) -> Option<PromptRequest> {
       Some(PromptRequest {
          id: record.id,
@@ -1161,12 +1041,12 @@ impl Daemon {
          dests: self.views(record),
          timeout_secs: self.config.prompt_timeout_secs,
          domain_scope_available: record.dests.iter().any(|dest| dest.connection.domain.is_some()),
-         pending: self.pending.queued_behind(record.id),
+         pending: self.pending.others_open(record.id),
       })
    }
 
-   /// Makes an activated prompt visible: broadcasts it with the number of prompts still
-   /// queued behind it, and repeats the timeout warning when no client is attached.
+   /// Makes a prompt visible: broadcasts it with the number of other prompts open alongside
+   /// it, and repeats the timeout warning when no client is attached.
    fn announce_prompt(&mut self, record: &PromptRecord) {
       let Some(request) = self.prompt_request(record) else {
          warn!(
@@ -1177,11 +1057,12 @@ impl Daemon {
       };
       let timeout_secs = request.timeout_secs;
       let pending = request.pending;
+      let open = self.pending.len();
       self.ipc.broadcast(&Response::Prompt(request));
       let packets: usize = record.dests.iter().map(|dest| dest.packet_ids.len()).sum();
       match record.dests.as_slice() {
          [dest] => info!(
-            "prompt {} for {} -> {}:{} ({} packet(s) held, {} queued)",
+            "prompt {} for {} -> {}:{} ({} packet(s) held, {} open)",
             record.id,
             dest.connection.app_name(),
             dest.connection.remote.addr,
@@ -1190,13 +1071,18 @@ impl Daemon {
             pending
          ),
          dests => info!(
-            "prompt {} for {} -> {} destinations ({} packet(s) held, {} queued)",
+            "prompt {} for {} -> {} destinations ({} packet(s) held, {} open)",
             record.id,
             record.app_name(),
             dests.len(),
             packets,
             pending
          ),
+      }
+      // A prompt storm is not capped, because a cap would silently deny a flow the user was
+      // never shown; it is made visible instead, once per prompt that crosses the line.
+      if open > MAX_OPEN_PROMPTS {
+         warn!("{open} prompts open at once");
       }
 
       if !self.ipc.is_subscribed() {
@@ -1217,7 +1103,7 @@ impl Daemon {
    }
 
    /// Re-broadcasts a prompt the sweep shrank, so the clients list only the destinations
-   /// that still need an answer. The prompt id, its deadline and its queue position stand.
+   /// that still need an answer. The prompt id and its deadline stand.
    fn update_prompt(&mut self, record: &PromptRecord) {
       let Some(request) = self.prompt_request(record) else {
          warn!(
@@ -1374,35 +1260,22 @@ impl Daemon {
          }
          Opened::Joined(id) => {
             // A second destination of an app whose prompt is already open: the group is
-            // already on screen, so the clients get the longer list and the head keeps its
-            // deadline.
+            // already on screen, so the clients get the longer list and the deadline stands.
             debug!(
                "prompt {id} for {} -> {}:{} joined the open group",
                connection.app_name(),
                connection.remote.addr,
                connection.remote.port
             );
-            if self.pending.is_active(id)
-               && let Some(record) = self.pending.get(id).cloned()
-            {
+            if let Some(record) = self.pending.get(id).cloned() {
                self.announce_prompt(&record);
             }
          }
          Opened::Created(id) => {
-            // Only the head is on screen; a prompt queued behind it waits without a
-            // deadline and is broadcast when it is activated, so it gets its full timeout
-            // while visible.
-            if self.pending.is_active(id) {
-               let record = self.pending.get(id).expect("just opened").clone();
-               self.announce_prompt(&record);
-            } else {
-               debug!(
-                  "prompt {id} for {} -> {}:{} queued behind an open prompt",
-                  connection.app_name(),
-                  connection.remote.addr,
-                  connection.remote.port
-               );
-            }
+            // Every prompt is live from the moment it is created, so it is broadcast at once
+            // with its own deadline; nothing waits behind anything else.
+            let record = self.pending.get(id).expect("just opened").clone();
+            self.announce_prompt(&record);
          }
       }
       self.publish_status();
@@ -1458,10 +1331,11 @@ impl Daemon {
       );
    }
 
-   /// Times out the active prompt, expires grants and prunes the DNS cache.
+   /// Times out every due prompt, expires grants and prunes the DNS cache.
    fn sweep(&mut self, now: Instant) {
-      let expired = self.pending.expired(now);
-      if let Some(resolved) = expired {
+      let expired = self.pending.expired_all(now);
+      let any = !expired.is_empty();
+      for resolved in expired {
          let record = resolved.record;
          let dest = match record.dests.as_slice() {
             [dest] => dest_label(&dest.connection),
@@ -1494,9 +1368,8 @@ impl Daemon {
          for dest in &record.dests {
             self.broadcast_connection(&dest.connection, Action::Deny, None, true);
          }
-         if let Some(next) = resolved.activated {
-            self.announce_prompt(&next);
-         }
+      }
+      if any {
          self.publish_status();
       }
 
@@ -3047,8 +2920,8 @@ mod tests {
       )
    }
 
-   /// A browser opens three destinations and another app opens one; the browser's single
-   /// prompt is the head, and the other app queues behind it.
+   /// A browser opens three destinations and another app opens one; both apps have a live
+   /// prompt from the moment they are opened.
    fn queue_two_apps(pending: &mut PendingPrompts, start: Instant) -> (u64, u64) {
       let timeout = Duration::from_secs(30);
       let browser = pending
@@ -3082,7 +2955,7 @@ mod tests {
       (browser, other)
    }
 
-   /// Three apps, three prompts in arrival order: only the first is the head.
+   /// Three apps, three live prompts in arrival order.
    fn queue_three_apps(pending: &mut PendingPrompts, start: Instant) -> (u64, u64, u64) {
       let timeout = Duration::from_secs(30);
       let first = pending
@@ -3113,10 +2986,9 @@ mod tests {
    }
 
    #[test]
-   fn an_app_wide_rule_sweeps_the_queued_prompt_for_that_app() {
+   fn an_app_wide_rule_sweeps_the_open_prompt_for_that_app() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
-      // The browser group must be *queued* for this sweep, so another app is the head.
       let head = pending
          .open(
             app_conn("/usr/bin/ssh", "198.51.100.24", 22),
@@ -3129,15 +3001,15 @@ mod tests {
       let mut policy = prompting_policy();
       policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
 
-      let swept = sweep_queued(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
-         swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
+         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
          vec![browser],
-         "the queued browser prompt is settled as a whole"
+         "the open browser prompt is settled as a whole"
       );
       assert_eq!(
-         swept[0]
+         sweep.swept[0]
             .record
             .dests
             .iter()
@@ -3147,18 +3019,18 @@ mod tests {
          "every destination of the group is answered"
       );
       assert_eq!(
-         swept[0].verdict,
+         sweep.swept[0].verdict,
          Verdict::Accept,
          "the rule allows every destination"
-      );
-      assert!(
-         pending.is_active(head),
-         "the prompt being answered is never swept"
       );
       assert_eq!(
          pending.len(),
          2,
-         "the head and the other app remain"
+         "the ssh prompt and the other app remain"
+      );
+      assert!(
+         pending.get(head).is_some(),
+         "the prompt being answered is never swept"
       );
       assert!(
          pending.get(other).is_some(),
@@ -3167,7 +3039,7 @@ mod tests {
    }
 
    #[test]
-   fn a_swept_group_never_becomes_the_head_so_the_other_app_keeps_its_deadline() {
+   fn a_swept_group_leaves_every_other_prompt_live_with_its_own_deadline() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let head = pending
@@ -3182,56 +3054,59 @@ mod tests {
       let mut policy = prompting_policy();
       policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
 
-      sweep_queued(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
-         pending.get(other).expect("still queued").deadline,
-         None,
-         "the unrelated prompt is still queued behind the head"
+         pending.get(other).expect("still open").deadline,
+         Some(start + Duration::from_secs(30)),
+         "the unrelated prompt keeps the clock it was opened with"
       );
-      assert!(pending.is_active(head));
-
-      // The other app is activated only when the head's turn ends, and it is still whole.
-      let resolved = pending.resolve(head, start + Duration::from_secs(5)).expect("head is open");
-      let activated = resolved.activated.expect("the other app becomes active");
-      assert_eq!(activated.id, other);
-      assert_eq!(
-         activated.deadline,
-         Some(start + Duration::from_secs(5) + Duration::from_secs(30))
+      assert!(
+         pending.is_active(head),
+         "the oldest prompt is listed first"
       );
-      assert_eq!(pending.len(), 1);
+      assert_eq!(sweep.updated.len(), 0);
       assert!(
          pending.get(browser).is_none(),
          "the swept group was removed"
       );
+
+      // The other app expires on its own clock; nothing ever activated it.
+      let expired = pending.expired_all(start + Duration::from_secs(30));
+      assert_eq!(
+         expired.iter().map(|resolved| resolved.record.id).collect::<Vec<_>>(),
+         vec![head, other]
+      );
    }
 
    #[test]
-   fn the_head_is_never_swept_even_when_the_rule_covers_it() {
+   fn the_oldest_prompt_is_swept_like_any_other() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
-      let (head, _other) = queue_two_apps(&mut pending, start);
+      let (browser, other) = queue_two_apps(&mut pending, start);
       let mut policy = prompting_policy();
       policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
 
-      let swept = sweep_queued(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
-      assert!(
-         swept.iter().all(|swept| swept.record.id != head),
-         "the head is the prompt being answered, not a queued one"
+      assert_eq!(
+         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
+         vec![browser],
+         "every prompt is live, so the oldest is swept too"
       );
       assert!(
-         pending.is_active(head),
-         "the head is still active with its own deadline"
+         pending.get(browser).is_none(),
+         "the decided group is closed"
       );
       assert_eq!(
-         pending.get(head).expect("open").deadline,
-         Some(start + Duration::from_secs(30))
+         pending.get(other).expect("open").deadline,
+         Some(start + Duration::from_secs(30)),
+         "the surviving prompt is still on its original clock"
       );
    }
 
    #[test]
-   fn a_deny_rule_drops_queued_prompts_for_that_app() {
+   fn a_deny_rule_drops_open_prompts_for_that_app() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let (head, other) = queue_two_apps(&mut pending, start);
@@ -3240,98 +3115,33 @@ mod tests {
       rule.action = Action::Deny;
       policy.upsert_rule(rule);
 
-      let swept = sweep_queued(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
-         swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
+         sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
          vec![other]
       );
-      assert_eq!(swept[0].verdict, Verdict::Drop);
-      assert_eq!(swept[0].resolution, Resolution::Denied);
-      assert!(pending.is_active(head));
-   }
-
-   /// The stale-snapshot hazard: a sweep can hold a record that the head's own resolution
-   /// has meanwhile activated. Settling that record must surface its successor, or the new
-   /// head would wait for a deadline and a broadcast that never come.
-   #[test]
-   fn settling_a_record_that_became_the_head_still_activates_the_next_prompt() {
-      let start = Instant::now();
-      let mut pending = PendingPrompts::new();
-      let timeout = Duration::from_secs(30);
-      let first = pending
-         .open(
-            app_conn("/usr/lib/firefox/firefox", "198.51.100.20", 443),
-            10,
-            timeout,
-            start,
-         )
-         .id();
-      let second = pending
-         .open(
-            app_conn("/usr/bin/curl", "198.51.100.21", 443),
-            20,
-            timeout,
-            start,
-         )
-         .id();
-      let third = pending
-         .open(
-            app_conn("/usr/bin/wget", "198.51.100.22", 443),
-            30,
-            timeout,
-            start,
-         )
-         .id();
-
-      // A sweep snapshot taken while the head was still open.
-      let snapshot = pending.queued_records();
-
-      // The head's answer resolves first and activates the second prompt.
-      let answered = pending.resolve(first, start + Duration::from_secs(1)).expect("head is open");
-      assert_eq!(
-         answered.activated.map(|record| record.id),
-         Some(second)
-      );
-      assert!(pending.is_active(second));
-
-      // The sweep now settles a record that is the active head; its resolution must hand
-      // back the next activation rather than leaving it headless.
-      let settled = pending
-         .resolve(snapshot[0].id, start + Duration::from_secs(2))
-         .expect("the record is still open");
-      let activated = settled.activated.expect("settling the head activates the prompt behind it");
-      assert_eq!(activated.id, third);
-      assert_eq!(
-         pending.get(third).expect("open").deadline,
-         Some(start + Duration::from_secs(2) + timeout),
-         "the surviving prompt is a real head with a deadline, not a stranded one"
-      );
-      assert!(pending.is_active(third));
-      assert_eq!(pending.len(), 1);
+      assert_eq!(sweep.swept[0].verdict, Verdict::Drop);
+      assert_eq!(sweep.swept[0].resolution, Resolution::Denied);
+      assert!(pending.get(head).is_some());
    }
 
    #[test]
-   fn sweeping_the_whole_queue_leaves_len_and_next_ids_consistent() {
+   fn sweeping_empties_the_set_and_next_ids_stay_monotonic() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
-      // Only queued prompts can be swept, so resolve the head first and then sweep the next
-      // one once it has been activated: this empties the set through the sweep path.
-      let (first, second, third) = queue_three_apps(&mut pending, start);
+      let (_first, _second, third) = queue_three_apps(&mut pending, start);
       let mut policy = prompting_policy();
+      policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
       policy.upsert_rule(allow_rule_for("/usr/bin/curl"));
       policy.upsert_rule(allow_rule_for("/usr/bin/wget"));
 
-      let swept = sweep_queued(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
       assert_eq!(
-         swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
-         vec![second, third]
+         sweep.swept.len(),
+         3,
+         "every open prompt is settled in one pass"
       );
-
-      // Answering the head leaves the set empty; `len` must reflect the sweep, and the next
-      // prompt must still get a fresh id rather than reusing one that was swept.
-      let head = pending.resolve(first, start).expect("head is open");
-      assert!(head.activated.is_none(), "the queue is empty");
       assert_eq!(pending.len(), 0);
       assert!(pending.is_empty());
 
@@ -3345,22 +3155,22 @@ mod tests {
          .id();
       assert!(
          next > third,
-         "ids are never reused after a sweep emptied the queue"
+         "ids are never reused after a sweep emptied the set"
       );
       assert_eq!(pending.len(), 1);
    }
 
-   /// A new app rule decides the group on screen: the whole group is taken and the app
-   /// behind it is announced, without the decided prompt ever being shown.
+   /// A new app rule decides the open browser group; the other app's prompt was already
+   /// broadcast and needs no re-announcement.
    #[test]
-   fn the_sweep_takes_decided_groups_and_announces_only_the_next_app() {
+   fn the_sweep_takes_decided_groups_without_announcing_anyone() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let (browser, other) = queue_two_apps(&mut pending, start);
       let mut policy = prompting_policy();
       policy.upsert_rule(allow_rule_for("/usr/lib/firefox/firefox"));
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
          sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
@@ -3377,22 +3187,16 @@ mod tests {
          vec![10, 11, 12],
          "every destination of the group is answered"
       );
-      assert_eq!(
-         sweep.announced.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
-         vec![other],
-         "only the other app becomes the head and is announced"
-      );
       assert_eq!(pending.len(), 1, "no browser prompt is left open");
       assert!(
-         pending.is_active(other),
-         "the other app becomes the head"
+         pending.get(other).is_some(),
+         "the other app was already announced when it was opened"
       );
       assert!(
          pending.get(other).expect("open").deadline.is_some(),
-         "the announced prompt carries a fresh deadline"
+         "it kept the deadline it was opened with"
       );
       assert!(sweep.updated.is_empty());
-      assert!(!sweep.bounded);
    }
 
    /// A narrow rule settles the one destination it covers and leaves the rest of the group
@@ -3410,7 +3214,7 @@ mod tests {
          now_secs().saturating_add(crate::policy::GRANT_TTL_SECS),
       );
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
          sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
@@ -3439,17 +3243,20 @@ mod tests {
       );
       assert!(
          pending.is_active(head),
-         "the shrunk group is still the head"
+         "the shrunk group is still listed first"
       );
       assert_eq!(
          pending.get(head).expect("open").deadline,
          Some(start + Duration::from_secs(30)),
-         "the head keeps its deadline"
+         "the prompt keeps its deadline"
       );
       assert_eq!(sweep.updated.len(), 1);
       assert_eq!(sweep.updated[0].id, head);
-      assert!(sweep.announced.is_empty());
-      assert_eq!(pending.get(other).expect("queued").deadline, None);
+      assert_eq!(
+         pending.get(other).expect("open").deadline,
+         Some(start + Duration::from_secs(30)),
+         "the other app is untouched"
+      );
    }
 
    /// A deny rule drops every destination of the decided group with `Verdict::Drop` and
@@ -3464,7 +3271,7 @@ mod tests {
       rule.action = Action::Deny;
       policy.upsert_rule(rule);
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
          sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
@@ -3472,21 +3279,17 @@ mod tests {
       );
       assert_eq!(sweep.swept[0].verdict, Verdict::Drop);
       assert_eq!(sweep.swept[0].resolution, Resolution::Denied);
-      assert_eq!(
-         sweep.announced.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
-         vec![other]
-      );
       assert_eq!(pending.len(), 1);
       assert!(
-         pending.is_active(other),
+         pending.get(other).is_some(),
          "the other app is untouched"
       );
    }
 
-   /// The loop stops at the first prompt the policy cannot decide and announces that prompt,
-   /// which the preceding settled head activated, exactly once.
+   /// A sweep settles every prompt it can in one pass and leaves the undecided ones exactly
+   /// as they were: no successor has to be announced, because they were announced on open.
    #[test]
-   fn the_loop_stops_at_an_undecided_prompt_and_announces_it_once() {
+   fn an_undecided_prompt_is_left_untouched_by_the_sweep() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let (first, second, third) = queue_three_apps(&mut pending, start);
@@ -3498,39 +3301,37 @@ mod tests {
          now_secs().saturating_add(crate::policy::GRANT_TTL_SECS),
       );
 
-      pending.resolve(first, start).expect("head is open");
+      pending.resolve(first).expect("first is open");
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert_eq!(
          sweep.swept.iter().map(|swept| swept.record.id).collect::<Vec<_>>(),
          vec![second]
       );
-      assert_eq!(
-         sweep.announced.iter().map(|prompt| prompt.id).collect::<Vec<_>>(),
-         vec![third],
-         "the first undecided prompt is announced exactly once"
-      );
       assert_eq!(pending.len(), 1);
-      assert!(pending.is_active(third));
+      assert!(
+         pending.is_active(third),
+         "the survivor is still live"
+      );
+      assert_eq!(
+         pending.get(third).expect("open").deadline,
+         Some(start + Duration::from_secs(30)),
+         "the survivor keeps the clock it was opened with"
+      );
    }
 
-   /// A prompt that was already the head when the sweep started is on screen already; the
-   /// sweep stops on it without announcing it a second time.
+   /// A sweep with nothing decided touches nothing at all.
    #[test]
-   fn an_undecided_prompt_that_was_already_the_head_is_not_announced_again() {
+   fn an_undecided_sweep_leaves_every_prompt_alone() {
       let start = Instant::now();
       let mut pending = PendingPrompts::new();
       let (_head, _other) = queue_two_apps(&mut pending, start);
       let mut policy = prompting_policy();
 
-      let sweep = sweep_decided(&mut pending, &mut policy, now_secs(), start);
+      let sweep = sweep_decided(&mut pending, &mut policy, now_secs());
 
       assert!(sweep.swept.is_empty(), "nothing is decided yet");
-      assert!(
-         sweep.announced.is_empty(),
-         "the visible head must not be broadcast twice"
-      );
       assert!(sweep.updated.is_empty());
       assert_eq!(pending.len(), 2);
    }
@@ -3560,7 +3361,7 @@ mod tests {
             start,
          );
       }
-      let record = pending.resolve(id, start).expect("open").record;
+      let record = pending.resolve(id).expect("open").record;
       (id, record)
    }
 
@@ -3655,7 +3456,7 @@ mod tests {
       connection.domain = Some("api.github.com".to_owned());
       let mut pending = PendingPrompts::new();
       let id = pending.open(connection, 10, Duration::from_secs(30), start).id();
-      let record = pending.resolve(id, start).expect("open").record;
+      let record = pending.resolve(id).expect("open").record;
       let decide = |scope| DecideRequest {
          prompt_id: id,
          action: Action::Allow,
