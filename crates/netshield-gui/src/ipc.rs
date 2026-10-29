@@ -1,16 +1,16 @@
 //! The GUI's half of the daemon protocol: one socket thread, a queue and a drain.
 //!
-//! The UI thread must never block on a socket, so all blocking I/O sits on a connection
-//! thread that retries a missing daemon instead of handing the UI an error to handle:
-//! `send` only queues and `poll` only drains. The UI wires this up in a later slice.
+//! `send` writes a frame straight to the socket, from whichever thread produced it, and
+//! `poll` only drains. All reading sits on a connection thread that retries a missing daemon
+//! instead of handing the UI an error to handle.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -20,8 +20,14 @@ use netshield_core::ipc::{
    encode_line,
 };
 
-/// How long a read may block before queued requests are forwarded again.
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long one request write may block. Only a daemon that stopped reading fills the socket
+/// buffer; a frame that cannot be written in this long is dropped and logged.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many frames wait for a socket that is not connected yet. The app's startup burst is
+/// three (`subscribe`, `status`, `listrules`); anything older is dropped once this is full,
+/// because a request that lost its connection is worth less than the newest one.
+const PENDING_CAP: usize = 64;
 
 /// How long to wait before redialling a daemon that is not running.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -149,40 +155,105 @@ fn deliver(events: &Sender<IpcEvent>, waker: &Waker, attend: &Attend, event: Ipc
 
 /// A non-blocking handle to the daemon socket.
 pub struct IpcClient {
-   out: Sender<String>,
+   writer: Writer,
    events: Receiver<IpcEvent>,
    on_prompt: PromptHook,
    /// Shared with the socket thread: whether the root window is on screen.
    attend: Arc<Attend>,
 }
 
-/// A send handle for code that runs outside the main window's frames (the alert viewport's own
-/// callback, which keeps painting while the main window is minimised).
+/// Frames written to the daemon socket, from any thread.
+///
+/// The socket thread publishes its connected socket here after the handshake, so a request
+/// goes out the moment it is sent instead of waiting for a read to time out and forward it.
+/// A frame sent while there is no socket -- the app's startup burst, or anything sent while
+/// the daemon is being redialled -- waits in `pending` and is flushed as soon as the thread
+/// has one.
 #[derive(Clone)]
-pub struct Decider {
-   out: Sender<String>,
+pub struct Writer {
+   shared: Arc<Mutex<WriterState>>,
 }
 
-impl Decider {
-   /// A handle whose requests go nowhere, for `--mock` where no daemon is contacted.
+struct WriterState {
+   /// The connected socket, cloned from the connection thread's.
+   socket: Option<UnixStream>,
+   /// Frames accepted while there was no socket to write them to.
+   pending: VecDeque<String>,
+}
+
+impl Writer {
+   /// A writer with no socket: frames queue and are dropped once the cap is reached.
    ///
-   /// The receiver is drained on a thread of its own so `send` keeps succeeding: a prompt
-   /// answer in `--mock` is discarded by design, not because the daemon thread died.
+   /// This is `--mock`'s sink. `send` must keep succeeding there -- a prompt answer with no
+   /// daemon is discarded by design, not because the transport died.
    pub fn silent() -> Self {
-      let (out, receiver) = mpsc::channel();
-      thread::spawn(move || while receiver.recv().is_ok() {});
-      Self { out }
+      Self::new()
    }
 
-   /// Encodes and queues a request. Returns false if the thread is gone.
+   fn new() -> Self {
+      Self {
+         shared: Arc::new(Mutex::new(WriterState {
+            socket: None,
+            pending: VecDeque::new(),
+         })),
+      }
+   }
+
+   /// Encodes one request and writes it, or queues it until there is a socket.
+   ///
+   /// `false` means the request never left: it could not be encoded, or the socket rejected
+   /// the write. A frame that merely queues returns `true`, exactly as the channel-backed
+   /// queue did.
    pub fn send(&self, request: &Request) -> bool {
       let Some(line) = frame(request) else {
          log::debug!("cannot encode an ipc request");
          return false;
       };
-      self.out.send(line).is_ok()
+      let mut state = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+      match state.socket.as_mut() {
+         Some(socket) => match socket.write_all(line.as_bytes()) {
+            Ok(()) => true,
+            Err(err) => {
+               log::debug!("cannot send an ipc request: {err}");
+               // The reader hits the same dead socket; frames queue until it reconnects.
+               state.socket = None;
+               false
+            }
+         },
+         None => {
+            if state.pending.len() >= PENDING_CAP && state.pending.pop_front().is_some() {
+               log::debug!("dropping an ipc request queued while the daemon was away");
+            }
+            state.pending.push_back(line);
+            true
+         }
+      }
+   }
+
+   /// Publishes a connected socket and flushes everything queued while there was none.
+   ///
+   /// The hello is already on the wire when this is called: the daemon refuses a client that
+   /// does not announce itself first, and every flushed frame has to follow it.
+   fn attach(&self, mut socket: UnixStream) {
+      let mut state = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+      while let Some(line) = state.pending.pop_front() {
+         if let Err(err) = socket.write_all(line.as_bytes()) {
+            log::debug!("cannot send a queued ipc request: {err}");
+            return;
+         }
+      }
+      state.socket = Some(socket);
+   }
+
+   /// Forgets the socket, so later frames queue instead of failing against a dead fd.
+   fn detach(&self) {
+      self.shared.lock().unwrap_or_else(PoisonError::into_inner).socket = None;
    }
 }
+
+/// A send handle for code that runs outside the main window's frames (the alert viewport's
+/// own callback, which keeps painting while the main window is minimised).
+pub type Decider = Writer;
 
 impl IpcClient {
    /// Spawns the connection thread. Never blocks and never fails: connection errors
@@ -191,17 +262,18 @@ impl IpcClient {
    /// Every queued event is followed by a `waker` call, because a hidden or minimised
    /// root window schedules no frame on its own and would otherwise not drain the queue.
    pub fn spawn(socket_path: PathBuf, waker: Waker, on_prompt: PromptHook) -> Self {
-      let (out, out_rx) = mpsc::channel();
+      let writer = Writer::new();
       let (events, events_rx) = mpsc::channel();
       let attend = Arc::new(Attend::new());
       let thread_events = events.clone();
       let thread_waker = Arc::clone(&waker);
       let thread_prompt = Arc::clone(&on_prompt);
       let thread_attend = Arc::clone(&attend);
+      let thread_writer = writer.clone();
       let spawned = thread::Builder::new().name("netshield-ipc".to_owned()).spawn(move || {
          run(
             &socket_path,
-            &out_rx,
+            &thread_writer,
             &thread_events,
             &thread_waker,
             &thread_prompt,
@@ -214,7 +286,7 @@ impl IpcClient {
          let _ = events.send(IpcEvent::Connected(false));
       }
       Self {
-         out,
+         writer,
          events: events_rx,
          on_prompt,
          attend,
@@ -232,13 +304,9 @@ impl IpcClient {
       self.attend.take()
    }
 
-   /// Encodes and queues a request. Returns false if the thread is gone.
+   /// Encodes and writes a request. Returns false if it could not leave the process.
    pub fn send(&self, request: &Request) -> bool {
-      let Some(line) = frame(request) else {
-         log::debug!("cannot encode an ipc request");
-         return false;
-      };
-      self.out.send(line).is_ok()
+      self.writer.send(request)
    }
 
    /// Non-blocking drain for the UI: returns None when there is nothing new.
@@ -248,9 +316,7 @@ impl IpcClient {
 
    /// A cloneable send handle for callbacks that outlive one `App::update` call.
    pub fn decider(&self) -> Decider {
-      Decider {
-         out: self.out.clone(),
-      }
+      self.writer.clone()
    }
 }
 
@@ -284,7 +350,7 @@ fn send_event(events: &Sender<IpcEvent>, waker: &Waker, event: IpcEvent) -> bool
 /// Owns the socket: dial, handshake, serve one connection, then retry forever.
 fn run(
    path: &Path,
-   out: &Receiver<String>,
+   writer: &Writer,
    events: &Sender<IpcEvent>,
    waker: &Waker,
    on_prompt: &PromptHook,
@@ -298,7 +364,9 @@ fn run(
             if !deliver(events, waker, attend, IpcEvent::Connected(true)) {
                return;
             }
-            if converse(stream, out, events, waker, on_prompt, attend) == Flow::Stop {
+            let flow = converse(stream, writer, events, waker, on_prompt, attend);
+            writer.detach();
+            if flow == Flow::Stop {
                return;
             }
          }
@@ -320,25 +388,25 @@ fn run(
 
 /// Serves one connection until it drops or the UI goes away.
 ///
-/// The read timeout is what keeps queued requests moving while the daemon is silent: a
-/// timeout is not an error, it just returns to the top of the loop and forwards again.
+/// The read blocks without a timeout: requests are written by [`Writer::send`] on the thread
+/// that produced them, so nothing has to wake this loop to forward a queue.
 fn converse(
    stream: UnixStream,
-   out: &Receiver<String>,
+   writer: &Writer,
    events: &Sender<IpcEvent>,
    waker: &Waker,
    on_prompt: &PromptHook,
    attend: &Attend,
 ) -> Flow {
-   let mut writer = match stream.try_clone() {
-      Ok(writer) => writer,
+   let mut out = match stream.try_clone() {
+      Ok(out) => out,
       Err(err) => {
          log::debug!("cannot clone the ipc socket: {err}");
          return Flow::Reconnect;
       }
    };
-   if let Err(err) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
-      log::debug!("cannot set the ipc read timeout: {err}");
+   if let Err(err) = out.set_write_timeout(Some(WRITE_TIMEOUT)) {
+      log::debug!("cannot set the ipc write timeout: {err}");
       return Flow::Reconnect;
    }
    let hello = Request::Hello {
@@ -348,28 +416,20 @@ fn converse(
    let Some(line) = frame(&hello) else {
       return Flow::Reconnect;
    };
-   if let Err(err) = writer.write_all(line.as_bytes()) {
+   if let Err(err) = out.write_all(line.as_bytes()) {
       log::debug!("cannot send the ipc hello: {err}");
       return Flow::Reconnect;
    }
+   // Everything queued while there was no socket follows the hello, then senders write here.
+   writer.attach(out);
 
-   // Partial frames survive a read timeout in `buf`, which grows only up to the bound.
    let mut buf = Vec::new();
    let mut reader = BufReader::new(stream);
    loop {
-      match forward(out, &mut writer) {
-         Flow::Continue => {}
-         flow => return flow,
-      }
       let budget = (MAX_FRAME_LEN + 1 - buf.len()) as u64;
       match reader.by_ref().take(budget).read_until(b'\n', &mut buf) {
          Ok(0) => return Flow::Reconnect,
          Ok(_) => {}
-         Err(err)
-            if matches!(
-               err.kind(),
-               ErrorKind::WouldBlock | ErrorKind::TimedOut
-            ) => {}
          Err(err) => {
             log::debug!("ipc read failed: {err}");
             return Flow::Reconnect;
@@ -385,22 +445,6 @@ fn converse(
          if flow != Flow::Continue {
             return flow;
          }
-      }
-   }
-}
-
-/// Writes everything the UI has queued, without blocking.
-fn forward(out: &Receiver<String>, writer: &mut UnixStream) -> Flow {
-   loop {
-      match out.try_recv() {
-         Ok(line) => {
-            if let Err(err) = writer.write_all(line.as_bytes()) {
-               log::debug!("cannot send an ipc request: {err}");
-               return Flow::Reconnect;
-            }
-         }
-         Err(TryRecvError::Empty) => return Flow::Continue,
-         Err(TryRecvError::Disconnected) => return Flow::Stop,
       }
    }
 }
@@ -922,6 +966,56 @@ mod tests {
          },
          other => panic!("expected a message, got {other:?}"),
       }
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn requests_sent_before_the_handshake_are_delivered() {
+      let path = socket_path("pending-flush");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+
+      // Both are sent before the thread has a socket to write them to.
+      assert!(client.send(&Request::Status));
+      assert!(client.send(&Request::ListRules));
+
+      let (mut reader, _writer) = accept_hello(&listener);
+      reader.get_ref().set_read_timeout(Some(WAIT)).expect("set the read timeout");
+      let mut line = String::new();
+      reader.read_line(&mut line).expect("read the status");
+      assert_eq!(
+         decode_line::<Request>(line.as_bytes()).expect("decodable status"),
+         Request::Status
+      );
+      line.clear();
+      reader.read_line(&mut line).expect("read the listrules");
+      assert_eq!(
+         decode_line::<Request>(line.as_bytes()).expect("decodable listrules"),
+         Request::ListRules
+      );
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn a_frame_after_a_silence_is_delivered() {
+      let path = socket_path("silent-read");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, _woken) = counted();
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let (_reader, mut writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+
+      // Well past the old read timeout, then the daemon speaks again.
+      thread::sleep(Duration::from_millis(400));
+      let hello = hello();
+      writer
+         .write_all(&encode_line(&hello).expect("encode the hello"))
+         .expect("write the hello");
+
+      assert_eq!(next_message(&client), hello);
 
       fs::remove_file(&path).expect("remove the socket");
    }
