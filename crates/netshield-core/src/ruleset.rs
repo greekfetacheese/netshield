@@ -36,12 +36,15 @@ impl RuleSet {
       let mut winner: Option<Winner> = None;
 
       for rule in &self.rules {
-         if !rule.enabled || !rule.app.matches(&conn.process) || !rule.dest.matches(conn) {
+         if !rule.enabled || !rule.app.matches(&conn.process) {
             continue;
          }
+         let Some(dest_rank) = rule.dest.matched_rank(conn) else {
+            continue;
+         };
          let candidate = Winner {
             app_rank: app_rank(&rule.app),
-            dest_rank: rule.dest.rank(),
+            dest_rank,
             action: rule.action,
             updated_at: rule.updated_at,
             id: &rule.id,
@@ -597,5 +600,58 @@ mod tests {
       set.replace_all(vec![new.clone()]);
       assert_eq!(set.len(), 1);
       assert_eq!(set.get(&new.id), Some(&new));
+   }
+
+   #[test]
+   fn a_set_ranks_by_the_entry_that_matched() {
+      let subdomains = rule(
+         AppMatcher::Any,
+         DestMatcher::Domain {
+            host: "github.com".to_owned(),
+            subdomains: true,
+         },
+         Action::Allow,
+         0,
+      );
+      let list = rule(
+         AppMatcher::Any,
+         DestMatcher::Set(vec![
+            DestMatcher::Domain {
+               host: "api.github.com".to_owned(),
+               subdomains: false,
+            },
+            DestMatcher::Ip("10.0.0.0/8".parse::<IpNet>().unwrap()),
+         ]),
+         Action::Deny,
+         0,
+      );
+
+      let mut set = RuleSet::new();
+      set.upsert(subdomains.clone());
+      set.upsert(list.clone());
+      assert_eq!(
+         set.evaluate(&firefox_conn()),
+         Outcome::Deny {
+            rule: list.id.clone()
+         },
+         "the list's exact-domain entry outranks the subdomain rule"
+      );
+
+      // The same list, judged against a host none of its entries cover: it must not match at
+      // all, whatever its best entry ranks.
+      let mut other = RuleSet::new();
+      other.upsert(list);
+      other.upsert(subdomains.clone());
+      let gist = Connection {
+         domain: Some("gist.github.com".to_owned()),
+         ..firefox_conn()
+      };
+      assert_eq!(
+         other.evaluate(&gist),
+         Outcome::Allow {
+            rule: subdomains.id.clone()
+         },
+         "a set does not match a host its entries do not cover"
+      );
    }
 }

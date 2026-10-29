@@ -102,49 +102,86 @@ impl AppMatcher {
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum DestMatcher {
    Any,
-   Domain { host: String, subdomains: bool },
+   Domain {
+      host: String,
+      subdomains: bool,
+   },
    Ip(IpNet),
    Port(u16),
+   /// Several destinations governed by one rule, matched as a union.
+   ///
+   /// A rule scoped to a list must not become one row per address in the table, so the list
+   /// lives inside the matcher. [`DestMatcher::from_entries`] is the only constructor: it keeps
+   /// the invariant that a set is never nested, never holds `Any`, never repeats an entry and
+   /// never holds fewer than two entries.
+   Set(Vec<DestMatcher>),
 }
 
 impl DestMatcher {
    /// Returns whether this matcher covers the connection's remote end.
    pub fn matches(&self, conn: &Connection) -> bool {
+      self.matched_rank(conn).is_some()
+   }
+
+   /// The specificity of the entry that matched, or `None` when nothing matches.
+   ///
+   /// This is `RuleSet::evaluate`'s destination key: exact domain 40, subdomain 30, IP 20,
+   /// port 10, any 0, and a set answers with the best of its matching entries — so a list ranks
+   /// exactly as the separate rules it stands for would, not as its most specific entry on every
+   /// flow. The ordering is deliberately independent of the application dimension so application
+   /// scope can be the outer key.
+   pub fn matched_rank(&self, conn: &Connection) -> Option<u8> {
       match self {
-         Self::Any => true,
+         Self::Any => Some(0),
          Self::Domain { host, subdomains } => {
-            let Some(domain) = conn.domain.as_deref() else {
-               return false;
-            };
+            let domain = conn.domain.as_deref()?;
             if domain.eq_ignore_ascii_case(host) {
-               return true;
+               return Some(40);
             }
             if !subdomains {
-               return false;
+               return None;
             }
             let domain = domain.to_ascii_lowercase();
-            domain.len() > host.len() + 1
-               && domain.ends_with(&format!(".{}", host.to_ascii_lowercase()))
+            (domain.len() > host.len() + 1
+               && domain.ends_with(&format!(".{}", host.to_ascii_lowercase())))
+            .then_some(30)
          }
-         Self::Ip(net) => net.contains(conn.remote.addr),
-         Self::Port(port) => conn.remote.port == *port,
+         Self::Ip(net) => net.contains(conn.remote.addr).then_some(20),
+         Self::Port(port) => (conn.remote.port == *port).then_some(10),
+         Self::Set(entries) => entries.iter().filter_map(|entry| entry.matched_rank(conn)).max(),
       }
    }
 
-   /// Specificity used by [`crate::RuleSet::evaluate`]: exact domain 40, subdomain 30,
-   /// IP 20, port 10, any 0. Higher wins, and the ordering is deliberately independent
-   /// of the application dimension so application scope can be the outer key.
-   pub fn rank(&self) -> u8 {
-      match self {
-         Self::Domain {
-            subdomains: false, ..
-         } => 40,
-         Self::Domain {
-            subdomains: true, ..
-         } => 30,
-         Self::Ip(_) => 20,
-         Self::Port(_) => 10,
-         Self::Any => 0,
+   /// Canonicalises a list of destinations into one matcher.
+   ///
+   /// Nested sets are flattened, repeated entries collapse to their first occurrence (so the
+   /// order the user typed survives), a list that contains "anywhere" is "anywhere" — the union
+   /// with everything is everything — and a list of one is simply that entry, which keeps every
+   /// existing single-destination rule byte-identical. An empty list is `None`: a rule that
+   /// matches nothing is not a narrowing, it is a mistake.
+   pub fn from_entries(entries: Vec<Self>) -> Option<Self> {
+      let mut unique: Vec<Self> = Vec::with_capacity(entries.len());
+      for entry in entries {
+         let entry = match entry {
+            Self::Set(nested) => match Self::from_entries(nested) {
+               Some(matcher) => matcher,
+               // An empty nested set contributes nothing.
+               None => continue,
+            },
+            other => other,
+         };
+         if entry == Self::Any {
+            return Some(Self::Any);
+         }
+         if !unique.contains(&entry) {
+            unique.push(entry);
+         }
+      }
+
+      match unique.len() {
+         0 => None,
+         1 => unique.pop(),
+         _ => Some(Self::Set(unique)),
       }
    }
 }
@@ -476,6 +513,13 @@ mod tests {
          },
          DestMatcher::Ip("10.0.0.0/8".parse().unwrap()),
          DestMatcher::Port(53),
+         DestMatcher::Set(vec![
+            DestMatcher::Domain {
+               host: "example.com".to_owned(),
+               subdomains: false,
+            },
+            DestMatcher::Ip("10.0.0.0/8".parse().unwrap()),
+         ]),
       ];
       for dest in dests {
          let json = serde_json::to_string(&dest).unwrap();
@@ -515,6 +559,88 @@ mod tests {
       assert_eq!(
          matcher,
          AppMatcher::Exe(PathBuf::from("/usr/lib/firefox").join(Path::new("firefox")))
+      );
+   }
+
+   #[test]
+   fn from_entries_collapses_dedupes_and_flattens() {
+      let domain = DestMatcher::Domain {
+         host: "github.com".to_owned(),
+         subdomains: false,
+      };
+      let net = DestMatcher::Ip("10.0.0.0/8".parse().unwrap());
+
+      assert_eq!(
+         DestMatcher::from_entries(vec![domain.clone()]),
+         Some(domain.clone()),
+         "one entry must collapse to that matcher"
+      );
+      assert_eq!(DestMatcher::from_entries(Vec::new()), None);
+      assert_eq!(
+         DestMatcher::from_entries(vec![domain.clone(), domain.clone(), net.clone()]),
+         Some(DestMatcher::Set(vec![
+            domain.clone(),
+            net.clone()
+         ])),
+         "duplicates collapse and the typed order is kept"
+      );
+      assert_eq!(
+         DestMatcher::from_entries(vec![
+            DestMatcher::Set(vec![domain.clone()]),
+            net.clone()
+         ]),
+         Some(DestMatcher::Set(vec![
+            domain.clone(),
+            net.clone()
+         ])),
+         "a nested set is flattened"
+      );
+      assert_eq!(
+         DestMatcher::from_entries(vec![domain.clone(), DestMatcher::Any]),
+         Some(DestMatcher::Any),
+         "a union with anywhere is anywhere"
+      );
+      assert_eq!(
+         DestMatcher::from_entries(vec![DestMatcher::Set(vec![DestMatcher::Any])]),
+         Some(DestMatcher::Any),
+         "anywhere nested inside a set still answers for the whole list"
+      );
+   }
+
+   #[test]
+   fn a_set_matches_any_of_its_entries() {
+      let set = DestMatcher::Set(vec![
+         DestMatcher::Domain {
+            host: "example.com".to_owned(),
+            subdomains: false,
+         },
+         DestMatcher::Ip("10.0.0.0/8".parse().unwrap()),
+      ]);
+
+      assert!(
+         set.matches(&Connection {
+            domain: Some("example.com".to_owned()),
+            ..conn()
+         }),
+         "the domain entry matches"
+      );
+      assert!(
+         set.matches(&Connection {
+            domain: None,
+            remote: Endpoint {
+               addr: IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+               port: 443,
+            },
+            ..conn()
+         }),
+         "the address entry matches without a learned name"
+      );
+      assert!(
+         !set.matches(&Connection {
+            domain: Some("gist.github.com".to_owned()),
+            ..conn()
+         }),
+         "an entry that matches alone cannot make the set match"
       );
    }
 }

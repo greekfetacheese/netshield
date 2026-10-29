@@ -176,7 +176,7 @@ def handle_frame(state, conn, msg):
             {
                 "kind": "hello",
                 "value": {
-                    "version": 1,
+                    "version": 2,
                     "daemon_pid": 999,
                     "mode": "alert",
                     "rule_count": 3,

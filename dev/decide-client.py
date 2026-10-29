@@ -72,7 +72,7 @@ def main(argv):
     def send(obj):
         sock.sendall((json.dumps(obj) + "\n").encode())
 
-    send({"kind": "hello", "value": {"version": 1, "client": "gui"}})
+    send({"kind": "hello", "value": {"version": 2, "client": "gui"}})
     send({"kind": "subscribe"})
     print(f"SUBSCRIBED {args.socket}", flush=True)
 
