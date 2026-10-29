@@ -8,7 +8,8 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, TextStyle, Ui};
+use egui_elements::Theme;
 use netshield_core::connection::Family;
 use netshield_core::ipc::{ConnectionView, DecideRequest, PromptRequest, ScopeChoice};
 use netshield_core::rule::{Action, Duration};
@@ -16,14 +17,14 @@ use netshield_core::rule::{Action, Duration};
 /// The host window's width; the panel never outgrows it.
 pub const WIDTH: f32 = 480.0;
 
-/// The host window's height. [`layout_height_estimate`] must stay below it.
+/// The tallest the host window may grow. [`layout_height_estimate`] must stay below it.
 ///
 /// Grown from 404 when the rule preview line was added, and from 440 when a grouped prompt
 /// got the scope picker back: a group now draws the list *and* one scope row, so its stack is
-/// no longer the shorter shape. The measured stack (with a queued prompt) is 410pt, and a
-/// fixed viewport silently clips rather than scrolls, so the window grows once here instead
-/// of resizing per prompt.
-pub const HEIGHT: f32 = 462.0;
+/// no longer the shorter shape. The window now takes the height its content measures, capped
+/// here: a tall prompt cannot outgrow the budget, and a short one no longer sits above a
+/// block of background. The measured stack (with a queued prompt) is 410pt.
+pub const MAX_HEIGHT: f32 = 462.0;
 
 /// Inner margin of the alert panel, in points, applied on all four sides.
 const PANEL_MARGIN: i8 = 14;
@@ -65,31 +66,18 @@ const BUTTON_HEIGHT: f32 = 32.0;
 /// Longest process name drawn before it is elided; the row must stay one line.
 const APP_NAME_CHARS: usize = 30;
 
-/// Character budget of the rule preview line. The alert is only 480pt wide, so the line
-/// is elided to stay one line instead of wrapping into the buttons.
-const RULE_PREVIEW_CHARS: usize = 60;
-
 /// How many destinations the group list shows before the `+N more` remainder.
 ///
 /// Three, not four: the scope control is drawn for a group too and costs one row, so the
-/// list gives that row back. The panel is a fixed size, and a longer list would push the
-/// action buttons past [`HEIGHT`] on the tallest shape.
+/// list gives that row back. A longer list would push the action buttons past
+/// [`MAX_HEIGHT`] on the tallest shape.
 pub const DEST_LINES: usize = 3;
 
-/// Longest app name kept in the rule preview before it is elided.
+/// Longest app name kept in a scope row before it is elided.
 const PREVIEW_APP_CHARS: usize = 20;
 
-/// Longest host kept in the rule preview before it is elided.
+/// Longest host kept in a scope row before it is elided.
 const PREVIEW_HOST_CHARS: usize = 26;
-
-/// Red fill of the Deny button. White text keeps the contrast well above 4.5:1.
-const DENY_FILL: Color32 = Color32::from_rgb(0xB3, 0x2D, 0x2D);
-
-/// Green fill of the Allow button.
-const ALLOW_FILL: Color32 = Color32::from_rgb(0x2E, 0x8B, 0x45);
-
-/// Both action buttons use white text on a saturated fill.
-const BUTTON_TEXT: Color32 = Color32::WHITE;
 
 /// Which destination scope the alert offers for one prompt.
 ///
@@ -452,9 +440,8 @@ impl AlertModel {
 
    /// Builds the `DecideRequest` for the shown prompt and queues it in `outgoing`.
    ///
-   /// The request comes from that prompt's own [`AlertState`], so it is exactly the rule the
-   /// preview line describes. After queueing, the prompt is removed and the alert advances to
-   /// whatever is first in the list.
+   /// The request comes from that prompt's own [`AlertState`]. After queueing, the prompt is
+   /// removed and the alert advances to whatever is first in the list.
    pub fn submit(&mut self, decision: Decision) {
       let Some(prompt) = self.pending.first() else {
          return;
@@ -495,68 +482,6 @@ impl AlertModel {
       if let Some(prompt) = self.pending.first() {
          self.raised.insert(prompt.id);
       }
-   }
-}
-
-/// The rule the current selections would write, as one line:
-/// `allow firefox → anywhere · until restart`.
-///
-/// It renders exactly what [`AlertState::decision`] will send, never what the radios look
-/// like: a scope that is not available for this prompt reads as the scope the decision
-/// actually produces. On a group the list above the picker still shows what prompted the
-/// question, but the sentence names the grant: `anywhere` for the app-wide default, `these N
-/// destinations` only when that is the scope the click sends. Pure, so the wording is
-/// testable without a window.
-pub fn rule_preview(prompt: &PromptRequest, state: &AlertState, action: Action) -> String {
-   let verb = match action {
-      Action::Allow => "allow",
-      Action::Deny => "deny",
-   };
-   let app = elide(&app_name(&prompt.connection), PREVIEW_APP_CHARS);
-   let scope = preview_scope(prompt, state);
-   let duration = duration_label(state.duration);
-   elide(
-      &format!("{verb} {app} → {scope} · {duration}"),
-      RULE_PREVIEW_CHARS,
-   )
-}
-
-/// The duration phrase shared by the preview and the grant sentence.
-fn duration_label(duration: Duration) -> &'static str {
-   match duration {
-      Duration::Once => "once",
-      Duration::Session => "until restart",
-      Duration::Forever => "forever",
-   }
-}
-
-/// The scope phrase the decision will produce, mirroring [`AlertState::decision`].
-///
-/// The app-wide scope reads as `anywhere`, which is what its rule holds. The address scope
-/// renders as the bare address, matching what `DestMatcher::Ip` holds: there is no name to
-/// prefix and no subdomain question, so `only` would add nothing. The group scope names the
-/// count, because the click writes one rule for each of them.
-fn preview_scope(prompt: &PromptRequest, state: &AlertState) -> String {
-   match state.effective_scope(prompt) {
-      Scope::Any => "anywhere".to_owned(),
-      Scope::Address => prompt.connection.remote_ip.to_string(),
-      Scope::Domain => match offered_domain(prompt) {
-         Some(host) => {
-            let host = elide(host, PREVIEW_HOST_CHARS);
-            if state.subdomains {
-               format!("only *.{host}")
-            } else {
-               format!("only {host}")
-            }
-         }
-         // `effective_scope` never returns `Domain` without an offered host; state the
-         // address scope it resolves to rather than inventing a name.
-         None => prompt.connection.remote_ip.to_string(),
-      },
-      Scope::TheseDestinations => format!(
-         "these {} destinations",
-         destinations(prompt).len()
-      ),
    }
 }
 
@@ -653,12 +578,12 @@ fn destination_label(view: &ConnectionView) -> String {
 
 /// Draws the whole alert into `ui`. Returns the chosen action, if any button was pressed.
 ///
-/// The fixed layout is sized for the 480x462 host: app name, destination, duration, scope,
-/// countdown and the action buttons all fit without scrolling. The app row is drawn first so
-/// a future section cannot push it off the top again; [`layout_height_estimate`] is the
-/// budget that guards that. The scope picker is always drawn, a group included: a group's
-/// list is visibly capped, and its default row is the app-wide rule that ends the prompting
-/// for the app instead of writing one rule per address.
+/// The layout is sized for the 480pt-wide host: app name, destination, duration, scope,
+/// countdown and the action buttons all fit without scrolling under [`MAX_HEIGHT`]. The app
+/// row is drawn first so a future section cannot push it off the top again;
+/// [`layout_height_estimate`] is the budget that guards that. The scope picker is always
+/// drawn, a group included: a group's list is visibly capped, and its default row is the
+/// app-wide rule that ends the prompting for the app instead of writing one rule per address.
 ///
 /// `waiting` is the number of *other* prompts open right now. It only adds the `+N waiting`
 /// counter to the app row and the `Later` button to the action row; a lone prompt draws
@@ -681,11 +606,11 @@ pub fn ui(
    // The constants exist to catch a section that outgrows the fixed host window; the
    // matching test below states the spare margin the real layout must leave.
    debug_assert!(
-      layout_height_estimate() <= HEIGHT,
-      "the alert layout outgrew its {HEIGHT}pt host window",
+      layout_height_estimate() <= MAX_HEIGHT,
+      "the alert layout outgrew its {MAX_HEIGHT}pt host window",
    );
 
-   egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
+   panel_frame(ui).show(ui, |ui| {
       ui.add_space(PANEL_TOP_GAP);
       ui.spacing_mut().item_spacing.y = SECTION_GAP;
 
@@ -694,7 +619,16 @@ pub fn ui(
       app_row(ui, view, waiting_label(waiting));
 
       ui.add_space(SECTION_GAP);
-      ui.label(RichText::new("wants to connect to").weak());
+      // The caption belongs to the address below it, not to the section above: xs, not the
+      // section gap, so the two read as one sentence.
+      let theme = Theme::current(ui.ctx());
+      ui.spacing_mut().item_spacing.y = theme.spacing.xs;
+      ui.label(
+         RichText::new("wants to connect to")
+            .text_style(TextStyle::Body)
+            .color(theme.colors.text_muted),
+      );
+      ui.spacing_mut().item_spacing.y = SECTION_GAP;
       destination(ui, view);
       if is_group(prompt) {
          destination_list(ui, prompt);
@@ -726,6 +660,11 @@ pub fn ui(
    action.or_else(|| shortcut_action(ui, waiting))
 }
 
+/// The panel frame: the theme's panel background behind the fixed inner margin.
+fn panel_frame(ui: &Ui) -> egui::Frame {
+   egui::Frame::default().fill(ui.visuals().panel_fill).inner_margin(PANEL_MARGIN)
+}
+
 /// The button row. With a lone prompt this is exactly the Deny/Allow pair it always was.
 ///
 /// `Later` joins to the left of `Deny` only when another prompt is waiting, and the row is
@@ -738,13 +677,15 @@ fn action_row(
 ) -> Option<AlertAction> {
    let mut action = None;
    let row = button_row(waiting);
+   let colors = Theme::current(ui.ctx()).colors;
    if row.len() == 2 {
       // The historical shape, byte for byte: two equal columns, Deny then Allow.
       ui.columns(2, |columns| {
-         let deny =
-            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
          let deny_width = columns[0].available_width();
-         if columns[0].add_sized(egui::vec2(deny_width, BUTTON_HEIGHT), deny).clicked() {
+         let deny = egui_elements::Button::new("Deny")
+            .min_size(egui::vec2(deny_width, BUTTON_HEIGHT))
+            .bg_color(colors.error);
+         if columns[0].add(deny).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -752,12 +693,11 @@ fn action_row(
             )));
          }
 
-         let allow = egui::Button::new(
-            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
-         )
-         .fill(ALLOW_FILL);
          let allow_width = columns[1].available_width();
-         if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
+         let allow = egui_elements::Button::new(allow_label(prompt, state))
+            .min_size(egui::vec2(allow_width, BUTTON_HEIGHT))
+            .bg_color(colors.success);
+         if columns[1].add(allow).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -773,11 +713,10 @@ fn action_row(
    ui.with_layout(
       egui::Layout::right_to_left(egui::Align::Center),
       |ui| {
-         let allow = egui::Button::new(
-            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
-         )
-         .fill(ALLOW_FILL);
-         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), allow).clicked() {
+         let allow = egui_elements::Button::new(allow_label(prompt, state))
+            .min_size(egui::vec2(width, BUTTON_HEIGHT))
+            .bg_color(colors.success);
+         if ui.add(allow).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -785,9 +724,10 @@ fn action_row(
             )));
          }
 
-         let deny =
-            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
-         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), deny).clicked() {
+         let deny = egui_elements::Button::new("Deny")
+            .min_size(egui::vec2(width, BUTTON_HEIGHT))
+            .bg_color(colors.error);
+         if ui.add(deny).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -797,10 +737,7 @@ fn action_row(
 
          if row.contains(&AlertButton::Later) {
             let later = ui
-               .add_sized(
-                  egui::vec2(width, BUTTON_HEIGHT),
-                  egui::Button::new("Later"),
-               )
+               .add(egui_elements::Button::new("Later").min_size(egui::vec2(width, BUTTON_HEIGHT)))
                .on_hover_text(format!(
                   "Show the next prompt · {}",
                   app_name(&prompt.connection)
@@ -835,7 +772,7 @@ fn shortcut_action(ui: &Ui, waiting: usize) -> Option<AlertAction> {
 
 /// Conservative vertical budget of the tallest panel the alert can draw, in points.
 ///
-/// It is deliberately generous: a real render must fit the configured window with room to
+/// It is deliberately generous: a real render must fit under the height cap with room to
 /// spare, and the test below keeps a future section from silently clipping the app row.
 /// The header spare is always counted, even though it is slack rather than a section: the
 /// estimate must not change when a second prompt arrives.
@@ -867,8 +804,8 @@ fn layout_height(group: bool) -> f32 {
       sections += DEST_LINES as f32 * SMALL_ROW + SMALL_ROW;
       sections += SECTION_GAP + SMALL_ROW + 2.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    } else {
-      // The scope label, its three radio rows (with the domain checkbox and the address
-      // row) and the rule preview.
+      // The scope label and its three radio rows (with the domain checkbox and the
+      // address row).
       sections += SECTION_GAP + SMALL_ROW + 3.0 * RADIO_ROW + SECTION_GAP + SMALL_ROW;
    }
    sections
@@ -940,7 +877,6 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
       }
       None => {
          ui.label(RichText::new(endpoint).size(20.0).strong().monospace());
-         ui.label(RichText::new("no hostname was learned for this address").small().weak());
       }
    }
 }
@@ -949,11 +885,14 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
 /// `· +N more` remainder.
 ///
 /// One line per destination, so an answer's reach is visible instead of implied. The cap
-/// keeps a large group from pushing the fixed panel past [`HEIGHT`]; the remainder line
-/// still states how many destinations are not named.
+/// keeps a large group from pushing the panel past [`MAX_HEIGHT`]; the remainder line still
+/// states how many destinations are not named.
 fn destination_list(ui: &mut Ui, prompt: &PromptRequest) {
+   let muted = Theme::current(ui.ctx()).colors.text_muted;
    for line in destination_lines(prompt) {
-      ui.label(RichText::new(line).small().weak());
+      // One style and one bullet for every row, so the indent never depends on the
+      // address family.
+      ui.label(RichText::new(line).text_style(TextStyle::Small).color(muted));
    }
 }
 
@@ -970,12 +909,19 @@ fn protocol_line(view: &ConnectionView) -> String {
    line
 }
 
-/// The duration radios, under a muted `Duration` label.
+/// The duration radios, under a `Duration` heading.
 ///
 /// Radios rather than a pill row: they say the three choices are mutually exclusive, and
 /// there is no orphan `For` label left over from the old layout.
 fn duration_section(ui: &mut Ui, state: &mut AlertState) {
-   ui.label(RichText::new("Duration").small().weak());
+   let theme = Theme::current(ui.ctx());
+   ui.label(
+      RichText::new("Duration")
+         .text_style(TextStyle::Body)
+         .color(theme.colors.text)
+         .strong(),
+   );
+   ui.add_space(theme.spacing.xs);
    ui.horizontal(|ui| {
       for (value, label) in [
          (Duration::Once, "Once"),
@@ -987,11 +933,10 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
    });
 }
 
-/// The scope radios, the subdomain opt-in when the domain row is offered, and the rule
-/// preview.
+/// The scope radios and the subdomain opt-in when the domain row is offered.
 ///
 /// The rows come from [`scope_options`], so the control is the same for one destination and
-/// for a group and its first row is always the default. The muted `Scope` label keeps
+/// for a group and its first row is always the default. The `Scope` heading keeps
 /// `Any connection by <app>` from reading as a fourth duration option. That first label is
 /// deliberately app-wide: the daemon turns `ScopeChoice::AnyConnection` into
 /// `DestMatcher::Any`, i.e. *any destination for this app*, so calling it "This connection"
@@ -1002,7 +947,14 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
 /// row, indented to the radio's *text* rather than its circle, and stays disabled until that
 /// scope is selected.
 fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
-   ui.label(RichText::new("Scope").small().weak());
+   let theme = Theme::current(ui.ctx());
+   ui.label(
+      RichText::new("Scope")
+         .text_style(TextStyle::Body)
+         .color(theme.colors.text)
+         .strong(),
+   );
+   ui.add_space(theme.spacing.xs);
    let selected = state.effective_scope(prompt);
 
    for option in scope_options(prompt) {
@@ -1028,16 +980,6 @@ fn scope_section(ui: &mut Ui, prompt: &PromptRequest, state: &mut AlertState) {
          });
       }
    }
-
-   // The line below the radios states the rule the current selections would write, so the
-   // app-wide scope above cannot be mistaken for a single flow, and a group's default says
-   // `anywhere` even though its destination list above still explains what was asked.
-   ui.label(
-      RichText::new(rule_preview(prompt, state, Action::Allow))
-         .small()
-         .monospace()
-         .weak(),
-   );
 }
 
 /// `Auto-deny in <n>s`, or the denying state once the deadline has passed.
@@ -1087,10 +1029,36 @@ fn endpoint(view: &ConnectionView) -> String {
    SocketAddr::new(view.remote_ip, view.remote_port).to_string()
 }
 
+/// The height the panel measures for `request`, as the real window would take it.
+///
+/// Runs one egui pass at the host width and reads `ui.min_rect().height()` after the same
+/// `ui` call the viewport makes, so the sizing tests need no window.
+#[cfg(test)]
+pub(crate) fn measured_height(request: &PromptRequest, waiting: usize) -> f32 {
+   let ctx = egui::Context::default();
+   crate::theme::install(&ctx);
+   let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+         egui::Pos2::ZERO,
+         egui::vec2(WIDTH, MAX_HEIGHT),
+      )),
+      ..Default::default()
+   };
+   let mut measured = 0.0;
+   let output = ctx.run_ui(input, |root| {
+      let mut state = AlertState::new();
+      ui(root, request, &mut state, 18.0, waiting);
+      measured = root.min_rect().height();
+   });
+   output.drop_without_applying_deltas();
+   measured
+}
+
 #[cfg(test)]
 mod tests {
    use std::net::{IpAddr, Ipv4Addr};
 
+   use egui::Color32;
    use netshield_core::connection::L4Proto;
 
    use super::*;
@@ -1187,14 +1155,6 @@ mod tests {
          state.decision(&request, Action::Allow).scope,
          ScopeChoice::AnyConnection
       );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow firefox → anywhere · until restart"
-      );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Deny),
-         "deny firefox → anywhere · until restart"
-      );
    }
 
    #[test]
@@ -1249,115 +1209,7 @@ mod tests {
             state.decision(&request, Action::Allow).scope,
             ScopeChoice::AnyConnection
          );
-         assert!(
-            !rule_preview(&request, &state, Action::Allow).contains("anywhere"),
-            "the preview must not claim the broad scope"
-         );
       }
-   }
-
-   #[test]
-   fn unknown_app_preview_names_the_address_and_elides_none_of_it() {
-      let request = unknown_prompt(Some("www.google.com"), true);
-      let state = AlertState::new();
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow unknown → only www.google.com · until restart"
-      );
-
-      let mut address = AlertState::new();
-      address.scope = Scope::Address;
-      assert_eq!(
-         rule_preview(&request, &address, Action::Allow),
-         "allow unknown → 142.250.185.78 · until restart"
-      );
-
-      let request = unknown_prompt(None, false);
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow unknown → 142.250.185.78 · until restart"
-      );
-   }
-
-   /// The required example: an IPv6 address renders as the destination it scopes to.
-   #[test]
-   fn address_preview_renders_an_ipv6_destination() {
-      let mut request = unknown_prompt(None, false);
-      request.connection.remote_ip = "2001:4860:482c:400::".parse().expect("an IPv6 address");
-      request.connection.family = Family::V6;
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow unknown → 2001:4860:482c:400:: · until restart"
-      );
-   }
-
-   #[test]
-   fn rule_preview_matches_the_decision_it_previews() {
-      let any = rule_preview(
-         &prompt(Some("www.google.com"), true),
-         &AlertState::new(),
-         Action::Allow,
-      );
-      assert_eq!(any, "allow firefox → anywhere · until restart");
-
-      let mut once = AlertState::new();
-      once.scope = Scope::Domain;
-      once.duration = Duration::Once;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("www.google.com"), true),
-            &once,
-            Action::Allow
-         ),
-         "allow firefox → only www.google.com · once"
-      );
-
-      let mut forever = AlertState::new();
-      forever.scope = Scope::Domain;
-      forever.duration = Duration::Forever;
-      forever.subdomains = true;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("github.com"), true),
-            &forever,
-            Action::Allow
-         ),
-         "allow firefox → only *.github.com · forever"
-      );
-   }
-
-   #[test]
-   fn rule_preview_never_claims_an_unavailable_domain_scope() {
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      assert_eq!(
-         rule_preview(
-            &prompt(Some("www.google.com"), false),
-            &state,
-            Action::Allow
-         ),
-         "allow firefox → anywhere · until restart"
-      );
-   }
-
-   #[test]
-   fn rule_preview_elides_a_long_app_and_domain() {
-      let mut request = prompt(
-         Some("a-very-long-subdomain.and-a-long-domain.example.com"),
-         true,
-      );
-      request.connection.app_name = "an-extremely-long-process-name-that-cannot-fit".to_owned();
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      let line = rule_preview(&request, &state, Action::Allow);
-      assert!(
-         line.chars().count() <= RULE_PREVIEW_CHARS,
-         "preview over budget: {line}"
-      );
-      assert!(
-         line.contains('…'),
-         "expected an ellipsis in: {line}"
-      );
    }
 
    #[test]
@@ -1466,18 +1318,14 @@ mod tests {
       let state = AlertState::new();
 
       assert_eq!(allow_label(&request, &state), "Allow");
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow brave → anywhere · until restart"
-      );
       assert!(
          !destination_lines(&request).is_empty(),
          "the list stays visible: it is what prompted the question"
       );
    }
 
-   /// Switching to the list scope names the count in the button and the sentence, and sends
-   /// the one scope that writes a rule per destination.
+   /// Switching to the list scope names the count in the button, and sends the one scope
+   /// that writes a rule per destination.
    #[test]
    fn choosing_these_destinations_states_the_list() {
       let request = group_of_six();
@@ -1487,10 +1335,6 @@ mod tests {
       assert_eq!(
          allow_label(&request, &state),
          "Allow 6 destinations"
-      );
-      assert_eq!(
-         rule_preview(&request, &state, Action::Allow),
-         "allow brave → these 6 destinations · until restart"
       );
       let decision = state.decision(&request, Action::Allow);
       assert_eq!(decision.scope, ScopeChoice::TheseDestinations);
@@ -1577,10 +1421,317 @@ mod tests {
       assert_eq!(destinations(&request).len(), 1);
       assert_eq!(allow_label(&request, &AlertState::new()), "Allow");
       assert!(destination_lines(&request).is_empty());
-      assert_eq!(
-         rule_preview(&request, &AlertState::new(), Action::Allow),
-         "allow brave → anywhere · until restart"
+   }
+
+   /// Renders one prompt at the host size and returns the text the panel painted.
+   fn rendered_text(request: &PromptRequest) -> String {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, MAX_HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, 0);
+      });
+      let mut text = String::new();
+      collect_text(&output.shapes, &mut text);
+      output.drop_without_applying_deltas();
+      text
+   }
+
+   /// Appends every glyph run in the painted shapes, so a test can read the panel.
+   fn collect_text(shapes: &[egui::epaint::ClippedShape], out: &mut String) {
+      fn collect(shape: &egui::Shape, out: &mut String) {
+         match shape {
+            egui::Shape::Text(text) => {
+               out.push_str(text.galley.text());
+               out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in shapes {
+         collect(&clipped.shape, out);
+      }
+   }
+
+   #[test]
+   fn the_panel_background_is_the_theme_background() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+         let frame = panel_frame(ui);
+         assert_eq!(frame.fill, ui.visuals().panel_fill);
+         assert_ne!(frame.fill, Color32::BLACK);
+      });
+      output.drop_without_applying_deltas();
+   }
+
+   #[test]
+   fn the_unnamed_address_note_is_gone() {
+      let text = rendered_text(&prompt(None, false));
+      assert!(
+         !text.contains("no hostname was learned"),
+         "the note is gone: {text}"
       );
+      assert!(
+         text.contains("142.250.185.78:443"),
+         "the address itself still names the destination: {text}"
+      );
+   }
+
+   /// One painted text run: what it says, where it starts, and how it was styled.
+   #[derive(Debug)]
+   struct PaintedText {
+      text: String,
+      pos: egui::Pos2,
+      font: egui::FontId,
+      color: Color32,
+   }
+
+   /// Renders the whole panel and returns every text run it painted.
+   fn painted(ctx: &egui::Context, request: &PromptRequest) -> Vec<PaintedText> {
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, MAX_HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, 0);
+      });
+      let mut painted = Vec::new();
+      fn collect(shape: &egui::Shape, out: &mut Vec<PaintedText>) {
+         match shape {
+            egui::Shape::Text(text) => {
+               let section = text.galley.job.sections.first().expect("one section");
+               out.push(PaintedText {
+                  text: text.galley.text().to_owned(),
+                  pos: text.pos,
+                  font: section.format.font_id.clone(),
+                  color: section.format.color,
+               });
+            }
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in &output.shapes {
+         collect(&clipped.shape, &mut painted);
+      }
+      output.drop_without_applying_deltas();
+      painted
+   }
+
+   /// Every filled rectangle the panel paints, so a test can read the button fills.
+   fn painted_fills(ctx: &egui::Context, request: &PromptRequest, waiting: usize) -> Vec<Color32> {
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, MAX_HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, waiting);
+      });
+      let mut fills = Vec::new();
+      fn collect(shape: &egui::Shape, out: &mut Vec<Color32>) {
+         match shape {
+            egui::Shape::Rect(rect) => out.push(rect.fill),
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in &output.shapes {
+         collect(&clipped.shape, &mut fills);
+      }
+      output.drop_without_applying_deltas();
+      fills
+   }
+
+   #[test]
+   fn the_buttons_use_the_theme_colours() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let request = prompt(Some("www.google.com"), true);
+
+      // Both action-row branches carry the theme's semantic colours.
+      for waiting in [0usize, 2] {
+         let fills = painted_fills(&ctx, &request, waiting);
+         assert!(
+            fills.contains(&theme.colors.error),
+            "Deny uses the theme's error colour: {fills:?}"
+         );
+         assert!(
+            fills.contains(&theme.colors.success),
+            "Allow uses the theme's success colour: {fills:?}"
+         );
+      }
+   }
+
+   /// A group whose rows cover a named host, an IPv4 endpoint, an IPv6 endpoint and a
+   /// remainder: enough shapes to catch a per-row indent.
+   fn mixed_group() -> PromptRequest {
+      let mut request = prompt(Some("www.google.com"), true);
+      request.connection = dest_view("firefox", "www.google.com", 74);
+      let mut v6 = dest_view("firefox", "", 75);
+      v6.family = Family::V6;
+      v6.remote_ip = IpAddr::V6("2001:4860:482c:400::1".parse().expect("ipv6"));
+      request.dests = vec![
+         request.connection.clone(),
+         dest_view("firefox", "ssl.gstatic.com", 75),
+         v6,
+         dest_view("firefox", "", 76),
+         dest_view("firefox", "fonts.gstatic.com", 77),
+      ];
+      request
+   }
+
+   #[test]
+   fn the_caption_reads_at_body_size() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let body = TextStyle::Body.resolve(&style);
+      let small = TextStyle::Small.resolve(&style);
+
+      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
+      let caption = painted
+         .iter()
+         .find(|run| run.text == "wants to connect to")
+         .expect("the caption is painted");
+      assert_eq!(
+         caption.font, body,
+         "the caption uses the body style"
+      );
+      assert_ne!(
+         caption.font, small,
+         "the caption no longer reads small"
+      );
+      assert_eq!(
+         caption.color, theme.colors.text_muted,
+         "the caption uses the theme's muted colour"
+      );
+   }
+
+   #[test]
+   fn additional_destinations_use_small_typography() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let small = TextStyle::Small.resolve(&style);
+
+      let mut request = prompt(Some("www.google.com"), true);
+      request.dests = vec![
+         request.connection.clone(),
+         dest_view("firefox", "ssl.gstatic.com", 75),
+      ];
+      let painted = painted(&ctx, &request);
+      let rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
+      assert_eq!(rows.len(), 2, "one list row per destination");
+      for row in rows {
+         assert_eq!(
+            row.font, small,
+            "the list row {} is small: {row:?}",
+            row.text
+         );
+         assert_eq!(
+            row.color, theme.colors.text_muted,
+            "the list row {} is muted",
+            row.text
+         );
+      }
+
+      let primary = painted
+         .iter()
+         .find(|run| run.text == "www.google.com")
+         .expect("the primary destination is painted");
+      assert_ne!(
+         primary.font, small,
+         "the primary destination keeps its size"
+      );
+   }
+
+   #[test]
+   fn every_destination_row_shares_one_indent() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let painted = painted(&ctx, &mixed_group());
+      let mut rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
+      rows.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
+      assert_eq!(
+         rows.len(),
+         DEST_LINES + 1,
+         "three rows and the remainder"
+      );
+      let left = rows[0].pos.x;
+      for row in &rows {
+         assert_eq!(
+            row.pos.x, left,
+            "row {} starts at the shared indent",
+            row.text
+         );
+      }
+   }
+
+   #[test]
+   fn section_labels_outrank_their_options() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let style = ctx.global_style();
+      let body = TextStyle::Body.resolve(&style);
+      let small = TextStyle::Small.resolve(&style);
+
+      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
+      for label in ["Duration", "Scope"] {
+         let run = painted
+            .iter()
+            .find(|run| run.text == label)
+            .unwrap_or_else(|| panic!("the {label} label is painted"));
+         assert_eq!(run.font, body, "{label} uses the body style");
+         assert_ne!(run.font, small, "{label} is no longer small");
+         assert_eq!(
+            run.color, theme.colors.text,
+            "{label} uses the body colour"
+         );
+      }
+   }
+
+   #[test]
+   fn the_summary_sentence_is_gone() {
+      for request in [prompt(Some("www.google.com"), true), group_of_six()] {
+         let text = rendered_text(&request);
+         assert!(
+            !text.contains("→ anywhere") && !text.contains("→ these"),
+            "the summary sentence is gone: {text}"
+         );
+      }
    }
 
    #[test]
@@ -1590,7 +1741,7 @@ mod tests {
       let input = egui::RawInput {
          screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(WIDTH, HEIGHT),
+            egui::vec2(WIDTH, MAX_HEIGHT),
          )),
          ..Default::default()
       };
@@ -1665,16 +1816,16 @@ mod tests {
    /// The panel's vertical budget must fit the host window with room to spare.
    ///
    /// [`layout_height_estimate`] counts every section but not this spare margin, so a
-   /// section added without growing [`HEIGHT`] fails here instead of clipping the app row.
+   /// section added without growing [`MAX_HEIGHT`] fails here instead of clipping the app row.
    /// A group is measured too: its capped destination list and its one-row-shorter scope
-   /// block must stay inside the same fixed window as the full single-destination stack.
+   /// block must stay under the same cap as the full single-destination stack.
    #[test]
    fn layout_estimate_leaves_headroom_in_the_host_window() {
       const MARGIN: f32 = 24.0;
       let estimate = layout_height_estimate();
       assert!(
-         HEIGHT > estimate + MARGIN,
-         "layout estimate {estimate} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+         MAX_HEIGHT > estimate + MARGIN,
+         "layout estimate {estimate} + {MARGIN} margin must stay below MAX_HEIGHT {MAX_HEIGHT}"
       );
       let group = layout_height(true);
       assert!(
@@ -1682,14 +1833,41 @@ mod tests {
          "the grouped stack {group} must fit the budget {estimate} it shares with the picker"
       );
       assert!(
-         HEIGHT > group + MARGIN,
-         "grouped stack {group} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+         MAX_HEIGHT > group + MARGIN,
+         "grouped stack {group} + {MARGIN} margin must stay below MAX_HEIGHT {MAX_HEIGHT}"
       );
-      // The list cap is part of the budget: a fourth line would outgrow the fixed window.
+      // The list cap is part of the budget: a fourth line would outgrow the cap.
       assert_eq!(
          destination_lines(&group_of_six()).len(),
          DEST_LINES + 1,
          "three lines plus the remainder is what the estimate counts"
+      );
+   }
+
+   /// A prompt with one destination asks for a shorter window than the cap; the tallest
+   /// shape the estimate budgets for still fits under it.
+   #[test]
+   fn a_short_prompt_measures_short() {
+      let short = prompt(None, false);
+      assert_eq!(
+         scope_options(&short).len(),
+         2,
+         "a named destination would add a scope"
+      );
+      let short_height = measured_height(&short, 0);
+      assert!(
+         short_height < MAX_HEIGHT,
+         "a two-scope prompt measures {short_height}, not the full {MAX_HEIGHT}"
+      );
+
+      let group_height = measured_height(&group_of_six(), 0);
+      assert!(
+         group_height > short_height,
+         "the six-destination list measures {group_height}, taller than {short_height}"
+      );
+      assert!(
+         group_height <= MAX_HEIGHT,
+         "the tallest shape measures {group_height}, within the {MAX_HEIGHT} cap"
       );
    }
 
@@ -1812,10 +1990,6 @@ mod tests {
          allow_label(&presented, model.state_mut()),
          "Allow",
          "the app-wide default on a group writes one rule for the app"
-      );
-      assert_eq!(
-         rule_preview(&presented, model.state_mut(), Action::Allow),
-         "allow brave → anywhere · forever"
       );
    }
 

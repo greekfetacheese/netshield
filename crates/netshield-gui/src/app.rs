@@ -80,6 +80,12 @@ pub struct App {
    /// Answers prompts from inside the alert viewport, where the main window's frames --
    /// and therefore its own `IpcClient` sends -- do not run while it is minimised.
    decider: Decider,
+   /// The inner height the alert viewport was last asked to take, if it has been asked yet.
+   ///
+   /// Shared with the deferred viewport's `'static` paint callback, which measures the panel
+   /// and asks for the new height, and with the prompt hook that centres the window before
+   /// it is painted. `None` means no measurement has happened, so the cap is the size.
+   alert_height: Arc<Mutex<Option<f32>>>,
    /// Last prompt whose window was raised, in both display modes, so the raise commands
    /// are sent once per prompt rather than every frame.
    last_alert_id: Option<u64>,
@@ -162,10 +168,12 @@ impl App {
    pub fn new(cli: Cli) -> Self {
       let ui_waker: UiWaker = Arc::new(Mutex::new(None));
       let alert_model: Arc<Mutex<AlertModel>> = Arc::new(Mutex::new(AlertModel::new()));
+      let alert_height: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
       // Starts `true` to match the builder's `with_visible(true)`: the first frame then
       // hides an idle alert, and a prompt that arrived before that frame only re-shows it.
       let alert_shown = true;
       let model_slot = Arc::clone(&alert_model);
+      let height_slot = Arc::clone(&alert_height);
       let ctx_slot = Arc::clone(&ui_waker);
       let on_prompt = Arc::new(move |prompt: &PromptRequest| {
          let timeout = Duration::from_secs(prompt.timeout_secs);
@@ -186,10 +194,14 @@ impl App {
             let id = alert_viewport_id();
             ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Visible(true));
             if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+               let height = height_slot
+                  .lock()
+                  .unwrap_or_else(std::sync::PoisonError::into_inner)
+                  .unwrap_or(alert::MAX_HEIGHT);
                ctx.send_viewport_cmd_to(
                   id,
                   egui::ViewportCommand::OuterPosition(
-                     centred_position(monitor, egui::vec2(alert::WIDTH, alert::HEIGHT)).into(),
+                     centred_position(monitor, egui::vec2(alert::WIDTH, height)).into(),
                   ),
                );
             }
@@ -231,6 +243,7 @@ impl App {
          prompt_deadlines: HashMap::new(),
          alert_model,
          decider,
+         alert_height,
          last_alert_id: None,
          alert_hidden: false,
          ui_waker,
@@ -560,7 +573,7 @@ impl App {
          // The root window *is* the alert, so it also takes the alert's own size and level.
          ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             alert::WIDTH,
-            alert::HEIGHT,
+            alert::MAX_HEIGHT,
          )));
       }
 
@@ -645,10 +658,11 @@ impl App {
       }
       let model = Arc::clone(&self.alert_model);
       let decider = self.decider.clone();
-      let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
+      let alert_height = Arc::clone(&self.alert_height);
+      let size = egui::vec2(alert::WIDTH, alert::MAX_HEIGHT);
       let mut builder = egui::ViewportBuilder::default()
          .with_title("NetShield")
-         .with_inner_size([alert::WIDTH, alert::HEIGHT])
+         .with_inner_size([alert::WIDTH, alert::MAX_HEIGHT])
          .with_resizable(false)
          .with_always_on_top()
          .with_visible(true)
@@ -658,7 +672,7 @@ impl App {
       }
       ctx.show_viewport_deferred(alert_viewport_id(), builder, move |ui, _class| {
          if model.lock().map(|m| m.prompt().is_some()).unwrap_or(false) {
-            paint_alert(ui, &model, &decider);
+            paint_alert(ui, &model, &decider, &alert_height);
          }
       });
       // The registration above is repeated every pass by design, so only the first one is
@@ -926,6 +940,24 @@ fn alert_viewport_id() -> egui::ViewportId {
    egui::ViewportId::from_hash_of(ALERT_VIEWPORT)
 }
 
+/// Records a measured panel height and returns the inner height to ask the viewport for.
+///
+/// The measurement is rounded up to whole points and capped at [`alert::MAX_HEIGHT`]. A
+/// difference of half a point or less is the same request: returning `None` there is what
+/// keeps a steady panel from issuing a viewport command on every frame. The stored height is
+/// updated only when a new request is returned, and it is also what a re-raise centres on.
+fn request_alert_height(stored: &Mutex<Option<f32>>, measured: f32) -> Option<f32> {
+   let height = measured.ceil().min(alert::MAX_HEIGHT);
+   let mut stored = stored.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+   match *stored {
+      Some(last) if (height - last).abs() <= 0.5 => None,
+      _ => {
+         *stored = Some(height);
+         Some(height)
+      }
+   }
+}
+
 /// Draws the alert into its own viewport and delivers the answer.
 ///
 /// A free function, not a closure over `App`: the callback must be `Send + Sync + 'static`,
@@ -933,7 +965,12 @@ fn alert_viewport_id() -> egui::ViewportId {
 /// drawing, submitting, expiring and sending -- must happen in this callback, because the
 /// main window's `ui` pass does not run while it is minimised, which is exactly when the
 /// alert still has to work.
-fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider: &Decider) {
+fn paint_alert(
+   ui: &mut egui::Ui,
+   model: &std::sync::Mutex<AlertModel>,
+   decider: &Decider,
+   alert_height: &Mutex<Option<f32>>,
+) {
    let ctx = ui.ctx().clone();
    let mut model = model.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -950,7 +987,11 @@ fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider:
          egui::UserAttentionType::Critical,
       ));
       if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
-         let size = egui::vec2(alert::WIDTH, alert::HEIGHT);
+         let height = alert_height
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(alert::MAX_HEIGHT);
+         let size = egui::vec2(alert::WIDTH, height);
          ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
             centred_position(monitor, size).into(),
          ));
@@ -967,6 +1008,18 @@ fn paint_alert(ui: &mut egui::Ui, model: &std::sync::Mutex<AlertModel>, decider:
       Some(alert::AlertAction::Later) => model.later(),
       Some(alert::AlertAction::Previous) => model.previous(),
       None => {}
+   }
+
+   // The panel now takes the height its content measured, capped at the old fixed size, so
+   // a short prompt no longer sits above empty background. The command goes out only when
+   // the rounded height actually changed; a steady panel measures the same every frame.
+   let measured = ui.min_rect().height();
+   if let Some(height) = request_alert_height(alert_height, measured) {
+      ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+         alert::WIDTH,
+         height,
+      )));
+      log::debug!("alert viewport height set to {height}");
    }
    if model.is_expired(std::time::Instant::now()) {
       model.clear();
@@ -1153,6 +1206,52 @@ mod tests {
       assert_eq!(
          app.model().prompt().map(|open| open.dests.len()),
          Some(6)
+      );
+   }
+
+   /// The same panel measures the same every frame, so only the first one asks for a size.
+   #[test]
+   fn the_window_height_is_requested_once() {
+      let stored: Mutex<Option<f32>> = Mutex::new(None);
+      let request = prompt(7);
+      let measured = alert::measured_height(&request, 0);
+
+      let first =
+         request_alert_height(&stored, measured).expect("the first measurement asks for a height");
+      assert_eq!(
+         *stored.lock().expect("height lock"),
+         Some(first),
+         "the requested height is stored"
+      );
+      assert_eq!(
+         request_alert_height(&stored, alert::measured_height(&request, 0)),
+         None,
+         "the same content issues no second request"
+      );
+      assert_eq!(
+         *stored.lock().expect("height lock"),
+         Some(first),
+         "the stored height did not change"
+      );
+   }
+
+   /// A prompt that grows from one destination to six asks for a taller window again.
+   #[test]
+   fn a_growing_prompt_asks_for_a_taller_window() {
+      let stored: Mutex<Option<f32>> = Mutex::new(None);
+      let short = request_alert_height(&stored, alert::measured_height(&prompt(7), 0))
+         .expect("the single destination asks for a height");
+
+      let grown = request_alert_height(&stored, alert::measured_height(&group(7, 6), 0))
+         .expect("the six destinations ask again");
+      assert!(
+         grown > short,
+         "the grown prompt asks for {grown}, above the single destination's {short}"
+      );
+      assert_eq!(
+         *stored.lock().expect("height lock"),
+         Some(grown),
+         "the taller request replaces the stored height"
       );
    }
 
