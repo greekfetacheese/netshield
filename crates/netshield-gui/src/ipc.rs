@@ -439,12 +439,12 @@ mod tests {
    }
 
    #[test]
-   fn handshake_sends_gui_hello_and_reports_the_daemon() {
+   fn the_handshake_and_the_outbound_queue() {
       let path = socket_path("handshake");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
       let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
-      let (_reader, mut writer) = accept_hello(&listener);
+      let (mut reader, mut writer) = accept_hello(&listener);
 
       let hello = hello();
       writer
@@ -454,17 +454,7 @@ mod tests {
       wait_connected(&client, true);
       assert_eq!(next_message(&client), hello);
 
-      fs::remove_file(&path).expect("remove the socket");
-   }
-
-   #[test]
-   fn forwards_queued_requests() {
-      let path = socket_path("forward");
-      let listener = UnixListener::bind(&path).expect("bind the listener");
-      let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
-      let (mut reader, _writer) = accept_hello(&listener);
-
+      // A queued request reaches the daemon, encoded as the protocol's own frame.
       assert!(client.send(&Request::Status));
       let mut line = String::new();
       reader.read_line(&mut line).expect("read the status");
@@ -511,46 +501,8 @@ mod tests {
    }
 
    #[test]
-   fn the_waker_fires_for_a_prompt_and_stays_quiet_when_idle() {
+   fn the_waker_and_the_prompt_hook_order() {
       let path = socket_path("wake");
-      let listener = UnixListener::bind(&path).expect("bind the listener");
-      let (waker, woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
-      let (_reader, mut writer) = accept_hello(&listener);
-      wait_connected(&client, true);
-
-      // Connected(true) is the only wake so far; a quiet socket must add none, or the
-      // thread would spin the UI for the whole session.
-      let settled = woken.load(Ordering::SeqCst);
-      thread::sleep(Duration::from_millis(300));
-      assert_eq!(
-         woken.load(Ordering::SeqCst),
-         settled,
-         "an idle connection must not keep waking the ui"
-      );
-
-      writer
-         .write_all(&encode_line(&hello()).expect("encode the hello"))
-         .expect("write the hello");
-      assert_eq!(next_message(&client), hello());
-
-      // The wake must cover the message itself, not only the connection event that
-      // preceded it: a minimised window has no other way to learn a prompt arrived.
-      let deadline = Instant::now() + WAIT;
-      while woken.load(Ordering::SeqCst) == settled && Instant::now() < deadline {
-         thread::sleep(Duration::from_millis(20));
-      }
-      assert!(
-         woken.load(Ordering::SeqCst) > settled,
-         "a prompt must wake the ui"
-      );
-
-      fs::remove_file(&path).expect("remove the socket");
-   }
-
-   #[test]
-   fn the_prompt_hook_runs_before_the_wake_that_publishes_the_prompt() {
-      let path = socket_path("hook");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
       // The hook snapshots the wake count as it fires: equal to the count from before the
@@ -567,8 +519,18 @@ mod tests {
       let client = IpcClient::spawn(path.clone(), waker, hook);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
-      let wakes = woken.load(Ordering::SeqCst);
 
+      // Connected(true) is the only wake so far; a quiet socket must add none, or the
+      // thread would spin the UI for the whole session.
+      let settled = woken.load(Ordering::SeqCst);
+      thread::sleep(Duration::from_millis(300));
+      assert_eq!(
+         woken.load(Ordering::SeqCst),
+         settled,
+         "an idle connection must not keep waking the ui"
+      );
+
+      let wakes = woken.load(Ordering::SeqCst);
       let frame = prompt(1);
       writer
          .write_all(&encode_line(&frame).expect("encode the prompt"))
@@ -576,6 +538,9 @@ mod tests {
 
       assert_eq!(next_message(&client), frame);
       assert_eq!(*seen.lock().expect("lock the hook"), vec![1]);
+      // The hook must run before the wake that publishes the prompt: the wake must cover the
+      // message itself, not only the connection event that preceded it. A minimised window
+      // has no other way to learn a prompt arrived.
       assert_eq!(
          at_hook.load(Ordering::SeqCst),
          wakes,
@@ -583,7 +548,7 @@ mod tests {
       );
       assert!(
          woken.load(Ordering::SeqCst) > wakes,
-         "the prompt still wakes the main window"
+         "a prompt must wake the ui"
       );
 
       fs::remove_file(&path).expect("remove the socket");

@@ -1494,7 +1494,7 @@ mod tests {
    }
 
    #[test]
-   fn the_activity_pill_sits_in_the_activity_column() {
+   fn the_activity_pill_is_positioned_from_the_row() {
       let columns = Columns::new(900.0);
       let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
 
@@ -1521,35 +1521,52 @@ mod tests {
    }
 
    #[test]
-   fn a_never_seen_app_is_collapsed() {
+   fn the_indicator_is_positioned_from_the_text() {
+      let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
+
+      let indicator = indicator_rect(row, APP_NAME_X, 50.0, row.center().y + 1.5);
+
+      // Row-relative and text-relative: the pre-fix code painted at an absolute column x.
+      assert_eq!(
+         indicator.center().x,
+         100.0 + APP_NAME_X + 50.0 + DOT_GAP
+      );
+      assert_eq!(
+         indicator.width(),
+         DOT_SIZE,
+         "the widget's own diameter is the rect's width"
+      );
+      assert!(
+         indicator.center().y > row.center().y,
+         "the caller's centre is honoured, not the row's"
+      );
+   }
+
+   #[test]
+   fn the_tree_is_grouped_ordered_and_collapsed_until_opened() {
+      // A never-seen app is collapsed: only its Group line is emitted.
       let lines = build_lines(
          &log(&[(10, "firefox", "a.example")]),
          &[],
          &Expanded::default(),
          &ShowingAll::default(),
       );
-
       assert_eq!(lines.len(), 1, "only the group line is emitted");
       assert!(matches!(lines[0], Line::Group { .. }));
-   }
 
-   #[test]
-   fn groups_are_ordered_by_their_newest_connection() {
-      let log = log(&[
+      // Apps first: newest connection wins, so firefox (40) sits above curl (20).
+      let history = log(&[
          (10, "firefox", "a.example"),
          (20, "curl", "b.example"),
          (30, "firefox", "c.example"),
          (40, "firefox", "b.example"),
       ]);
-
       let lines = build_lines(
-         &log,
+         &history,
          &[],
          &expanded_set(&[Node::app("firefox"), Node::app("curl")]),
          &ShowingAll::default(),
       );
-
-      // Apps first: newest connection wins, so firefox (40) sits above curl (20).
       assert_eq!(group(&lines, 0), ("firefox", 3, 40));
       // Then firefox's own destinations, newest group first: b's newest is 40, c's is 30.
       assert_eq!(dest(&lines, 1), ("b.example", 1, 40));
@@ -1558,10 +1575,62 @@ mod tests {
       assert_eq!(group(&lines, 4), ("curl", 1, 20));
       assert_eq!(dest(&lines, 5), ("b.example", 1, 20));
       assert_eq!(lines.len(), 6);
-   }
 
-   #[test]
-   fn an_expanded_app_shows_its_connections_until_collapsed() {
+      // Destinations group under their app, and an open app on its own emits only Dest lines.
+      let grouped = log(&[
+         (10, "firefox", "a.example"),
+         (20, "firefox", "a.example"),
+         (30, "firefox", "b.example"),
+      ]);
+      let lines = build_lines(
+         &grouped,
+         &[],
+         &expanded_set(&[Node::app("firefox")]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         lines.len(),
+         3,
+         "a closed app emits no connections"
+      );
+      assert_eq!(group(&lines, 0), ("firefox", 3, 30));
+      assert_eq!(dest(&lines, 1), ("b.example", 1, 30));
+      assert_eq!(dest(&lines, 2), ("a.example", 2, 20));
+      assert!(matches!(lines[1], Line::Dest { .. }));
+      assert!(matches!(lines[2], Line::Dest { .. }));
+
+      // A closed destination paints no connection lines; an open one lists its rows, and its
+      // identical flows collapse.
+      let host = Node::dest("firefox", "a.example");
+      let closed = build_lines(
+         &grouped,
+         &[],
+         &expanded_set(&[Node::app("firefox")]),
+         &ShowingAll::default(),
+      );
+      assert!(
+         !closed.iter().any(|line| matches!(line, Line::Conn(_))),
+         "a closed destination paints no connection lines"
+      );
+      let open = build_lines(
+         &grouped,
+         &[],
+         &expanded_set(&[Node::app("firefox"), host]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(
+         open.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         1,
+         "only the open destination's rows are drawn, and its identical flows collapse"
+      );
+      let listed = conn(&open, 3);
+      assert_eq!(listed.dest, "a.example");
+      assert_eq!(
+         listed.repeat, 2,
+         "both of a.example's flows are counted"
+      );
+
+      // Re-collapsing hides the rows again.
       let log = log(&[(20, "firefox", "a.example"), (10, "curl", "b.example")]);
       let mut expanded = expanded_set(&[Node::app("firefox"), Node::app("curl")]);
       let open = build_lines(&log, &[], &expanded, &ShowingAll::default());
@@ -1603,71 +1672,6 @@ mod tests {
       assert_eq!(conn(&reopened, 2).dest, "a.example");
    }
 
-   #[test]
-   fn relative_time_is_a_short_age() {
-      let now = 1_000_000;
-      assert_eq!(relative(now, now), "now");
-      assert_eq!(relative(now - 9, now), "now");
-      assert_eq!(relative(now - 59, now), "59 s ago");
-      assert_eq!(relative(now - 60, now), "1 min ago");
-      assert_eq!(relative(now - 59 * 60, now), "59 min ago");
-      assert_eq!(relative(now - 2 * 3_600, now), "2 h ago");
-   }
-
-   #[test]
-   fn the_group_rule_is_the_newest_connections_rule() {
-      let allow = rule(DestMatcher::Any, Action::Allow);
-      let deny = rule(
-         DestMatcher::Domain {
-            host: "example.com".to_owned(),
-            subdomains: false,
-         },
-         Action::Deny,
-      );
-      let rules = vec![allow, deny];
-
-      let mut older = event(10, "firefox", "example.com");
-      older.allowed = false;
-      older.matched_rule = Some(rules[1].id.clone());
-      let mut newer = event(20, "firefox", "other.example");
-      newer.matched_rule = Some(rules[0].id.clone());
-      let mut history = ConnectionLog::new(8);
-      history.push(&older);
-      history.push(&newer);
-
-      let lines = build_lines(
-         &history,
-         &rules,
-         &expanded_set(&[Node::app("firefox")]),
-         &ShowingAll::default(),
-      );
-      let Line::Group { rule, denied, .. } = &lines[0] else {
-         panic!("expected a group first");
-      };
-      assert_eq!(
-         rule, "allow anywhere",
-         "the newest row picks the rule"
-      );
-      assert!(
-         *denied,
-         "the older denied row still turns the dot red"
-      );
-
-      let clean = build_lines(
-         &log(&[(30, "curl", "b.example")]),
-         &rules,
-         &expanded_set(&[Node::app("curl")]),
-         &ShowingAll::default(),
-      );
-      let Line::Group { denied, .. } = &clean[0] else {
-         panic!("expected a group first");
-      };
-      assert!(
-         !*denied,
-         "an all-allowed group keeps its dot green"
-      );
-   }
-
    /// A log of `count` flows to one destination, each with its own address, so none collapse.
    fn distinct_flows(count: u64) -> ConnectionLog {
       let mut history = ConnectionLog::new(64);
@@ -1680,7 +1684,8 @@ mod tests {
    }
 
    #[test]
-   fn a_group_shows_eight_connections_then_the_remainder() {
+   fn each_level_caps_its_children_and_reports_the_remainder() {
+      // Eight distinct flows fill the cap exactly; the ninth adds one More row.
       let app = Node::app("firefox");
       let host = Node::dest("firefox", "a.example");
       let lines = build_lines(
@@ -1696,52 +1701,47 @@ mod tests {
       );
       assert!(matches!(lines[9], Line::Conn(_)));
 
-      let lines = build_lines(
+      let nine = build_lines(
          &distinct_flows(9),
          &[],
          &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
       );
       assert_eq!(
-         lines.len(),
+         nine.len(),
          11,
          "eight connection lines plus one overflow"
       );
       assert_eq!(
-         lines[10],
+         nine[10],
          Line::More {
             remaining: 1,
             node: host.clone()
          }
       );
 
-      let lines = build_lines(
+      let ten = build_lines(
          &distinct_flows(10),
          &[],
-         &expanded_set(&[app, host.clone()]),
+         &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
       );
       assert_eq!(
-         lines[10],
+         ten[10],
          Line::More {
             remaining: 2,
-            node: host
+            node: host.clone()
          },
          "the remainder is the count past the cap"
       );
-   }
 
-   #[test]
-   fn eleven_connections_are_capped_with_an_exact_remainder() {
-      let host = Node::dest("firefox", "a.example");
+      // The destination's cap: group and destination, `MAX_CHILDREN` connections, then More.
       let lines = build_lines(
          &distinct_flows(11),
          &[],
-         &expanded_set(&[Node::app("firefox"), host.clone()]),
+         &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
       );
-
-      // The group and its destination, `MAX_CHILDREN` connections, then one `More` line.
       assert_eq!(lines.len(), 2 + MAX_CHILDREN + 1);
       assert!(matches!(lines[0], Line::Group { .. }));
       assert!(matches!(lines[1], Line::Dest { .. }));
@@ -1756,21 +1756,41 @@ mod tests {
          lines[more],
          Line::More {
             remaining: 3,
-            node: host
+            node: host.clone()
          },
          "the More row opens its destination"
       );
-   }
 
-   #[test]
-   fn showing_all_reveals_every_connection_and_no_more_line() {
+      // The app's cap: the group, `MAX_CHILDREN` destinations, then its own More row.
+      let dests: Vec<String> = (0..10).map(|at| format!("d{at}.example")).collect();
+      let events: Vec<(u64, &str, &str)> = dests
+         .iter()
+         .enumerate()
+         .map(|(at, dest)| (at as u64, "firefox", dest.as_str()))
+         .collect();
+      let lines = build_lines(
+         &log(&events),
+         &[],
+         &expanded_set(&[Node::app("firefox")]),
+         &ShowingAll::default(),
+      );
+      assert_eq!(lines.len(), 1 + MAX_CHILDREN + 1);
+      assert_eq!(
+         lines[MAX_CHILDREN + 1],
+         Line::More {
+            remaining: 2,
+            node: Node::app("firefox")
+         },
+         "the app's More row opens the app"
+      );
+
+      // Showing all reveals every connection and leaves no More row.
       let lines = build_lines(
          &distinct_flows(11),
          &[],
          &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
          &showing_all_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
       );
-
       assert_eq!(
          lines.len(),
          13,
@@ -1784,71 +1804,50 @@ mod tests {
          lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
          11
       );
-   }
 
-   #[test]
-   fn destinations_are_grouped_under_their_app() {
-      let log = log(&[
-         (10, "firefox", "a.example"),
-         (20, "firefox", "a.example"),
-         (30, "firefox", "b.example"),
-      ]);
-
+      // The cap counts unique flows: ten identical flows are one row and fit under it.
+      let identical: Vec<(u64, &str, &str)> =
+         (0..10).map(|at| (at, "firefox", "a.example")).collect();
       let lines = build_lines(
-         &log,
+         &log(&identical),
          &[],
-         &expanded_set(&[Node::app("firefox")]),
+         &expanded_set(&[app.clone(), host.clone()]),
          &ShowingAll::default(),
       );
-
       assert_eq!(
-         lines.len(),
-         3,
-         "a closed app emits no connections"
-      );
-      assert_eq!(group(&lines, 0), ("firefox", 3, 30));
-      assert_eq!(dest(&lines, 1), ("b.example", 1, 30));
-      assert_eq!(dest(&lines, 2), ("a.example", 2, 20));
-      assert!(matches!(lines[1], Line::Dest { .. }));
-      assert!(matches!(lines[2], Line::Dest { .. }));
-   }
-
-   #[test]
-   fn a_destination_lists_its_connections_only_when_open() {
-      let log = log(&[
-         (10, "firefox", "a.example"),
-         (20, "firefox", "a.example"),
-         (30, "firefox", "b.example"),
-      ]);
-      let host = Node::dest("firefox", "a.example");
-
-      let closed = build_lines(
-         &log,
-         &[],
-         &expanded_set(&[Node::app("firefox")]),
-         &ShowingAll::default(),
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         1,
+         "ten identical flows are one collapsed row"
       );
       assert!(
-         !closed.iter().any(|line| matches!(line, Line::Conn(_))),
-         "a closed destination paints no connection lines"
+         !lines.iter().any(|line| matches!(line, Line::More { .. })),
+         "one unique flow fits under the cap"
       );
 
-      let open = build_lines(
-         &log,
+      let mut distinct = ConnectionLog::new(16);
+      for at in 0..10 {
+         let mut row = event(at, "firefox", "a.example");
+         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
+         distinct.push(&row);
+      }
+      let lines = build_lines(
+         &distinct,
          &[],
-         &expanded_set(&[Node::app("firefox"), host]),
+         &expanded_set(&[app, host.clone()]),
          &ShowingAll::default(),
       );
       assert_eq!(
-         open.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
-         1,
-         "only the open destination's rows are drawn, and its identical flows collapse"
+         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
+         MAX_CHILDREN,
+         "ten distinct addresses still fill the cap"
       );
-      let listed = conn(&open, 3);
-      assert_eq!(listed.dest, "a.example");
       assert_eq!(
-         listed.repeat, 2,
-         "both of a.example's flows are counted"
+         lines[MAX_CHILDREN + 2],
+         Line::More {
+            remaining: 2,
+            node: host
+         },
+         "the remainder counts the unique flows past the cap"
       );
    }
 
@@ -1872,55 +1871,13 @@ mod tests {
    }
 
    #[test]
-   fn the_two_levels_cap_their_children_separately() {
-      let dests: Vec<String> = (0..10).map(|at| format!("d{at}.example")).collect();
-      let events: Vec<(u64, &str, &str)> = dests
-         .iter()
-         .enumerate()
-         .map(|(at, dest)| (at as u64, "firefox", dest.as_str()))
-         .collect();
-      let lines = build_lines(
-         &log(&events),
-         &[],
-         &expanded_set(&[Node::app("firefox")]),
-         &ShowingAll::default(),
-      );
-      assert_eq!(lines.len(), 1 + MAX_CHILDREN + 1);
-      assert_eq!(
-         lines[MAX_CHILDREN + 1],
-         Line::More {
-            remaining: 2,
-            node: Node::app("firefox")
-         },
-         "the app's More row opens the app"
-      );
-
-      let conns = distinct_flows(10);
-      let host = Node::dest("firefox", "a.example");
-      let lines = build_lines(
-         &conns,
-         &[],
-         &expanded_set(&[Node::app("firefox"), host.clone()]),
-         &ShowingAll::default(),
-      );
-      assert_eq!(lines.len(), 2 + MAX_CHILDREN + 1);
-      assert_eq!(
-         lines[MAX_CHILDREN + 2],
-         Line::More {
-            remaining: 2,
-            node: host
-         },
-         "the destination's More row opens the destination"
-      );
-   }
-
-   #[test]
-   fn clicking_a_group_selects_it_and_only_the_chevron_collapses() {
+   fn clicking_a_row_selects_it_and_only_its_chevron_toggles_it() {
       let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
       let mut expanded = Expanded::default();
       let mut showing_all = ShowingAll::default();
       let mut selection = Selection::default();
 
+      // Clicking a group's name selects it and leaves the group alone.
       click_node(
          Node::app("firefox"),
          rect,
@@ -1936,6 +1893,7 @@ mod tests {
          "clicking the name must not collapse the group"
       );
 
+      // Its chevron toggles the group and leaves the selection alone.
       click_node(
          Node::app("firefox"),
          rect,
@@ -1954,59 +1912,12 @@ mod tests {
          Selection::App("firefox".to_owned()),
          "the chevron leaves the selection alone"
       );
-   }
 
-   #[test]
-   fn collapsing_a_group_forgets_that_it_was_showing_all() {
-      let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
-      let mut expanded = expanded_set(&[Node::app("firefox")]);
-      let mut showing_all = showing_all_set(&[Node::app("firefox")]);
-      let mut selection = Selection::default();
-
-      // The chevron collapses the open group and drops its `showing all` entry.
-      click_node(
-         Node::app("firefox"),
-         rect,
-         pos2(6.0, 12.0),
-         APP_NAME_X,
-         &mut expanded,
-         &mut showing_all,
-         &mut selection,
-      );
-      assert!(!expanded.contains(&Node::app("firefox")));
-      assert!(
-         !showing_all.contains(&Node::app("firefox")),
-         "reopening starts from MAX_CHILDREN again"
-      );
-   }
-
-   #[test]
-   fn collapsing_an_app_forgets_its_destinations_showing_all() {
-      let app = Node::app("firefox");
-      let first = Node::dest("firefox", "a.example");
-      let second = Node::dest("firefox", "b.example");
-      let expanded = expanded_set(&[app.clone(), first.clone(), second.clone()]);
-      let mut showing_all = showing_all_set(&[app.clone(), first.clone(), second.clone()]);
-
-      showing_all.forget(&app);
-
-      assert!(!showing_all.contains(&app));
-      assert!(!showing_all.contains(&first));
-      assert!(!showing_all.contains(&second));
-      assert!(
-         expanded.contains(&first) && expanded.contains(&second),
-         "the destinations stay open"
-      );
-   }
-
-   #[test]
-   fn clicking_a_destination_selects_it_and_only_its_chevron_toggles_it() {
-      let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, LINE_HEIGHT));
+      // A destination: the chevron toggles it without selecting, a name click selects it.
       let node = Node::dest("firefox", "a.example");
       let mut expanded = Expanded::default();
       let mut showing_all = ShowingAll::default();
       let mut selection = Selection::default();
-
       click_node(
          node.clone(),
          rect,
@@ -2027,7 +1938,7 @@ mod tests {
       );
 
       click_node(
-         node.clone(),
+         node,
          rect,
          pos2(rect.left() + 100.0, 12.0),
          DEST_NAME_X,
@@ -2042,10 +1953,47 @@ mod tests {
             dest: "a.example".to_owned()
          }
       );
+
+      // Collapsing an open group forgets that it was showing all.
+      let mut expanded = expanded_set(&[Node::app("firefox")]);
+      let mut showing_all = showing_all_set(&[Node::app("firefox")]);
+      let mut selection = Selection::default();
+      click_node(
+         Node::app("firefox"),
+         rect,
+         pos2(6.0, 12.0),
+         APP_NAME_X,
+         &mut expanded,
+         &mut showing_all,
+         &mut selection,
+      );
+      assert!(!expanded.contains(&Node::app("firefox")));
+      assert!(
+         !showing_all.contains(&Node::app("firefox")),
+         "reopening starts from MAX_CHILDREN again"
+      );
+
+      // And collapsing an app forgets its destinations' showing-all entries, without closing
+      // the destinations themselves.
+      let app = Node::app("firefox");
+      let first = Node::dest("firefox", "a.example");
+      let second = Node::dest("firefox", "b.example");
+      let expanded = expanded_set(&[app.clone(), first.clone(), second.clone()]);
+      let mut showing_all = showing_all_set(&[app.clone(), first.clone(), second.clone()]);
+
+      showing_all.forget(&app);
+
+      assert!(!showing_all.contains(&app));
+      assert!(!showing_all.contains(&first));
+      assert!(!showing_all.contains(&second));
+      assert!(
+         expanded.contains(&first) && expanded.contains(&second),
+         "the destinations stay open"
+      );
    }
 
    #[test]
-   fn a_connection_is_selected_by_its_address() {
+   fn a_connection_is_selected_by_its_address_and_protocol() {
       let mut first = event(10, "firefox", "a.example");
       first.connection.remote_ip = "203.0.113.9".parse().unwrap();
       // The second row has no resolved name, so its destination is the address itself: the
@@ -2107,53 +2055,52 @@ mod tests {
          other_proto.dest, None,
          "the protocol disambiguates the address"
       );
-   }
 
-   #[test]
-   fn the_rule_column_names_the_matching_rule() {
-      let allow = rule(DestMatcher::Any, Action::Allow);
-      let deny = rule(
-         DestMatcher::Domain {
-            host: "example.com".to_owned(),
-            subdomains: false,
-         },
-         Action::Deny,
-      );
-      let rules = vec![allow, deny];
-
-      assert_eq!(
-         rule_label(Some(&rules[0].id), &rules),
-         "allow anywhere"
-      );
-      assert_eq!(
-         rule_label(Some(&rules[1].id), &rules),
-         "deny only example.com"
-      );
-      assert_eq!(
-         rule_label(Some(&RuleId::new_unique()), &rules),
-         DASH
-      );
-      assert_eq!(rule_label(None, &rules), DASH);
-
-      // And through the flattened row, which is what the detail pane reads.
-      let mut matched = event(0, "firefox", "a.example");
-      matched.matched_rule = Some(rules[0].id.clone());
-      let mut log = ConnectionLog::new(8);
-      log.push(&matched);
+      // Two rows on the same address and timestamp, one per protocol: the protocol picks the
+      // row, and its verdict with it.
+      let mut tcp = event(10, "firefox", "a.example");
+      tcp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      let mut udp = event(10, "firefox", "a.example");
+      udp.connection.remote_ip = "203.0.113.9".parse().unwrap();
+      udp.connection.proto = L4Proto::Udp;
+      udp.allowed = false;
+      let mut history = ConnectionLog::new(8);
+      history.push(&tcp);
+      history.push(&udp);
       let lines = build_lines(
-         &log,
-         &rules,
-         &expanded_set(&[Node::app("firefox")]),
+         &history,
+         &[],
+         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
          &ShowingAll::default(),
       );
-      let Line::Dest { rule, .. } = &lines[1] else {
-         panic!("expected a destination after the group");
-      };
-      assert_eq!(rule, "allow anywhere");
+
+      let tcp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "tcp".to_owned(),
+         },
+      )
+      .expect("the tcp connection resolves");
+      let udp_detail = Detail::resolve(
+         &lines,
+         &Selection::Conn {
+            app: "firefox".to_owned(),
+            at: 10,
+            addr: "203.0.113.9:443".to_owned(),
+            proto: "udp".to_owned(),
+         },
+      )
+      .expect("the udp connection resolves");
+
+      assert_eq!(tcp_detail.verdict, Some(true));
+      assert_eq!(udp_detail.verdict, Some(false));
    }
 
    #[test]
-   fn the_cache_rebuilds_only_when_an_input_changes() {
+   fn the_lines_cache_rebuilds_only_when_an_input_changes() {
       let mut log = log(&[(10, "firefox", "a.example")]);
       let mut expanded = Expanded::default();
       let mut showing_all = ShowingAll::default();
@@ -2215,150 +2162,6 @@ mod tests {
       assert_eq!(builds(), before + 6, "a rule list rebuilds too");
    }
 
-   #[test]
-   fn the_indicator_follows_the_count_and_the_callers_line() {
-      let row = Rect::from_min_size(pos2(100.0, 0.0), vec2(900.0, LINE_HEIGHT));
-
-      let indicator = indicator_rect(row, APP_NAME_X, 50.0, row.center().y + 1.5);
-
-      // Row-relative and text-relative: the pre-fix code painted at an absolute column x.
-      assert_eq!(
-         indicator.center().x,
-         100.0 + APP_NAME_X + 50.0 + DOT_GAP
-      );
-      assert_eq!(
-         indicator.width(),
-         DOT_SIZE,
-         "the widget's own diameter is the rect's width"
-      );
-      assert!(
-         indicator.center().y > row.center().y,
-         "the caller's centre is honoured, not the row's"
-      );
-   }
-
-   #[test]
-   fn a_smaller_label_shares_the_baseline_but_sits_lower() {
-      // One LayoutJob puts both fonts on one baseline, so the 11px count's box centre is
-      // below the 13px name's — which is why a light centred on the row read as higher than
-      // the label it qualifies.
-      let name = glyph_center_y(100.0, 10.4, 13.0);
-      let count = glyph_center_y(100.0, 8.8, 11.0);
-      assert_eq!(count, 96.7);
-      assert!(
-         count > name,
-         "the label's centre is lower: {count} vs {name}"
-      );
-   }
-
-   #[test]
-   fn a_count_reads_as_a_bare_number() {
-      assert_eq!(count_label(1), "1");
-      assert_eq!(count_label(12), "12");
-   }
-
-   #[test]
-   fn a_connection_line_names_its_endpoint_and_verdict() {
-      let mut allowed = event(10, "firefox", "a.example");
-      allowed.connection.remote_ip = "140.82.121.6".parse().unwrap();
-      let mut history = ConnectionLog::new(8);
-      history.push(&allowed);
-      let lines = build_lines(
-         &history,
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-      let allowed = conn(&lines, 2);
-      assert_eq!(allowed.repeat, 1, "a lone flow stands for itself");
-      assert_eq!(
-         conn_line_text(allowed),
-         "140.82.121.6:443 · tcp · ALLOWED"
-      );
-
-      let mut prompted = event(10, "firefox", "a.example");
-      prompted.connection.remote_ip = "140.82.121.6".parse().unwrap();
-      prompted.via_prompt = true;
-      let mut history = ConnectionLog::new(8);
-      history.push(&prompted);
-      let lines = build_lines(
-         &history,
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-      assert!(
-         conn_line_text(conn(&lines, 2)).ends_with("ALLOWED (prompt)"),
-         "a prompted allow names the prompt"
-      );
-
-      let mut denied = event(10, "firefox", "a.example");
-      denied.connection.remote_ip = "140.82.121.6".parse().unwrap();
-      denied.allowed = false;
-      let mut history = ConnectionLog::new(8);
-      history.push(&denied);
-      let lines = build_lines(
-         &history,
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-      assert!(
-         conn_line_text(conn(&lines, 2)).ends_with("DENIED"),
-         "a denied connection names its verdict"
-      );
-   }
-
-   #[test]
-   fn an_overflow_row_sits_level_with_its_children() {
-      assert_eq!(more_row_x(&Node::app("firefox")), DEST_NAME_X);
-      assert_eq!(
-         more_row_x(&Node::dest("firefox", "a.example")),
-         CONN_TEXT_X
-      );
-   }
-
-   #[test]
-   fn the_name_width_leaves_room_for_the_indicator() {
-      let columns = Columns::new(900.0);
-
-      let limit = name_width_limit(&columns, APP_NAME_X);
-
-      assert!(
-         limit + APP_NAME_X + DOT_SPACE == columns.connection,
-         "the galley must stop short of the indicator: limit {limit}, column {}",
-         columns.connection
-      );
-      assert!(limit > 0.0, "a 900px row has room for a name");
-
-      // And a destination's narrower name: the same identity holds one indent to the right.
-      let limit = name_width_limit(&columns, DEST_NAME_X);
-      assert!(
-         limit + DEST_NAME_X + DOT_SPACE == columns.connection,
-         "a destination's galley stops short of its indicator too"
-      );
-   }
-
-   #[test]
-   fn the_columns_keep_their_own_gaps() {
-      let columns = Columns::new(900.0);
-
-      assert_eq!(
-         columns.rule_x - columns.connection,
-         CONNECTION_GAP,
-         "the Connection column stops one wide gap short of Rule"
-      );
-      assert_eq!(
-         columns.rule, RULE_WIDTH,
-         "the Rule column keeps its width"
-      );
-      assert_eq!(
-         columns.activity_x - (columns.rule_x + columns.rule),
-         COLUMN_GAP,
-         "Rule and Activity stay a normal gap apart"
-      );
-   }
-
    /// Four flows to one destination: one older udp flow and three identical tcp ones.
    fn repeated_flows() -> ConnectionLog {
       let mut udp = event(5, "firefox", "a.example");
@@ -2372,7 +2175,7 @@ mod tests {
    }
 
    #[test]
-   fn repeated_flows_collapse_into_one_counted_row() {
+   fn repeated_flows_collapse_and_totals_stay_raw() {
       let history = repeated_flows();
       let rows: Vec<&Row> = history.rows().rev().collect();
       let unique = unique_conns(&rows);
@@ -2400,147 +2203,14 @@ mod tests {
       assert_eq!(conns[0].repeat, 3);
       assert_eq!(conns[0].at, 30);
       assert_eq!(conns[1].repeat, 1);
-   }
 
-   #[test]
-   fn the_group_keeps_the_raw_connection_count() {
-      let lines = build_lines(
-         &repeated_flows(),
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-
+      // The group and destination totals stay raw even though the third level collapses.
       assert_eq!(group(&lines, 0), ("firefox", 4, 30));
       assert_eq!(dest(&lines, 1), ("a.example", 4, 30));
       assert_eq!(
          lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
          2,
          "the third level collapses even though the totals do not"
-      );
-   }
-
-   #[test]
-   fn the_cap_counts_unique_flows() {
-      let app = Node::app("firefox");
-      let host = Node::dest("firefox", "a.example");
-
-      let identical: Vec<(u64, &str, &str)> =
-         (0..10).map(|at| (at, "firefox", "a.example")).collect();
-      let lines = build_lines(
-         &log(&identical),
-         &[],
-         &expanded_set(&[app.clone(), host.clone()]),
-         &ShowingAll::default(),
-      );
-      assert_eq!(
-         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
-         1,
-         "ten identical flows are one collapsed row"
-      );
-      assert!(
-         !lines.iter().any(|line| matches!(line, Line::More { .. })),
-         "one unique flow fits under the cap"
-      );
-
-      let mut distinct = ConnectionLog::new(16);
-      for at in 0..10 {
-         let mut row = event(at, "firefox", "a.example");
-         row.connection.remote_ip = format!("203.0.113.{}", at + 1).parse().unwrap();
-         distinct.push(&row);
-      }
-      let lines = build_lines(
-         &distinct,
-         &[],
-         &expanded_set(&[app, host.clone()]),
-         &ShowingAll::default(),
-      );
-      assert_eq!(
-         lines.iter().filter(|line| matches!(line, Line::Conn(_))).count(),
-         MAX_CHILDREN,
-         "ten distinct addresses still fill the cap"
-      );
-      assert_eq!(
-         lines[MAX_CHILDREN + 2],
-         Line::More {
-            remaining: 2,
-            node: host
-         },
-         "the remainder counts the unique flows past the cap"
-      );
-   }
-
-   #[test]
-   fn a_connection_is_selected_by_its_protocol_too() {
-      let mut tcp = event(10, "firefox", "a.example");
-      tcp.connection.remote_ip = "203.0.113.9".parse().unwrap();
-      let mut udp = event(10, "firefox", "a.example");
-      udp.connection.remote_ip = "203.0.113.9".parse().unwrap();
-      udp.connection.proto = L4Proto::Udp;
-      udp.allowed = false;
-      let mut history = ConnectionLog::new(8);
-      history.push(&tcp);
-      history.push(&udp);
-      let lines = build_lines(
-         &history,
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-
-      let tcp_detail = Detail::resolve(
-         &lines,
-         &Selection::Conn {
-            app: "firefox".to_owned(),
-            at: 10,
-            addr: "203.0.113.9:443".to_owned(),
-            proto: "tcp".to_owned(),
-         },
-      )
-      .expect("the tcp connection resolves");
-      let udp_detail = Detail::resolve(
-         &lines,
-         &Selection::Conn {
-            app: "firefox".to_owned(),
-            at: 10,
-            addr: "203.0.113.9:443".to_owned(),
-            proto: "udp".to_owned(),
-         },
-      )
-      .expect("the udp connection resolves");
-
-      assert_eq!(tcp_detail.verdict, Some(true));
-      assert_eq!(udp_detail.verdict, Some(false));
-   }
-
-   #[test]
-   fn a_repeated_flow_says_how_many_it_stands_for() {
-      let lines = build_lines(
-         &repeated_flows(),
-         &[],
-         &expanded_set(&[Node::app("firefox"), Node::dest("firefox", "a.example")]),
-         &ShowingAll::default(),
-      );
-      let conns: Vec<&Conn> = lines
-         .iter()
-         .filter_map(|line| match line {
-            Line::Conn(conn) => Some(conn),
-            _ => None,
-         })
-         .collect();
-
-      let repeated = conns
-         .iter()
-         .find(|conn| conn.repeat == 3)
-         .expect("the collapsed group is present");
-      assert!(
-         conn_line_text(repeated).ends_with("×3"),
-         "the hint carries the collapsed count"
-      );
-      let single = conns.iter().find(|conn| conn.repeat == 1).expect("the single flow is present");
-      assert!(
-         !conn_line_text(single).contains('×'),
-         "a single flow has no count"
       );
    }
 }

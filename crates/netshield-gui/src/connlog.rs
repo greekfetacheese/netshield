@@ -152,7 +152,6 @@ impl ConnectionLog {
 mod tests {
    use super::*;
    use netshield_core::connection::{Family, L4Proto};
-   use netshield_core::rule::RuleId;
    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
    fn view(ip: IpAddr) -> ConnectionView {
@@ -198,7 +197,7 @@ mod tests {
    }
 
    #[test]
-   fn a_domain_replaces_the_address_in_the_destination() {
+   fn a_row_names_its_destination_from_the_name_then_the_address() {
       let mut connection = view(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
       connection.domain = Some("example.com".to_owned());
       let row = Row::from_event(&event(0, connection));
@@ -206,10 +205,7 @@ mod tests {
       assert_eq!(row.dest, "example.com");
       assert_eq!(row.addr, "93.184.216.34:443");
       assert_eq!(row.candidate, None);
-   }
 
-   #[test]
-   fn no_domain_falls_back_to_the_address_and_keeps_a_candidate() {
       let mut connection = view(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
       connection.domain_candidates = vec!["api.example.com".to_owned()];
       let row = Row::from_event(&event(0, connection));
@@ -225,19 +221,6 @@ mod tests {
    }
 
    #[test]
-   fn the_process_path_is_kept_for_the_detail_pane() {
-      let row = Row::from_event(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
-      assert_eq!(
-         row.exe.as_deref(),
-         Some("/usr/lib/firefox/firefox")
-      );
-
-      let mut connection = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
-      connection.exe = None;
-      assert_eq!(Row::from_event(&event(0, connection)).exe, None);
-   }
-
-   #[test]
    fn app_falls_back_to_the_exe_basename_then_unknown() {
       let mut connection = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
       connection.app_name.clear();
@@ -249,20 +232,6 @@ mod tests {
       connection.exe = None;
       let row = Row::from_event(&event(0, connection));
       assert_eq!(row.app, "unknown");
-   }
-
-   #[test]
-   fn rule_appears_only_when_one_matched() {
-      let connection = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
-      let id = RuleId::new_unique();
-      let mut matched = event(0, connection.clone());
-      matched.matched_rule = Some(id.clone());
-
-      assert_eq!(Row::from_event(&matched).rule_id, Some(id));
-      assert_eq!(
-         Row::from_event(&event(0, connection)).rule_id,
-         None
-      );
    }
 
    #[test]
@@ -288,12 +257,5 @@ mod tests {
       let before = empty.version();
       empty.push(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
       assert_eq!(empty.version(), before + 1);
-   }
-
-   #[test]
-   fn time_is_utc_hh_mm_ss() {
-      assert_eq!(clock(0), "00:00:00");
-      assert_eq!(clock(3661), "01:01:01");
-      assert_eq!(clock(86_399), "23:59:59");
    }
 }

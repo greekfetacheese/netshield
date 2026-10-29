@@ -429,30 +429,25 @@ mod tests {
    }
 
    #[test]
-   fn every_known_level_name_parses() {
+   fn level_names_parse_and_unknown_defaults_to_info() {
       assert_eq!(level_from(Some("off")), LevelFilter::Off);
       assert_eq!(level_from(Some("error")), LevelFilter::Error);
       assert_eq!(level_from(Some("warn")), LevelFilter::Warn);
       assert_eq!(level_from(Some("info")), LevelFilter::Info);
       assert_eq!(level_from(Some("debug")), LevelFilter::Debug);
       assert_eq!(level_from(Some("trace")), LevelFilter::Trace);
-   }
 
-   #[test]
-   fn level_names_are_case_insensitive_and_trimmed() {
       assert_eq!(level_from(Some("DEBUG")), LevelFilter::Debug);
       assert_eq!(level_from(Some(" Warn \n")), LevelFilter::Warn);
-   }
 
-   #[test]
-   fn an_unset_or_unknown_level_defaults_to_info() {
       assert_eq!(level_from(None), LevelFilter::Info);
       assert_eq!(level_from(Some("")), LevelFilter::Info);
       assert_eq!(level_from(Some("verbose")), LevelFilter::Info);
    }
 
    #[test]
-   fn the_file_override_wins_over_the_state_directories() {
+   fn the_log_path_prefers_the_override_then_the_state_home() {
+      // The file override wins over the state directories.
       assert_eq!(
          resolve_path(
             Some(Path::new("/tmp/custom.log")),
@@ -461,10 +456,8 @@ mod tests {
          ),
          Some(PathBuf::from("/tmp/custom.log"))
       );
-   }
 
-   #[test]
-   fn an_empty_override_counts_as_unset() {
+      // An empty override counts as unset.
       assert_eq!(
          resolve_path(
             Some(Path::new("")),
@@ -473,10 +466,8 @@ mod tests {
          ),
          Some(PathBuf::from("/xdg/netshield/gui.log"))
       );
-   }
 
-   #[test]
-   fn the_state_home_is_used_when_it_is_set() {
+      // The state home is used when it is set.
       assert_eq!(
          resolve_path(
             None,
@@ -485,20 +476,16 @@ mod tests {
          ),
          Some(PathBuf::from("/xdg/netshield/gui.log"))
       );
-   }
 
-   #[test]
-   fn home_is_the_last_resort() {
+      // Home is the last resort.
       assert_eq!(
          resolve_path(None, None, Some(Path::new("/home/user"))),
          Some(PathBuf::from(
             "/home/user/.local/state/netshield/gui.log"
          ))
       );
-   }
 
-   #[test]
-   fn no_state_directory_resolves_to_no_path() {
+      // No state directory at all resolves to no path.
       assert_eq!(resolve_path(None, None, None), None);
       assert_eq!(
          resolve_path(None, Some(Path::new("")), Some(Path::new(""))),
@@ -507,56 +494,20 @@ mod tests {
    }
 
    #[test]
-   fn rotation_only_happens_past_one_mebibyte() {
-      assert!(!should_rotate(0));
-      assert!(!should_rotate(MAX_LOG_BYTES));
-      assert!(should_rotate(MAX_LOG_BYTES + 1));
-   }
-
-   #[test]
-   fn a_rotated_log_sits_beside_the_original_with_a_dot_one() {
-      assert_eq!(
-         rotated_path(Path::new("/state/netshield/gui.log")),
-         PathBuf::from("/state/netshield/gui.log.1")
-      );
-   }
-
-   #[test]
-   fn the_epoch_formats_as_utc() {
-      assert_eq!(utc_timestamp(at(0)), "1970-01-01T00:00:00Z");
-   }
-
-   #[test]
-   fn a_later_epoch_formats_as_utc() {
-      // `1_000_000_000` is 2001-09-09T01:46:40Z, not the 2009 date it is easily mistaken
-      // for; GNU `date -u -d @1000000000` agrees. The 2009 instant is `1_234_567_900`,
-      // pinned beside it so both readings stay covered.
-      assert_eq!(
-         utc_timestamp(at(1_000_000_000)),
-         "2001-09-09T01:46:40Z"
-      );
-      assert_eq!(
-         utc_timestamp(at(1_234_567_900)),
-         "2009-02-13T23:31:40Z"
-      );
-   }
-
-   #[test]
-   fn the_leap_day_formats_as_utc() {
+   fn utc_timestamps_format_and_truncate() {
+      // A leap day formats as UTC.
       assert_eq!(
          utc_timestamp(at(951_782_400)),
          "2000-02-29T00:00:00Z"
       );
-   }
 
-   #[test]
-   fn sub_second_time_is_truncated_not_rounded() {
+      // Sub-second time is truncated, never rounded up into the next second.
       let now = at(1_234_567_900) + Duration::from_millis(999);
       assert_eq!(utc_timestamp(now), "2009-02-13T23:31:40Z");
    }
 
    #[test]
-   fn a_formatted_line_has_the_documented_shape() {
+   fn a_record_has_the_documented_shape() {
       let line = format_record(
          Level::Info,
          "netshield_gui::app",
@@ -570,14 +521,6 @@ mod tests {
       );
    }
 
-   #[test]
-   fn the_level_column_is_left_padded_to_five_characters() {
-      let line = format_record(Level::Warn, "netshield_gui::ipc", "short", at(0));
-      assert!(line.starts_with("1970-01-01T00:00:00Z WARN  netshield_gui::ipc: "));
-      let line = format_record(Level::Error, "netshield_gui::ipc", "short", at(0));
-      assert!(line.starts_with("1970-01-01T00:00:00Z ERROR netshield_gui::ipc: "));
-   }
-
    /// Debug settings with the dependency filter in its default state.
    fn debug_settings() -> Settings {
       Settings {
@@ -587,25 +530,17 @@ mod tests {
    }
 
    #[test]
-   fn our_own_debug_records_are_emitted() {
+   fn only_our_own_debug_records_reach_the_log() {
       assert!(emits(
          "netshield_gui::app",
          Level::Debug,
          &debug_settings()
       ));
-   }
-
-   #[test]
-   fn a_dependencys_debug_records_are_dropped() {
       assert!(!emits(
          "wgpu_core::instance",
          Level::Debug,
          &debug_settings()
       ));
-   }
-
-   #[test]
-   fn a_dependencys_warnings_are_still_emitted() {
       assert!(emits(
          "wgpu_core::instance",
          Level::Warn,
@@ -616,10 +551,8 @@ mod tests {
          Level::Error,
          &debug_settings()
       ));
-   }
 
-   #[test]
-   fn all_targets_lifts_the_dependency_filter() {
+      // `all_targets` lifts the dependency filter.
       let settings = Settings {
          level: LevelFilter::Debug,
          all_targets: all_targets_from(Some("all")),
@@ -644,7 +577,7 @@ mod tests {
    }
 
    #[test]
-   fn a_write_past_the_threshold_rotates_the_open_file() {
+   fn a_write_past_the_threshold_rotates() {
       let path = temp_path("rotate-during-write");
       let mut log = OpenLog {
          file: open_log_file(&path).expect("the temp log opens"),

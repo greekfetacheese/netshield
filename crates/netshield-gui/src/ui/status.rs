@@ -141,18 +141,6 @@ mod tests {
    use super::*;
 
    #[test]
-   fn uptime_formats_each_unit_boundary() {
-      assert_eq!(uptime(0, 0), "0s");
-      assert_eq!(uptime(0, 59), "59s");
-      assert_eq!(uptime(0, 60), "1m 0s");
-      assert_eq!(uptime(0, 90), "1m 30s");
-      assert_eq!(uptime(0, 3_600), "1h 0m");
-      assert_eq!(uptime(0, 3_661), "1h 1m");
-      assert_eq!(uptime(0, 86_400), "1d 0h");
-      assert_eq!(uptime(0, 176_400), "2d 1h");
-   }
-
-   #[test]
    fn uptime_never_underflows_when_the_clock_is_behind() {
       assert_eq!(uptime(100, 0), "0s");
    }

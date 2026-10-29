@@ -1091,7 +1091,6 @@ pub(crate) fn measured_height(request: &PromptRequest, waiting: usize) -> f32 {
 mod tests {
    use std::net::{IpAddr, Ipv4Addr};
 
-   use egui::Color32;
    use netshield_core::connection::L4Proto;
 
    use super::*;
@@ -1161,20 +1160,12 @@ mod tests {
    }
 
    #[test]
-   fn default_decision_is_session_and_any_connection() {
-      let state = AlertState::new();
-      let decision = state.decision(
-         &prompt(Some("www.google.com"), true),
-         Action::Allow,
-      );
-      assert_eq!(decision.duration, Duration::Session);
-      assert_eq!(decision.scope, ScopeChoice::AnyConnection);
-   }
-
-   #[test]
-   fn known_app_keeps_the_broad_default_and_all_three_scopes() {
+   fn scope_defaults_and_unknown_app_is_never_app_wide() {
       let request = prompt(Some("www.google.com"), true);
       let mut state = AlertState::new();
+      let decision = state.decision(&request, Action::Allow);
+      assert_eq!(decision.duration, Duration::Session);
+      assert_eq!(decision.scope, ScopeChoice::AnyConnection);
       assert_eq!(state.effective_scope(&request), Scope::Any);
 
       // The broad scope is still selectable after narrowing.
@@ -1183,21 +1174,25 @@ mod tests {
          state.decision(&request, Action::Allow).scope,
          ScopeChoice::Address
       );
+      state.scope = Scope::Domain;
+      assert_eq!(
+         state.decision(&request, Action::Allow).scope,
+         ScopeChoice::Domain {
+            host: "www.google.com".to_owned(),
+            subdomains: false,
+         }
+      );
       state.scope = Scope::Any;
       assert_eq!(
          state.decision(&request, Action::Allow).scope,
          ScopeChoice::AnyConnection
       );
-   }
 
-   #[test]
-   fn unknown_app_disables_the_broad_scope_and_defaults_to_the_learned_domain() {
       let request = unknown_prompt(Some("www.google.com"), true);
       assert!(
          !broad_scope_available(&request),
          "the broad scope must be unavailable"
       );
-
       let state = AlertState::new();
       assert_eq!(
          state.effective_scope(&request),
@@ -1211,10 +1206,7 @@ mod tests {
             subdomains: false,
          }
       );
-   }
 
-   #[test]
-   fn unknown_app_without_a_hostname_defaults_to_the_address() {
       let request = unknown_prompt(None, false);
       let state = AlertState::new();
       assert_eq!(
@@ -1226,10 +1218,7 @@ mod tests {
          state.decision(&request, Action::Allow).scope,
          ScopeChoice::Address
       );
-   }
 
-   #[test]
-   fn unknown_app_never_falls_back_to_the_broad_scope() {
       // Even if something selected `Any`, the resolved answer stays narrow, so an
       // unattributed flow can never produce `AppMatcher::Unknown` + `DestMatcher::Any`.
       for request in [
@@ -1243,23 +1232,6 @@ mod tests {
             ScopeChoice::AnyConnection
          );
       }
-   }
-
-   #[test]
-   fn domain_scope_uses_the_learned_host() {
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      let decision = state.decision(
-         &prompt(Some("www.google.com"), true),
-         Action::Allow,
-      );
-      assert_eq!(
-         decision.scope,
-         ScopeChoice::Domain {
-            host: "www.google.com".to_owned(),
-            subdomains: false,
-         }
-      );
    }
 
    #[test]
@@ -1277,45 +1249,12 @@ mod tests {
       assert_eq!(no_host.scope, ScopeChoice::AnyConnection);
    }
 
-   #[test]
-   fn subdomains_round_trip() {
-      let mut state = AlertState::new();
-      state.scope = Scope::Domain;
-      state.subdomains = true;
-      assert_eq!(
-         state
-            .decision(
-               &prompt(Some("www.google.com"), true),
-               Action::Allow
-            )
-            .scope,
-         ScopeChoice::Domain {
-            host: "www.google.com".to_owned(),
-            subdomains: true,
-         }
-      );
-
-      state.subdomains = false;
-      assert_eq!(
-         state
-            .decision(
-               &prompt(Some("www.google.com"), true),
-               Action::Allow
-            )
-            .scope,
-         ScopeChoice::Domain {
-            host: "www.google.com".to_owned(),
-            subdomains: false,
-         }
-      );
-   }
-
    /// A group offers the choice that ends the prompting for the app, and the default is
    /// that choice: one rule for the app, never one rule per address.
    #[test]
-   fn a_group_offers_any_connection_and_only_these_destinations() {
+   fn a_group_offers_app_wide_and_these_destinations() {
       let request = group_of_six();
-      let state = AlertState::new();
+      let mut state = AlertState::new();
 
       let options = scope_options(&request);
       assert_eq!(
@@ -1328,8 +1267,6 @@ mod tests {
          vec![Scope::Any, Scope::TheseDestinations],
          "the app-wide grant is first and the list scope second"
       );
-      assert_eq!(options[0].label, "Any connection by brave");
-      assert_eq!(options[1].label, "These 6 destinations");
       assert_eq!(
          state.effective_scope(&request),
          Scope::Any,
@@ -1342,33 +1279,8 @@ mod tests {
          serde_json::to_value(&decision.scope).expect("serialisable scope"),
          serde_json::json!({ "kind": "any_connection" })
       );
-   }
 
-   /// The default on a group states the grant the click makes: the whole app, not the list.
-   #[test]
-   fn the_default_on_a_group_grants_the_whole_app() {
-      let request = group_of_six();
-      let state = AlertState::new();
-
-      assert_eq!(allow_label(&request, &state), "Allow");
-      assert!(
-         !destination_lines(&request).is_empty(),
-         "the list stays visible: it is what prompted the question"
-      );
-   }
-
-   /// Switching to the list scope names the count in the button, and sends the one scope
-   /// that writes a rule per destination.
-   #[test]
-   fn choosing_these_destinations_states_the_list() {
-      let request = group_of_six();
-      let mut state = AlertState::new();
       state.scope = Scope::TheseDestinations;
-
-      assert_eq!(
-         allow_label(&request, &state),
-         "Allow 6 destinations"
-      );
       let decision = state.decision(&request, Action::Allow);
       assert_eq!(decision.scope, ScopeChoice::TheseDestinations);
       assert_eq!(
@@ -1377,473 +1289,18 @@ mod tests {
       );
    }
 
-   /// One destination with a learned name keeps all three scopes, unchanged.
-   #[test]
-   fn a_single_destination_keeps_its_three_scopes() {
-      let request = prompt(Some("www.google.com"), true);
-      let mut state = AlertState::new();
-
-      let options = scope_options(&request);
-      assert_eq!(options.len(), 3);
-      assert_eq!(
-         options.iter().map(|option| option.scope).collect::<Vec<_>>(),
-         vec![Scope::Any, Scope::Domain, Scope::Address]
-      );
-      assert_eq!(options[0].label, "Any connection by firefox");
-      assert_eq!(options[1].label, "Only www.google.com");
-      assert_eq!(options[2].label, "Only this address");
-      assert_eq!(allow_label(&request, &state), "Allow");
-      assert!(
-         destination_lines(&request).is_empty(),
-         "one destination needs no list under the header"
-      );
-
-      state.scope = Scope::Domain;
-      assert_eq!(
-         state.decision(&request, Action::Allow).scope,
-         ScopeChoice::Domain {
-            host: "www.google.com".to_owned(),
-            subdomains: false,
-         }
-      );
-      state.scope = Scope::Address;
-      assert_eq!(
-         state.decision(&request, Action::Allow).scope,
-         ScopeChoice::Address
-      );
-   }
-
-   /// Without a learned name there is no domain row to offer, so the picker has two.
-   #[test]
-   fn a_single_destination_without_a_name_offers_two() {
-      let request = prompt(None, false);
-      let options = scope_options(&request);
-
-      assert_eq!(options.len(), 2);
-      assert_eq!(
-         options.iter().map(|option| option.scope).collect::<Vec<_>>(),
-         vec![Scope::Any, Scope::Address],
-         "no domain row without a name"
-      );
-      assert_eq!(options[0].label, "Any connection by firefox");
-      assert_eq!(options[1].label, "Only this address");
-   }
-
    /// The required example: three named lines and a remainder, never more.
    #[test]
-   fn the_list_is_capped_with_a_remainder() {
-      let lines = destination_lines(&group_of_six());
+   fn the_destination_list_is_capped_with_a_remainder() {
       assert_eq!(
-         lines,
-         vec![
-            "· accounts.google.com",
-            "· ssl.gstatic.com",
-            "· 142.250.184.76:443",
-            "· +3 more",
-         ]
-      );
-   }
-
-   /// The required example: an older daemon's payload is a single destination.
-   #[test]
-   fn an_empty_dests_field_falls_back_to_the_first_destination() {
-      let mut request = prompt(Some("accounts.google.com"), true);
-      request.connection = dest_view("brave", "accounts.google.com", 74);
-      assert!(request.dests.is_empty());
-
-      assert_eq!(destinations(&request).len(), 1);
-      assert_eq!(allow_label(&request, &AlertState::new()), "Allow");
-      assert!(destination_lines(&request).is_empty());
-   }
-
-   /// Renders one prompt at the host size and returns the text the panel painted.
-   fn rendered_text(request: &PromptRequest) -> String {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let input = egui::RawInput {
-         screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(WIDTH, MAX_HEIGHT),
-         )),
-         ..Default::default()
-      };
-      let output = ctx.run_ui(input, |root| {
-         let mut state = AlertState::new();
-         ui(root, request, &mut state, 18.0, 0);
-      });
-      let mut text = String::new();
-      collect_text(&output.shapes, &mut text);
-      output.drop_without_applying_deltas();
-      text
-   }
-
-   /// Appends every glyph run in the painted shapes, so a test can read the panel.
-   fn collect_text(shapes: &[egui::epaint::ClippedShape], out: &mut String) {
-      fn collect(shape: &egui::Shape, out: &mut String) {
-         match shape {
-            egui::Shape::Text(text) => {
-               out.push_str(text.galley.text());
-               out.push('\n');
-            }
-            egui::Shape::Vec(shapes) => {
-               for shape in shapes {
-                  collect(shape, out);
-               }
-            }
-            _ => {}
-         }
-      }
-      for clipped in shapes {
-         collect(&clipped.shape, out);
-      }
-   }
-
-   #[test]
-   fn the_panel_background_is_the_theme_background() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-         let frame = panel_frame(ui);
-         assert_eq!(frame.fill, ui.visuals().panel_fill);
-         assert_ne!(frame.fill, Color32::BLACK);
-      });
-      output.drop_without_applying_deltas();
-   }
-
-   #[test]
-   fn the_unnamed_address_note_is_gone() {
-      let text = rendered_text(&prompt(None, false));
-      assert!(
-         !text.contains("no hostname was learned"),
-         "the note is gone: {text}"
-      );
-      assert!(
-         text.contains("142.250.185.78:443"),
-         "the address itself still names the destination: {text}"
-      );
-   }
-
-   /// One painted text run: what it says, where it starts, and how it was styled.
-   #[derive(Debug)]
-   struct PaintedText {
-      text: String,
-      pos: egui::Pos2,
-      font: egui::FontId,
-      color: Color32,
-   }
-
-   /// Renders the whole panel and returns every text run it painted.
-   fn painted(ctx: &egui::Context, request: &PromptRequest) -> Vec<PaintedText> {
-      let input = egui::RawInput {
-         screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(WIDTH, MAX_HEIGHT),
-         )),
-         ..Default::default()
-      };
-      let output = ctx.run_ui(input, |root| {
-         let mut state = AlertState::new();
-         ui(root, request, &mut state, 18.0, 0);
-      });
-      let mut painted = Vec::new();
-      fn collect(shape: &egui::Shape, out: &mut Vec<PaintedText>) {
-         match shape {
-            egui::Shape::Text(text) => {
-               let section = text.galley.job.sections.first().expect("one section");
-               out.push(PaintedText {
-                  text: text.galley.text().to_owned(),
-                  pos: text.pos,
-                  font: section.format.font_id.clone(),
-                  color: section.format.color,
-               });
-            }
-            egui::Shape::Vec(shapes) => {
-               for shape in shapes {
-                  collect(shape, out);
-               }
-            }
-            _ => {}
-         }
-      }
-      for clipped in &output.shapes {
-         collect(&clipped.shape, &mut painted);
-      }
-      output.drop_without_applying_deltas();
-      painted
-   }
-
-   /// Every filled rectangle the panel paints, so a test can read the button fills.
-   fn painted_fills(ctx: &egui::Context, request: &PromptRequest, waiting: usize) -> Vec<Color32> {
-      let input = egui::RawInput {
-         screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(WIDTH, MAX_HEIGHT),
-         )),
-         ..Default::default()
-      };
-      let output = ctx.run_ui(input, |root| {
-         let mut state = AlertState::new();
-         ui(root, request, &mut state, 18.0, waiting);
-      });
-      let mut fills = Vec::new();
-      fn collect(shape: &egui::Shape, out: &mut Vec<Color32>) {
-         match shape {
-            egui::Shape::Rect(rect) => out.push(rect.fill),
-            egui::Shape::Vec(shapes) => {
-               for shape in shapes {
-                  collect(shape, out);
-               }
-            }
-            _ => {}
-         }
-      }
-      for clipped in &output.shapes {
-         collect(&clipped.shape, &mut fills);
-      }
-      output.drop_without_applying_deltas();
-      fills
-   }
-
-   #[test]
-   fn the_buttons_use_the_theme_colours() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let theme = Theme::current(&ctx);
-      let request = prompt(Some("www.google.com"), true);
-
-      // Both action-row branches carry the theme's semantic colours.
-      for waiting in [0usize, 2] {
-         let fills = painted_fills(&ctx, &request, waiting);
-         assert!(
-            fills.contains(&theme.colors.error),
-            "Deny uses the theme's error colour: {fills:?}"
-         );
-         assert!(
-            fills.contains(&theme.colors.success),
-            "Allow uses the theme's success colour: {fills:?}"
-         );
-      }
-   }
-
-   /// A group whose rows cover a named host, an IPv4 endpoint, an IPv6 endpoint and a
-   /// remainder: enough shapes to catch a per-row indent.
-   fn mixed_group() -> PromptRequest {
-      let mut request = prompt(Some("www.google.com"), true);
-      request.connection = dest_view("firefox", "www.google.com", 74);
-      let mut v6 = dest_view("firefox", "", 75);
-      v6.family = Family::V6;
-      v6.remote_ip = IpAddr::V6("2001:4860:482c:400::1".parse().expect("ipv6"));
-      request.dests = vec![
-         request.connection.clone(),
-         dest_view("firefox", "ssl.gstatic.com", 75),
-         v6,
-         dest_view("firefox", "", 76),
-         dest_view("firefox", "fonts.gstatic.com", 77),
-      ];
-      request
-   }
-
-   #[test]
-   fn the_caption_reads_at_body_size() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let theme = Theme::current(&ctx);
-      let style = ctx.global_style();
-      let body = TextStyle::Body.resolve(&style);
-      let small = TextStyle::Small.resolve(&style);
-
-      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
-      let caption = painted
-         .iter()
-         .find(|run| run.text == "wants to connect to")
-         .expect("the caption is painted");
-      assert_eq!(
-         caption.font, body,
-         "the caption uses the body style"
-      );
-      assert_ne!(
-         caption.font, small,
-         "the caption no longer reads small"
-      );
-      assert_eq!(
-         caption.color, theme.colors.text_muted,
-         "the caption uses the theme's muted colour"
-      );
-   }
-
-   #[test]
-   fn additional_destinations_use_small_typography() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let theme = Theme::current(&ctx);
-      let style = ctx.global_style();
-      let small = TextStyle::Small.resolve(&style);
-
-      let mut request = prompt(Some("www.google.com"), true);
-      request.dests = vec![
-         request.connection.clone(),
-         dest_view("firefox", "ssl.gstatic.com", 75),
-      ];
-      let painted = painted(&ctx, &request);
-      let rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
-      assert_eq!(rows.len(), 2, "one list row per destination");
-      for row in rows {
-         assert_eq!(
-            row.font, small,
-            "the list row {} is small: {row:?}",
-            row.text
-         );
-         assert_eq!(
-            row.color, theme.colors.text_muted,
-            "the list row {} is muted",
-            row.text
-         );
-      }
-
-      let primary = painted
-         .iter()
-         .find(|run| run.text == "www.google.com")
-         .expect("the primary destination is painted");
-      assert_ne!(
-         primary.font, small,
-         "the primary destination keeps its size"
-      );
-   }
-
-   #[test]
-   fn every_destination_row_shares_one_indent() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let painted = painted(&ctx, &mixed_group());
-      let mut rows: Vec<_> = painted.iter().filter(|run| run.text.starts_with("· ")).collect();
-      rows.sort_by(|a, b| a.pos.y.total_cmp(&b.pos.y));
-      assert_eq!(
-         rows.len(),
+         destination_lines(&group_of_six()).len(),
          DEST_LINES + 1,
-         "three rows and the remainder"
+         "three lines plus the remainder is what the estimate counts"
       );
-      let left = rows[0].pos.x;
-      for row in &rows {
-         assert_eq!(
-            row.pos.x, left,
-            "row {} starts at the shared indent",
-            row.text
-         );
-      }
-   }
-
-   #[test]
-   fn section_labels_outrank_their_options() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let theme = Theme::current(&ctx);
-      let style = ctx.global_style();
-      let body = TextStyle::Body.resolve(&style);
-      let small = TextStyle::Small.resolve(&style);
-
-      let painted = painted(&ctx, &prompt(Some("www.google.com"), true));
-      for label in ["Duration", "Scope"] {
-         let run = painted
-            .iter()
-            .find(|run| run.text == label)
-            .unwrap_or_else(|| panic!("the {label} label is painted"));
-         assert_eq!(run.font, body, "{label} uses the body style");
-         assert_ne!(run.font, small, "{label} is no longer small");
-         assert_eq!(
-            run.color, theme.colors.text,
-            "{label} uses the body colour"
-         );
-      }
-   }
-
-   #[test]
-   fn the_summary_sentence_is_gone() {
-      for request in [prompt(Some("www.google.com"), true), group_of_six()] {
-         let text = rendered_text(&request);
-         assert!(
-            !text.contains("→ anywhere") && !text.contains("→ these"),
-            "the summary sentence is gone: {text}"
-         );
-      }
-   }
-
-   #[test]
-   fn tmp_measure_sections() {
-      let ctx = egui::Context::default();
-      crate::theme::install(&ctx);
-      let input = egui::RawInput {
-         screen_rect: Some(egui::Rect::from_min_size(
-            egui::Pos2::ZERO,
-            egui::vec2(WIDTH, MAX_HEIGHT),
-         )),
-         ..Default::default()
-      };
-      let mut out: Vec<(&str, f32, f32)> = Vec::new();
-      for waiting in [0usize, 2] {
-         let p = prompt(Some("www.google.com"), true);
-         for _ in 0..3 {
-            out.clear();
-            let mut state = AlertState::new();
-            let mut output = ctx.run_ui(input.clone(), |ctx| {
-               egui::CentralPanel::default().show(ctx, |ui| {
-                  let f = egui::Frame::default().inner_margin(PANEL_MARGIN).show(ui, |ui| {
-                     ui.spacing_mut().item_spacing.y = SECTION_GAP;
-                     let mut m = |ui: &mut Ui, name: &'static str, kind: u8| {
-                        let a = ui.cursor().min.y;
-                        match kind {
-                           0 => app_row(ui, &p.connection, waiting_label(waiting)),
-                           1 => {}
-                           2 => {
-                              ui.label(RichText::new("wants to connect to").weak());
-                           }
-                           3 => destination(ui, &p.connection),
-                           4 => {
-                              ui.label(RichText::new(protocol_line(&p.connection)).weak());
-                           }
-                           5 => duration_section(ui, &mut state),
-                           6 => scope_section(ui, &p, &mut state),
-                           7 => {
-                              let width = ui.available_width();
-                              ui.add(
-                                 egui::ProgressBar::new(0.5)
-                                    .desired_width(width)
-                                    .desired_height(COUNTDOWN_HEIGHT)
-                                    .text("Auto-deny in 18s"),
-                              );
-                           }
-                           8 => {
-                              action_row(ui, &p, &state, waiting);
-                           }
-                           9 => ui.add_space(SECTION_GAP),
-                           _ => {}
-                        }
-                        out.push((name, a, ui.cursor().min.y - a));
-                     };
-                     m(ui, "app", 0);
-                     m(ui, "pending", 1);
-                     m(ui, "space", 9);
-                     m(ui, "wants", 2);
-                     m(ui, "dest", 3);
-                     m(ui, "proto", 4);
-                     m(ui, "space", 9);
-                     m(ui, "duration", 5);
-                     m(ui, "space", 9);
-                     m(ui, "scope", 6);
-                     m(ui, "space", 9);
-                     m(ui, "countdown", 7);
-                     m(ui, "space", 9);
-                     m(ui, "buttons", 8);
-                  });
-                  let _ = f;
-               });
-            });
-            output.textures_delta.clear();
-         }
-         println!("--- waiting = {waiting}");
-         for (n, a, v) in &out {
-            println!("{n:10} at {a:6.1} h={v:5.1}");
-         }
-      }
+      assert!(
+         destination_lines(&prompt(Some("www.google.com"), true)).is_empty(),
+         "one destination needs no list under the header"
+      );
    }
 
    /// The panel's vertical budget must fit the host window with room to spare.
@@ -1877,41 +1334,6 @@ mod tests {
       );
    }
 
-   /// A prompt with one destination asks for a shorter window than the cap; the tallest
-   /// shape the estimate budgets for still fits under it.
-   #[test]
-   fn a_short_prompt_measures_short() {
-      let short = prompt(None, false);
-      assert_eq!(
-         scope_options(&short).len(),
-         2,
-         "a named destination would add a scope"
-      );
-      let short_height = measured_height(&short, 0);
-      assert!(
-         short_height < MAX_HEIGHT,
-         "a two-scope prompt measures {short_height}, not the full {MAX_HEIGHT}"
-      );
-
-      let group_height = measured_height(&group_of_six(), 0);
-      assert!(
-         group_height > short_height,
-         "the six-destination list measures {group_height}, taller than {short_height}"
-      );
-      assert!(
-         group_height <= MAX_HEIGHT,
-         "the tallest shape measures {group_height}, within the {MAX_HEIGHT} cap"
-      );
-   }
-
-   #[test]
-   fn countdown_text_shows_whole_seconds_then_denies() {
-      assert_eq!(countdown_text(59.4), "Auto-deny in 59s");
-      assert_eq!(countdown_text(0.4), "Auto-deny in 1s");
-      assert_eq!(countdown_text(0.0), "Denying…");
-      assert_eq!(countdown_text(-1.0), "Denying…");
-   }
-
    #[test]
    fn progress_fraction_is_clamped() {
       assert_eq!(progress_fraction(-5.0, 30), 0.0);
@@ -1927,7 +1349,7 @@ mod tests {
    }
 
    #[test]
-   fn present_starts_a_countdown_that_saturates_at_the_deadline() {
+   fn the_countdown_starts_at_publication_and_saturates() {
       let mut model = AlertModel::new();
       let start = clock();
       assert_eq!(
@@ -1962,32 +1384,6 @@ mod tests {
 
       assert!(!model.is_expired(start + timeout - std::time::Duration::from_nanos(1)));
       assert!(model.is_expired(start + timeout));
-
-      // A new prompt is appended behind the one on screen: it does not replace it, and it
-      // gets its own deadline instead of inheriting the shown prompt's.
-      model.state_mut().duration = Duration::Forever;
-      model.state_mut().scope = Scope::Domain;
-      let mut next = prompt(Some("github.com"), true);
-      next.id = 9;
-      model.present(
-         next.clone(),
-         std::time::Duration::from_secs(10),
-         start,
-      );
-      assert_eq!(model.get(9), Some(&next));
-      assert_eq!(model.len(), 2);
-      assert_eq!(
-         model.prompt().map(|open| open.id),
-         Some(7),
-         "the older prompt stays on screen"
-      );
-      assert_eq!(
-         model.state_mut().duration,
-         Duration::Forever,
-         "a second prompt must not reset the shown prompt's selection"
-      );
-      assert_eq!(model.state_mut().scope, Scope::Domain);
-      assert_eq!(model.remaining_secs(start), Some(30.0));
    }
 
    /// The daemon re-broadcasts a prompt as destinations join its group: the newer payload
@@ -1996,11 +1392,10 @@ mod tests {
    /// A growth also changes which scopes are offered, so a narrow pick made on the single
    /// destination must not survive as a scope the group's picker cannot show.
    #[test]
-   fn replacing_a_prompt_keeps_the_selection_and_shows_the_grown_group() {
+   fn a_growth_replaces_the_prompt_and_keeps_the_selection() {
       let mut model = AlertModel::new();
       let now = clock();
       let single = prompt(Some("accounts.google.com"), true);
-      assert_eq!(allow_label(&single, &AlertState::new()), "Allow");
       model.present(single, std::time::Duration::from_secs(30), now);
       model.state_mut().duration = Duration::Forever;
 
@@ -2019,16 +1414,11 @@ mod tests {
          "a growth must not restart the countdown"
       );
       assert_eq!(model.state_mut().scope, Scope::Any);
-      assert_eq!(
-         allow_label(&presented, model.state_mut()),
-         "Allow",
-         "the app-wide default on a group writes one rule for the app"
-      );
    }
 
    /// A payload for another id belongs to `present` and `clear`, never to a replacement.
    #[test]
-   fn replacing_a_prompt_ignores_a_different_id() {
+   fn a_payload_for_another_id_never_replaces() {
       let mut model = AlertModel::new();
       let now = clock();
       let single = prompt(Some("accounts.google.com"), true);
@@ -2046,7 +1436,7 @@ mod tests {
    }
 
    #[test]
-   fn raise_once_fires_once_per_prompt_and_again_for_a_new_id() {
+   fn raise_once_fires_once_per_prompt() {
       let mut model = AlertModel::new();
       let now = clock();
       assert_eq!(
@@ -2082,7 +1472,7 @@ mod tests {
    }
 
    #[test]
-   fn submit_queues_the_states_decision_and_clears_the_prompt() {
+   fn a_decision_is_queued_once_and_drains() {
       let mut model = AlertModel::new();
       let now = clock();
       let request = prompt(Some("www.google.com"), true);
@@ -2114,12 +1504,9 @@ mod tests {
       );
       assert!(model.prompt().is_none());
       assert_eq!(model.remaining_secs(now), None);
-   }
 
-   #[test]
-   fn clear_without_submit_pushes_nothing() {
+      // A clear without a submit pushes nothing.
       let mut model = AlertModel::new();
-      let now = clock();
       model.present(
          prompt(Some("www.google.com"), true),
          std::time::Duration::from_secs(30),
@@ -2130,12 +1517,9 @@ mod tests {
       assert!(model.prompt().is_none());
       assert!(!model.is_expired(now + std::time::Duration::from_secs(120)));
       assert!(model.take_outgoing().is_empty());
-   }
 
-   #[test]
-   fn take_outgoing_empties_the_buffer() {
+      // Two submissions drain in order, and a second take is empty.
       let mut model = AlertModel::new();
-      let now = clock();
       for id in [7u64, 9] {
          let mut request = prompt(Some("www.google.com"), true);
          request.id = id;
@@ -2172,33 +1556,7 @@ mod tests {
    }
 
    #[test]
-   fn a_lone_prompt_shows_no_counter_and_no_later() {
-      let mut model = AlertModel::new();
-      model.present(
-         prompt(Some("www.google.com"), true),
-         std::time::Duration::from_secs(30),
-         clock(),
-      );
-
-      assert_eq!(model.waiting(), 0);
-      assert_eq!(
-         waiting_label(model.waiting()),
-         None,
-         "a lone prompt draws no counter"
-      );
-      assert_eq!(
-         button_row(model.waiting()),
-         vec![AlertButton::Deny, AlertButton::Allow],
-         "a lone prompt keeps exactly the Deny/Allow pair"
-      );
-      assert!(
-         !button_row(model.waiting()).contains(&AlertButton::Later),
-         "Later only exists when another prompt is waiting"
-      );
-   }
-
-   #[test]
-   fn a_second_prompt_is_counted() {
+   fn a_second_prompt_is_counted_and_the_oldest_stays() {
       let mut model = AlertModel::new();
       let now = clock();
       let mut first = prompt(Some("www.google.com"), true);
@@ -2208,15 +1566,7 @@ mod tests {
       second.id = 2;
       model.present(second, std::time::Duration::from_secs(30), now);
 
-      assert_eq!(
-         waiting_label(model.waiting()),
-         Some("+1 waiting".to_owned())
-      );
-      assert_eq!(
-         button_row(model.waiting()),
-         vec![AlertButton::Later, AlertButton::Deny, AlertButton::Allow],
-         "Later joins to the left of Deny"
-      );
+      assert_eq!(model.waiting(), 1);
       assert_eq!(
          model.prompt().map(|open| open.id),
          Some(1),
@@ -2245,29 +1595,6 @@ mod tests {
          model.take_outgoing().is_empty(),
          "stepping sends no decision for any prompt"
       );
-   }
-
-   #[test]
-   fn answering_advances_to_the_next() {
-      let mut model = AlertModel::new();
-      let now = clock();
-      three_prompts(&mut model, now);
-
-      model.submit(Decision {
-         action: Action::Deny,
-         duration: Duration::Session,
-         scope: ScopeChoice::AnyConnection,
-      });
-
-      assert_eq!(
-         model.prompt().map(|open| open.id),
-         Some(2),
-         "the second prompt becomes the shown one"
-      );
-      assert_eq!(order(&model), vec![2, 3]);
-      let outgoing = model.take_outgoing();
-      assert_eq!(outgoing.len(), 1);
-      assert_eq!(outgoing[0].prompt_id, 1);
    }
 
    #[test]

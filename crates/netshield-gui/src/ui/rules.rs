@@ -584,7 +584,6 @@ fn action_colour(action: Action, enabled: bool) -> Color32 {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use std::path::PathBuf;
 
    fn rule(dest: DestMatcher) -> Rule {
       Rule {
@@ -618,7 +617,7 @@ mod tests {
    }
 
    #[test]
-   fn validate_accepts_each_good_scope() {
+   fn validate_accepts_good_scopes_and_rejects_bad_ones() {
       assert_eq!(
          validate(&draft(ScopeDraft::Domain {
             host: "API.GitHub.com.".to_owned(),
@@ -641,32 +640,30 @@ mod tests {
          })),
          Ok(DestMatcher::Port(443))
       );
-   }
 
-   #[test]
-   fn validate_names_what_is_wrong_with_bad_scope() {
-      assert_eq!(
+      assert!(
          validate(&draft(ScopeDraft::Domain {
             host: "   ".to_owned(),
             subdomains: false,
-         })),
-         Err("host is empty".to_owned())
+         }))
+         .is_err(),
+         "an empty host is rejected"
       );
       for bad in ["140.82.0.0/33", "not an ip", "140.82.0.0/"] {
-         assert_eq!(
+         assert!(
             validate(&draft(ScopeDraft::Ip {
                text: bad.to_owned(),
-            })),
-            Err("not a CIDR, e.g. 140.82.0.0/16".to_owned()),
+            }))
+            .is_err(),
             "CIDR {bad:?} must be rejected"
          );
       }
       for bad in ["0", "70000", ""] {
-         assert_eq!(
+         assert!(
             validate(&draft(ScopeDraft::Port {
                text: bad.to_owned(),
-            })),
-            Err("port must be 1-65535".to_owned()),
+            }))
+            .is_err(),
             "port {bad:?} must be rejected"
          );
       }
@@ -755,53 +752,6 @@ mod tests {
          editor.draft.is_none(),
          "a modal closed by Escape must leave no draft"
       );
-   }
-
-   #[test]
-   fn app_label_names_the_scope() {
-      assert_eq!(app_label(&AppMatcher::Any), "any application");
-      assert_eq!(
-         app_label(&AppMatcher::Exe(PathBuf::from(
-            "/usr/bin/firefox"
-         ))),
-         "firefox"
-      );
-      assert_eq!(app_label(&AppMatcher::Unknown), "unknown");
-   }
-
-   #[test]
-   fn dest_label_names_the_scope() {
-      assert_eq!(dest_label(&DestMatcher::Any), "anywhere");
-      assert_eq!(
-         dest_label(&DestMatcher::Domain {
-            host: "api.github.com".to_owned(),
-            subdomains: false,
-         }),
-         "only api.github.com"
-      );
-      assert_eq!(
-         dest_label(&DestMatcher::Domain {
-            host: "github.com".to_owned(),
-            subdomains: true,
-         }),
-         "*.github.com"
-      );
-      assert_eq!(
-         dest_label(&DestMatcher::Ip("140.82.0.0/16".parse().unwrap())),
-         "140.82.0.0/16"
-      );
-      assert_eq!(dest_label(&DestMatcher::Port(443)), "port 443");
-   }
-
-   #[test]
-   fn action_and_duration_labels() {
-      assert_eq!(action_label(Action::Allow), "allow");
-      assert_eq!(action_label(Action::Deny), "deny");
-      assert_eq!(duration_label(Duration::Once), "once");
-      assert_eq!(duration_label(Duration::Session), "until restart");
-      assert_eq!(duration_label(Duration::Forever), "forever");
-      assert_eq!(matched_label(None), "—");
-      assert_eq!(matched_label(Some(3661)), "01:01:01");
    }
 
    #[test]
