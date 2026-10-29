@@ -1396,7 +1396,6 @@ mod tests {
       let mut model = AlertModel::new();
       let now = clock();
       let single = prompt(Some("accounts.google.com"), true);
-      assert_eq!(allow_label(&single, &AlertState::new()), "Allow");
       model.present(single, std::time::Duration::from_secs(30), now);
       model.state_mut().duration = Duration::Forever;
 

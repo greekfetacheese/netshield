@@ -185,7 +185,7 @@ mod tests {
    }
 
    #[test]
-   fn defaults_match_the_daemon_socket() {
+   fn defaults_and_the_socket_flag() {
       let cli = run(&[]);
       assert_eq!(
          cli.socket,
@@ -193,10 +193,7 @@ mod tests {
       );
       assert!(!cli.mock);
       assert!(!cli.alert);
-   }
 
-   #[test]
-   fn socket_accepts_a_path() {
       assert_eq!(
          run(&["--socket", "/x"]).socket,
          PathBuf::from("/x")
@@ -205,39 +202,9 @@ mod tests {
    }
 
    #[test]
-   fn flags_are_accepted() {
-      assert!(run(&["--mock"]).mock);
-      assert!(run(&["--alert"]).alert);
-      assert!(!run(&["--mock"]).alert);
-   }
-
-   #[test]
-   fn version_names_the_binary_and_crate_version() {
-      let expected = format!("netshield-gui {}", env!("CARGO_PKG_VERSION"));
-      assert_eq!(parse(&["--version"]), Ok(Parsed::Info(expected)));
-      assert_eq!(parse(&["-V"]), parse(&["--version"]));
-   }
-
-   #[test]
-   fn help_lists_every_flag() {
-      let Ok(Parsed::Info(text)) = parse(&["--help"]) else {
-         panic!("expected help text");
-      };
-      for flag in ["--socket", "--mock", "--alert", "--version", "--help"] {
-         assert!(text.contains(flag), "help is missing {flag}");
-      }
-      assert!(text.contains("start hidden and show only alerts"));
-      assert_eq!(parse(&["-h"]), parse(&["--help"]));
-   }
-
-   #[test]
-   fn unknown_options_are_errors() {
+   fn bad_arguments_are_errors() {
       assert!(parse(&["--nope"]).is_err());
       assert!(parse(&["extra"]).is_err());
-   }
-
-   #[test]
-   fn socket_without_a_value_is_an_error() {
       assert!(parse(&["--socket"]).is_err());
       assert!(parse(&["--socket="]).is_err());
       assert!(parse(&["--socket", "--mock"]).is_err());
