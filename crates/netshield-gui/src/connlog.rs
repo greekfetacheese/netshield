@@ -4,7 +4,7 @@
 //! without bound: the oldest rows are dropped and counted instead. Each row is flattened
 //! when it is pushed so the table does no formatting work on every frame.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -89,13 +89,31 @@ fn app_label(view: &ConnectionView) -> String {
    }
 }
 
-/// A fixed-capacity ring of rendered connections, oldest first.
+/// One application's slice of the log: a ring of its own, so the busiest process on the
+/// machine cannot evict a quiet one's history.
+#[derive(Clone, Debug)]
+struct AppLog {
+   /// This application's rows, oldest first, never more than `ConnectionLog::per_app`.
+   rows: VecDeque<Arc<Row>>,
+   /// Unix seconds of the newest row, which is what picks the application to evict.
+   last_at: u64,
+}
+
+/// A bounded, render-ready history of connection events, capped per application.
+///
+/// The cap is per process on purpose: one p2p client opening hundreds of flows a second used
+/// to fill a single global ring and evict every other process from the history.
 #[derive(Debug)]
 pub struct ConnectionLog {
-   /// Rows are shared rather than owned so handing a snapshot of the log to another thread
-   /// is a refcount bump instead of a deep clone of every string in the history.
-   rows: VecDeque<Arc<Row>>,
-   capacity: usize,
+   /// One ring per application, in the order the applications were first seen. That order is
+   /// not an output order — the Connections page sorts what it draws.
+   apps: Vec<AppLog>,
+   /// Application name → slot in `apps`.
+   index: HashMap<String, usize>,
+   /// How many rows one application may keep.
+   per_app: usize,
+   /// How many applications the log tracks at once.
+   max_apps: usize,
    dropped: u64,
    /// Bumped whenever the contents change, so the UI can cache a derived line list and
    /// rebuild it only when the log actually moved.
@@ -103,36 +121,94 @@ pub struct ConnectionLog {
 }
 
 impl ConnectionLog {
-   /// Creates a log that keeps at most `capacity` rows.
-   pub fn new(capacity: usize) -> Self {
+   /// Creates a log that keeps at most `per_app` rows for each of `max_apps` applications.
+   pub fn new(per_app: usize, max_apps: usize) -> Self {
       Self {
-         rows: VecDeque::with_capacity(capacity),
-         capacity,
+         apps: Vec::with_capacity(max_apps),
+         index: HashMap::new(),
+         per_app,
+         max_apps,
          dropped: 0,
          version: 0,
       }
    }
 
-   /// Appends one event, dropping the oldest row once the capacity is reached.
+   /// Appends one event, dropping the row that fell out of its own application's ring.
    pub fn push(&mut self, event: &ConnectionEvent) {
-      if self.capacity == 0 {
+      if self.per_app == 0 || self.max_apps == 0 {
          self.dropped += 1;
          self.version += 1;
          return;
       }
-      while self.rows.len() >= self.capacity {
-         self.rows.pop_front();
-         self.dropped += 1;
+      let row = Arc::new(Row::from_event(event));
+      let app = row.app.clone();
+      let at = row.at;
+      let slot = match self.index.get(&app).copied() {
+         Some(slot) => slot,
+         None => {
+            if self.apps.len() >= self.max_apps {
+               self.evict_the_quietest();
+            }
+            self.apps.push(AppLog {
+               rows: VecDeque::new(),
+               last_at: at,
+            });
+            self.index.insert(app, self.apps.len() - 1);
+            self.apps.len() - 1
+         }
+      };
+
+      let mut evicted = 0_u64;
+      {
+         let log = &mut self.apps[slot];
+         while log.rows.len() >= self.per_app {
+            log.rows.pop_front();
+            evicted += 1;
+         }
+         log.last_at = log.last_at.max(at);
+         log.rows.push_back(row);
       }
-      self.rows.push_back(Arc::new(Row::from_event(event)));
+      self.dropped += evicted;
       self.version += 1;
    }
 
-   /// Rows oldest first; the table reverses this so the newest is on top.
-   /// The rows are shared, so this borrows through the reference rather than handing out the
-   /// owning count.
-   pub fn rows(&self) -> impl DoubleEndedIterator<Item = &Row> {
-      self.rows.iter().map(std::convert::AsRef::as_ref)
+   /// Drops the application that has been quiet longest, so a new one fits.
+   ///
+   /// Ties break on the name, so the choice never depends on hash order.
+   fn evict_the_quietest(&mut self) {
+      let quietest = self
+         .index
+         .iter()
+         .min_by(
+            |(left_name, left_slot), (right_name, right_slot)| {
+               self.apps[**left_slot]
+                  .last_at
+                  .cmp(&self.apps[**right_slot].last_at)
+                  .then_with(|| left_name.cmp(right_name))
+            },
+         )
+         .map(|(name, slot)| (name.clone(), *slot));
+      let Some((name, slot)) = quietest else {
+         return;
+      };
+
+      let removed = self.apps.remove(slot);
+      self.dropped += removed.rows.len() as u64;
+      self.index.remove(&name);
+      // The slots after the removed application shifted down by one.
+      for index in self.index.values_mut() {
+         if *index > slot {
+            *index -= 1;
+         }
+      }
+   }
+
+   /// Every row, oldest first within each application.
+   ///
+   /// The interleaving between applications is not an order: the Connections page sorts the
+   /// rows it draws, so a caller that needs one sorts by `at` itself.
+   pub fn rows(&self) -> impl Iterator<Item = &Row> {
+      self.apps.iter().flat_map(|log| log.rows.iter()).map(AsRef::as_ref)
    }
 
    /// A frozen copy of the log for a background rebuild.
@@ -142,19 +218,21 @@ impl ConnectionLog {
    /// point of taking one.
    pub fn snapshot(&self) -> Self {
       Self {
-         rows: self.rows.clone(),
-         capacity: self.capacity,
+         apps: self.apps.clone(),
+         index: self.index.clone(),
+         per_app: self.per_app,
+         max_apps: self.max_apps,
          dropped: self.dropped,
          version: self.version,
       }
    }
 
    pub fn len(&self) -> usize {
-      self.rows.len()
+      self.apps.iter().map(|log| log.rows.len()).sum()
    }
 
    pub fn is_empty(&self) -> bool {
-      self.rows.is_empty()
+      self.apps.iter().all(|log| log.rows.is_empty())
    }
 
    /// How many rows fell out of the front of the log.
@@ -202,7 +280,7 @@ mod tests {
 
    #[test]
    fn keeps_capacity_and_drops_the_oldest() {
-      let mut log = ConnectionLog::new(500);
+      let mut log = ConnectionLog::new(500, 32);
       for at in 0..520 {
          log.push(&event(at, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
       }
@@ -210,10 +288,7 @@ mod tests {
       assert_eq!(log.len(), 500);
       assert_eq!(log.dropped(), 20);
       assert_eq!(log.rows().next().map(|row| row.at), Some(20));
-      assert_eq!(
-         log.rows().next_back().map(|row| row.at),
-         Some(519)
-      );
+      assert_eq!(log.rows().last().map(|row| row.at), Some(519));
    }
 
    #[test]
@@ -256,7 +331,7 @@ mod tests {
 
    #[test]
    fn the_version_moves_only_when_the_log_changes() {
-      let mut log = ConnectionLog::new(2);
+      let mut log = ConnectionLog::new(2, 32);
       let start = log.version();
       assert_eq!(
          log.version(),
@@ -273,9 +348,68 @@ mod tests {
       assert!(log.version() > pushed, "a drop is a change too");
 
       // A zero-capacity log has no rows but still counts its drops.
-      let mut empty = ConnectionLog::new(0);
+      let mut empty = ConnectionLog::new(0, 32);
       let before = empty.version();
       empty.push(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
       assert_eq!(empty.version(), before + 1);
+   }
+
+   #[test]
+   fn one_process_cannot_evict_another() {
+      let mut log = ConnectionLog::new(100, 32);
+      for at in 0..300 {
+         log.push(&event(at, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      }
+      assert_eq!(
+         log.len(),
+         100,
+         "the busy app is capped on its own"
+      );
+      assert_eq!(log.dropped(), 200);
+
+      // A quiet app keeps every row it ever had, however busy the other one is.
+      let mut quiet = view(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+      quiet.app_name = "quiet".to_owned();
+      for at in 0..3 {
+         log.push(&event(300 + at, quiet.clone()));
+      }
+      assert_eq!(log.len(), 103);
+      assert_eq!(
+         log.rows().filter(|row| row.app == "quiet").count(),
+         3,
+         "the busy app's overflow never reaches another app's history"
+      );
+   }
+
+   #[test]
+   fn the_quietest_app_is_the_one_evicted() {
+      let mut log = ConnectionLog::new(10, 2);
+      let mut alpha = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
+      alpha.app_name = "alpha".to_owned();
+      let mut bravo = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
+      bravo.app_name = "bravo".to_owned();
+      let mut charlie = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
+      charlie.app_name = "charlie".to_owned();
+
+      log.push(&event(10, alpha.clone()));
+      log.push(&event(20, bravo));
+      assert_eq!(log.len(), 2);
+
+      // charlie arrives against a two-app budget: alpha goes, because its newest row is oldest.
+      log.push(&event(30, charlie));
+      assert_eq!(log.len(), 2);
+      assert_eq!(log.dropped(), 1);
+      assert_eq!(
+         log.rows().map(|row| row.app.as_str()).collect::<Vec<_>>(),
+         vec!["bravo", "charlie"]
+      );
+
+      // alpha speaks again, so bravo is now the quiet one — not the oldest slot.
+      log.push(&event(40, alpha));
+      assert_eq!(
+         log.rows().map(|row| row.app.as_str()).collect::<Vec<_>>(),
+         vec!["charlie", "alpha"],
+         "the quietest app goes, not the first one inserted"
+      );
    }
 }
