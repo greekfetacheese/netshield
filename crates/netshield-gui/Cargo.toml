@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 egui = "0.37"
-egui-elements = { version = "1.4.0", features = ["full"] }
+egui-elements = { version = "1.4.0", features = ["elegance"] }
 egui-elegance = "0.17"
 egui-lucide = "0.2"
 netshield-core = { path = "../netshield-core" }
