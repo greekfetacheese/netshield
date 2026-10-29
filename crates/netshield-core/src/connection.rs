@@ -189,21 +189,14 @@ mod tests {
    }
 
    #[test]
-   fn flow_key_is_stable_for_equal_connections() {
+   fn flow_key_is_stable_and_changes_with_pid_or_port() {
       assert_eq!(conn(42, 443).flow_key(), conn(42, 443).flow_key());
-   }
-
-   #[test]
-   fn flow_key_changes_with_pid_or_port() {
       assert_ne!(conn(42, 443).flow_key(), conn(43, 443).flow_key());
       assert_ne!(
          conn(42, 443).flow_key(),
          conn(42, 8443).flow_key()
       );
-   }
 
-   #[test]
-   fn flow_key_of_unknown_attribution_has_no_pid() {
       let mut c = conn(42, 443);
       c.process = Attribution::Unknown;
       assert_eq!(c.flow_key().pid, None);
@@ -225,15 +218,7 @@ mod tests {
    }
 
    #[test]
-   fn l4proto_labels() {
-      assert_eq!(L4Proto::Tcp.as_str(), "tcp");
-      assert_eq!(L4Proto::Udp.to_string(), "udp");
-      assert_eq!(L4Proto::Icmp.to_string(), "icmp");
-      assert_eq!(L4Proto::Other(132).to_string(), "other");
-   }
-
-   #[test]
-   fn attribution_accessors() {
+   fn attribution_accessors_and_protocol_labels() {
       let attributed = conn(7, 443);
       assert_eq!(attributed.process.uid(), Some(1000));
       assert_eq!(
@@ -244,6 +229,11 @@ mod tests {
       let unknown = Attribution::Unknown;
       assert_eq!(unknown.uid(), None);
       assert_eq!(unknown.exe(), None);
+
+      assert_eq!(L4Proto::Tcp.as_str(), "tcp");
+      assert_eq!(L4Proto::Udp.to_string(), "udp");
+      assert_eq!(L4Proto::Icmp.to_string(), "icmp");
+      assert_eq!(L4Proto::Other(132).to_string(), "other");
    }
 
    #[test]

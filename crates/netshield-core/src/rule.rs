@@ -306,53 +306,30 @@ mod tests {
 
    #[test]
    fn normalize_host_lowercases_and_strips_one_trailing_dot() {
-      assert_eq!(
-         normalize_host("API.GitHub.COM.").unwrap(),
-         "api.github.com"
-      );
-      assert_eq!(
-         normalize_host("api.github.com..").unwrap(),
-         "api.github.com."
-      );
-   }
-
-   #[test]
-   fn normalize_host_accepts_literals_and_fqdn() {
-      assert_eq!(
-         normalize_host("2001:DB8::1").unwrap(),
-         "2001:db8::1"
-      );
-      assert_eq!(normalize_host("1.2.3.4").unwrap(), "1.2.3.4");
-      assert_eq!(
-         normalize_host("api.github.com").unwrap(),
-         "api.github.com"
-      );
+      for (raw, expected) in [
+         ("API.GitHub.COM.", "api.github.com"),
+         ("api.github.com..", "api.github.com."),
+         ("2001:DB8::1", "2001:db8::1"),
+         ("1.2.3.4", "1.2.3.4"),
+         ("api.github.com", "api.github.com"),
+      ] {
+         assert_eq!(normalize_host(raw).unwrap(), expected, "{raw:?}");
+      }
    }
 
    #[test]
    fn normalize_host_rejects_caller_errors() {
-      assert_eq!(
-         normalize_host("https://x/y"),
-         Err(RuleError::HostHasScheme)
-      );
-      assert_eq!(
-         normalize_host("host:443"),
-         Err(RuleError::HostHasPort)
-      );
-      assert_eq!(
-         normalize_host("a b"),
-         Err(RuleError::HostHasWhitespace)
-      );
-      assert_eq!(normalize_host(""), Err(RuleError::EmptyHost));
-      assert_eq!(normalize_host("."), Err(RuleError::EmptyHost));
-      assert_eq!(
-         normalize_host("host/path"),
-         Err(RuleError::HostHasPath)
-      );
-   }
+      for (raw, expected) in [
+         ("https://x/y", RuleError::HostHasScheme),
+         ("host:443", RuleError::HostHasPort),
+         ("a b", RuleError::HostHasWhitespace),
+         ("", RuleError::EmptyHost),
+         (".", RuleError::EmptyHost),
+         ("host/path", RuleError::HostHasPath),
+      ] {
+         assert_eq!(normalize_host(raw), Err(expected), "{raw:?}");
+      }
 
-   #[test]
-   fn normalize_host_rejects_254_bytes_but_accepts_253() {
       let too_long = "a".repeat(254);
       assert_eq!(
          normalize_host(&too_long),
@@ -375,32 +352,6 @@ mod tests {
 
       assert!(AppMatcher::Unknown.matches(&Attribution::Unknown));
       assert!(!AppMatcher::Unknown.matches(&process(Some("/usr/bin/x"))));
-   }
-
-   #[test]
-   fn dest_matcher_ranks() {
-      assert_eq!(
-         DestMatcher::Domain {
-            host: "a.example".to_owned(),
-            subdomains: false
-         }
-         .rank(),
-         40
-      );
-      assert_eq!(
-         DestMatcher::Domain {
-            host: "a.example".to_owned(),
-            subdomains: true
-         }
-         .rank(),
-         30
-      );
-      assert_eq!(
-         DestMatcher::Ip("10.0.0.0/8".parse().unwrap()).rank(),
-         20
-      );
-      assert_eq!(DestMatcher::Port(443).rank(), 10);
-      assert_eq!(DestMatcher::Any.rank(), 0);
    }
 
    #[test]
@@ -479,7 +430,7 @@ mod tests {
    }
 
    #[test]
-   fn rule_serde_round_trip_is_lossless() {
+   fn the_rule_and_matcher_wire_shapes() {
       let rule = Rule {
          id: RuleId::new_unique(),
          enabled: false,
@@ -499,10 +450,7 @@ mod tests {
       let json = serde_json::to_string(&rule).unwrap();
       let back: Rule = serde_json::from_str(&json).unwrap();
       assert_eq!(back, rule);
-   }
 
-   #[test]
-   fn every_matcher_variant_round_trips() {
       let apps = [
          AppMatcher::Any,
          AppMatcher::Exe(PathBuf::from("/usr/bin/curl")),
@@ -536,10 +484,7 @@ mod tests {
             dest
          );
       }
-   }
 
-   #[test]
-   fn action_and_duration_serialize_lowercase() {
       assert_eq!(
          serde_json::to_string(&Action::Deny).unwrap(),
          "\"deny\""

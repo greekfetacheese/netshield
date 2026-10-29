@@ -222,138 +222,165 @@ mod tests {
    }
 
    #[test]
-   fn destination_ranks_win_in_descending_order() {
-      // Inserted worst-first so the winner cannot be explained by insertion order.
-      let mut set = RuleSet::new();
-      let any = rule(
-         AppMatcher::Any,
-         DestMatcher::Any,
-         Action::Allow,
-         0,
-      );
-      let port = rule(
-         AppMatcher::Any,
-         DestMatcher::Port(443),
-         Action::Allow,
-         0,
-      );
-      let ip = rule(
-         AppMatcher::Any,
-         DestMatcher::Ip("140.82.0.0/16".parse::<IpNet>().unwrap()),
-         Action::Allow,
-         0,
-      );
-      let subdomains = rule(
-         AppMatcher::Any,
-         DestMatcher::Domain {
-            host: "github.com".to_owned(),
-            subdomains: true,
-         },
-         Action::Allow,
-         0,
-      );
-      let exact = rule(AppMatcher::Any, api_github(), Action::Allow, 0);
+   fn the_precedence_order_is_lexicographic_with_deny_winning_ties() {
+      type Case = (&'static str, fn(&str));
+      let cases: [Case; 6] = [
+         (
+            "rank ladder, inserted worst-first so insertion order cannot explain the winner",
+            |reason| {
+               let mut set = RuleSet::new();
+               let any = rule(
+                  AppMatcher::Any,
+                  DestMatcher::Any,
+                  Action::Allow,
+                  0,
+               );
+               let port = rule(
+                  AppMatcher::Any,
+                  DestMatcher::Port(443),
+                  Action::Allow,
+                  0,
+               );
+               let ip = rule(
+                  AppMatcher::Any,
+                  DestMatcher::Ip("140.82.0.0/16".parse::<IpNet>().unwrap()),
+                  Action::Allow,
+                  0,
+               );
+               let subdomains = rule(
+                  AppMatcher::Any,
+                  DestMatcher::Domain {
+                     host: "github.com".to_owned(),
+                     subdomains: true,
+                  },
+                  Action::Allow,
+                  0,
+               );
+               let exact = rule(AppMatcher::Any, api_github(), Action::Allow, 0);
 
-      for candidate in [&any, &port, &ip, &subdomains, &exact] {
-         set.upsert(candidate.clone());
-         assert_eq!(
-            set.evaluate(&firefox_conn()),
-            Outcome::Allow {
-               rule: candidate.id.clone()
+               for candidate in [&any, &port, &ip, &subdomains, &exact] {
+                  set.upsert(candidate.clone());
+                  assert_eq!(
+                     set.evaluate(&firefox_conn()),
+                     Outcome::Allow {
+                        rule: candidate.id.clone()
+                     },
+                     "{reason}: rank of {:?} should win",
+                     candidate.dest
+                  );
+               }
             },
-            "rank of {:?} should win",
-            candidate.dest
-         );
-      }
-   }
+         ),
+         (
+            "app-over-destination: the app rule outranks the destination winner",
+            |reason| {
+               let mut set = RuleSet::new();
+               let app_deny = rule(firefox(), DestMatcher::Any, Action::Deny, 0);
+               let global_allow = rule(AppMatcher::Any, api_github(), Action::Allow, 0);
+               // Global rule first, so insertion order cannot be what makes the app rule win.
+               set.upsert(global_allow.clone());
+               set.upsert(app_deny.clone());
 
-   #[test]
-   fn app_rank_outranks_destination_rank() {
-      let mut set = RuleSet::new();
-      let app_deny = rule(firefox(), DestMatcher::Any, Action::Deny, 0);
-      let global_allow = rule(AppMatcher::Any, api_github(), Action::Allow, 0);
-      // Global rule first, so insertion order cannot be what makes the app rule win.
-      set.upsert(global_allow.clone());
-      set.upsert(app_deny.clone());
+               assert_eq!(
+                  set.evaluate(&firefox_conn()),
+                  Outcome::Deny {
+                     rule: app_deny.id.clone()
+                  },
+                  "{reason}"
+               );
 
-      assert_eq!(
-         set.evaluate(&firefox_conn()),
-         Outcome::Deny {
-            rule: app_deny.id.clone()
-         }
-      );
-
-      // Sanity check the scenario: the global rule really is the destination winner.
-      let mut without_app = RuleSet::new();
-      without_app.upsert(global_allow.clone());
-      assert_eq!(
-         without_app.evaluate(&firefox_conn()),
-         Outcome::Allow {
-            rule: global_allow.id.clone()
-         }
-      );
-   }
-
-   #[test]
-   fn deny_wins_an_equal_tie_in_either_insertion_order() {
-      for deny_first in [true, false] {
-         let mut set = RuleSet::new();
-         let allow = rule(AppMatcher::Any, api_github(), Action::Allow, 5);
-         let deny = rule(AppMatcher::Any, api_github(), Action::Deny, 5);
-         if deny_first {
-            set.upsert(deny.clone());
-            set.upsert(allow.clone());
-         } else {
-            set.upsert(allow.clone());
-            set.upsert(deny.clone());
-         }
-         assert_eq!(
-            set.evaluate(&firefox_conn()),
-            Outcome::Deny {
-               rule: deny.id.clone()
+               // Sanity check the scenario: the global rule really is the destination winner.
+               let mut without_app = RuleSet::new();
+               without_app.upsert(global_allow.clone());
+               assert_eq!(
+                  without_app.evaluate(&firefox_conn()),
+                  Outcome::Allow {
+                     rule: global_allow.id.clone()
+                  },
+                  "{reason}: the scenario's destination winner must be the global rule"
+               );
             },
-            "deny must win (deny_first = {deny_first})"
-         );
+         ),
+         (
+            "deny-wins-ties: deny inserted first wins the action tie",
+            |reason| {
+               let mut set = RuleSet::new();
+               let allow = rule(AppMatcher::Any, api_github(), Action::Allow, 5);
+               let deny = rule(AppMatcher::Any, api_github(), Action::Deny, 5);
+               set.upsert(deny.clone());
+               set.upsert(allow.clone());
+               assert_eq!(
+                  set.evaluate(&firefox_conn()),
+                  Outcome::Deny {
+                     rule: deny.id.clone()
+                  },
+                  "{reason}"
+               );
+            },
+         ),
+         (
+            "deny-wins-ties: deny inserted second wins the action tie",
+            |reason| {
+               let mut set = RuleSet::new();
+               let allow = rule(AppMatcher::Any, api_github(), Action::Allow, 5);
+               let deny = rule(AppMatcher::Any, api_github(), Action::Deny, 5);
+               set.upsert(allow.clone());
+               set.upsert(deny.clone());
+               assert_eq!(
+                  set.evaluate(&firefox_conn()),
+                  Outcome::Deny {
+                     rule: deny.id.clone()
+                  },
+                  "{reason}"
+               );
+            },
+         ),
+         (
+            "newer-wins after an action tie, and an older re-insert does not displace it",
+            |reason| {
+               let mut set = RuleSet::new();
+               let old = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
+               let new = rule(AppMatcher::Any, api_github(), Action::Allow, 20);
+               set.upsert(old.clone());
+               set.upsert(new.clone());
+               assert_eq!(
+                  set.evaluate(&firefox_conn()),
+                  Outcome::Allow {
+                     rule: new.id.clone()
+                  },
+                  "{reason}"
+               );
+
+               // A later insert with an older timestamp must not displace the incumbent.
+               set.upsert(old.clone());
+               assert_eq!(
+                  set.evaluate(&firefox_conn()),
+                  Outcome::Allow {
+                     rule: new.id.clone()
+                  },
+                  "{reason}: the older re-insert must not displace the incumbent"
+               );
+            },
+         ),
+         ("first-inserted wins the final tie", |reason| {
+            let mut set = RuleSet::new();
+            let first = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
+            let second = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
+            set.upsert(first.clone());
+            set.upsert(second.clone());
+            assert_eq!(
+               set.evaluate(&firefox_conn()),
+               Outcome::Allow {
+                  rule: first.id.clone()
+               },
+               "{reason}"
+            );
+         }),
+      ];
+
+      for (reason, case) in cases {
+         case(reason);
       }
-   }
-
-   #[test]
-   fn newer_rule_wins_after_action_tie() {
-      let mut set = RuleSet::new();
-      let old = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
-      let new = rule(AppMatcher::Any, api_github(), Action::Allow, 20);
-      set.upsert(old.clone());
-      set.upsert(new.clone());
-      assert_eq!(
-         set.evaluate(&firefox_conn()),
-         Outcome::Allow {
-            rule: new.id.clone()
-         }
-      );
-
-      // A later insert with an older timestamp must not displace the incumbent.
-      set.upsert(old.clone());
-      assert_eq!(
-         set.evaluate(&firefox_conn()),
-         Outcome::Allow {
-            rule: new.id.clone()
-         }
-      );
-   }
-
-   #[test]
-   fn first_inserted_wins_the_final_tie() {
-      let mut set = RuleSet::new();
-      let first = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
-      let second = rule(AppMatcher::Any, api_github(), Action::Allow, 10);
-      set.upsert(first.clone());
-      set.upsert(second.clone());
-      assert_eq!(
-         set.evaluate(&firefox_conn()),
-         Outcome::Allow {
-            rule: first.id.clone()
-         }
-      );
    }
 
    #[test]

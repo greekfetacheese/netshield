@@ -432,16 +432,12 @@ mod tests {
    }
 
    #[test]
-   fn requests_round_trip() {
+   fn requests_and_responses_round_trip() {
       for request in requests() {
          let bytes = encode_line(&request).expect("serialisable request");
          let decoded = decode_line::<Request>(&bytes).expect("decodable request");
          assert_eq!(decoded, request);
       }
-   }
-
-   #[test]
-   fn responses_round_trip() {
       for response in responses() {
          let bytes = encode_line(&response).expect("serialisable response");
          let decoded = decode_line::<Response>(&bytes).expect("decodable response");
@@ -477,52 +473,45 @@ mod tests {
    }
 
    #[test]
-   fn scope_choice_address_round_trips() {
-      let scope = ScopeChoice::Address;
-      let bytes = encode_line(&scope).expect("serialisable scope");
-      assert_eq!(
-         decode_line::<ScopeChoice>(&bytes).expect("decodable scope"),
-         scope
-      );
-      assert_eq!(
-         serde_json::to_value(&scope).expect("serialisable scope"),
-         serde_json::json!({ "kind": "address" })
-      );
+   fn the_scope_choice_wire_shapes() {
+      for (scope, wire) in [
+         (
+            ScopeChoice::Address,
+            serde_json::json!({ "kind": "address" }),
+         ),
+         (
+            ScopeChoice::TheseDestinations,
+            serde_json::json!({ "kind": "these_destinations" }),
+         ),
+      ] {
+         let bytes = encode_line(&scope).expect("serialisable scope");
+         assert_eq!(
+            decode_line::<ScopeChoice>(&bytes).expect("decodable scope"),
+            scope
+         );
+         assert_eq!(
+            serde_json::to_value(&scope).expect("serialisable scope"),
+            wire
+         );
+      }
    }
 
    #[test]
-   fn scope_choice_these_destinations_serializes_without_a_value() {
-      let scope = ScopeChoice::TheseDestinations;
-      let bytes = encode_line(&scope).expect("serialisable scope");
-      assert_eq!(
-         serde_json::to_value(&scope).expect("serialisable scope"),
-         serde_json::json!({ "kind": "these_destinations" })
-      );
-      assert_eq!(
-         decode_line::<ScopeChoice>(&bytes).expect("decodable scope"),
-         scope
-      );
-   }
-
-   #[test]
-   fn trailing_newline_is_tolerated_but_arrays_are_not() {
+   fn a_frame_tolerates_a_newline_and_enforces_its_bound() {
       assert_eq!(
          decode_line::<Request>(b"{\"kind\":\"subscribe\"}\n").expect("decodable"),
          Request::Subscribe
       );
       assert!(decode_line::<Request>(b"[]").is_err());
       assert!(decode_line::<Request>(b"[{\"kind\":\"subscribe\"}]").is_err());
-   }
 
-   #[test]
-   fn frame_len_boundary_is_inclusive() {
       assert!(frame_len_ok(0));
       assert!(frame_len_ok(MAX_FRAME_LEN));
       assert!(!frame_len_ok(MAX_FRAME_LEN + 1));
    }
 
    #[test]
-   fn view_copies_endpoints_and_the_first_candidate() {
+   fn the_view_and_attribution_snapshot() {
       let conn = Connection {
          family: Family::V4,
          proto: L4Proto::Tcp,
@@ -563,10 +552,7 @@ mod tests {
       assert_eq!(view.local_port, 51_234);
       assert_eq!(view.domain.as_deref(), Some("api.github.com"));
       assert_eq!(view.domain_candidates, candidates);
-   }
 
-   #[test]
-   fn unknown_attribution_leaves_pid_and_exe_empty() {
       let conn = Connection {
          family: Family::V6,
          proto: L4Proto::Udp,
