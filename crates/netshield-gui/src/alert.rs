@@ -17,14 +17,14 @@ use netshield_core::rule::{Action, Duration};
 /// The host window's width; the panel never outgrows it.
 pub const WIDTH: f32 = 480.0;
 
-/// The host window's height. [`layout_height_estimate`] must stay below it.
+/// The tallest the host window may grow. [`layout_height_estimate`] must stay below it.
 ///
 /// Grown from 404 when the rule preview line was added, and from 440 when a grouped prompt
 /// got the scope picker back: a group now draws the list *and* one scope row, so its stack is
-/// no longer the shorter shape. The measured stack (with a queued prompt) is 410pt, and a
-/// fixed viewport silently clips rather than scrolls, so the window grows once here instead
-/// of resizing per prompt.
-pub const HEIGHT: f32 = 462.0;
+/// no longer the shorter shape. The window now takes the height its content measures, capped
+/// here: a tall prompt cannot outgrow the budget, and a short one no longer sits above a
+/// block of background. The measured stack (with a queued prompt) is 410pt.
+pub const MAX_HEIGHT: f32 = 462.0;
 
 /// Inner margin of the alert panel, in points, applied on all four sides.
 const PANEL_MARGIN: i8 = 14;
@@ -69,8 +69,8 @@ const APP_NAME_CHARS: usize = 30;
 /// How many destinations the group list shows before the `+N more` remainder.
 ///
 /// Three, not four: the scope control is drawn for a group too and costs one row, so the
-/// list gives that row back. The panel is a fixed size, and a longer list would push the
-/// action buttons past [`HEIGHT`] on the tallest shape.
+/// list gives that row back. A longer list would push the action buttons past
+/// [`MAX_HEIGHT`] on the tallest shape.
 pub const DEST_LINES: usize = 3;
 
 /// Longest app name kept in a scope row before it is elided.
@@ -578,12 +578,12 @@ fn destination_label(view: &ConnectionView) -> String {
 
 /// Draws the whole alert into `ui`. Returns the chosen action, if any button was pressed.
 ///
-/// The fixed layout is sized for the 480x462 host: app name, destination, duration, scope,
-/// countdown and the action buttons all fit without scrolling. The app row is drawn first so
-/// a future section cannot push it off the top again; [`layout_height_estimate`] is the
-/// budget that guards that. The scope picker is always drawn, a group included: a group's
-/// list is visibly capped, and its default row is the app-wide rule that ends the prompting
-/// for the app instead of writing one rule per address.
+/// The layout is sized for the 480pt-wide host: app name, destination, duration, scope,
+/// countdown and the action buttons all fit without scrolling under [`MAX_HEIGHT`]. The app
+/// row is drawn first so a future section cannot push it off the top again;
+/// [`layout_height_estimate`] is the budget that guards that. The scope picker is always
+/// drawn, a group included: a group's list is visibly capped, and its default row is the
+/// app-wide rule that ends the prompting for the app instead of writing one rule per address.
 ///
 /// `waiting` is the number of *other* prompts open right now. It only adds the `+N waiting`
 /// counter to the app row and the `Later` button to the action row; a lone prompt draws
@@ -606,8 +606,8 @@ pub fn ui(
    // The constants exist to catch a section that outgrows the fixed host window; the
    // matching test below states the spare margin the real layout must leave.
    debug_assert!(
-      layout_height_estimate() <= HEIGHT,
-      "the alert layout outgrew its {HEIGHT}pt host window",
+      layout_height_estimate() <= MAX_HEIGHT,
+      "the alert layout outgrew its {MAX_HEIGHT}pt host window",
    );
 
    panel_frame(ui).show(ui, |ui| {
@@ -772,7 +772,7 @@ fn shortcut_action(ui: &Ui, waiting: usize) -> Option<AlertAction> {
 
 /// Conservative vertical budget of the tallest panel the alert can draw, in points.
 ///
-/// It is deliberately generous: a real render must fit the configured window with room to
+/// It is deliberately generous: a real render must fit under the height cap with room to
 /// spare, and the test below keeps a future section from silently clipping the app row.
 /// The header spare is always counted, even though it is slack rather than a section: the
 /// estimate must not change when a second prompt arrives.
@@ -885,8 +885,8 @@ fn destination(ui: &mut Ui, view: &ConnectionView) {
 /// `· +N more` remainder.
 ///
 /// One line per destination, so an answer's reach is visible instead of implied. The cap
-/// keeps a large group from pushing the fixed panel past [`HEIGHT`]; the remainder line
-/// still states how many destinations are not named.
+/// keeps a large group from pushing the panel past [`MAX_HEIGHT`]; the remainder line still
+/// states how many destinations are not named.
 fn destination_list(ui: &mut Ui, prompt: &PromptRequest) {
    let muted = Theme::current(ui.ctx()).colors.text_muted;
    for line in destination_lines(prompt) {
@@ -1027,6 +1027,31 @@ fn app_name(view: &ConnectionView) -> String {
 /// `<ip>:<port>`, with brackets for IPv6.
 fn endpoint(view: &ConnectionView) -> String {
    SocketAddr::new(view.remote_ip, view.remote_port).to_string()
+}
+
+/// The height the panel measures for `request`, as the real window would take it.
+///
+/// Runs one egui pass at the host width and reads `ui.min_rect().height()` after the same
+/// `ui` call the viewport makes, so the sizing tests need no window.
+#[cfg(test)]
+pub(crate) fn measured_height(request: &PromptRequest, waiting: usize) -> f32 {
+   let ctx = egui::Context::default();
+   crate::theme::install(&ctx);
+   let input = egui::RawInput {
+      screen_rect: Some(egui::Rect::from_min_size(
+         egui::Pos2::ZERO,
+         egui::vec2(WIDTH, MAX_HEIGHT),
+      )),
+      ..Default::default()
+   };
+   let mut measured = 0.0;
+   let output = ctx.run_ui(input, |root| {
+      let mut state = AlertState::new();
+      ui(root, request, &mut state, 18.0, waiting);
+      measured = root.min_rect().height();
+   });
+   output.drop_without_applying_deltas();
+   measured
 }
 
 #[cfg(test)]
@@ -1405,7 +1430,7 @@ mod tests {
       let input = egui::RawInput {
          screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(WIDTH, HEIGHT),
+            egui::vec2(WIDTH, MAX_HEIGHT),
          )),
          ..Default::default()
       };
@@ -1479,7 +1504,7 @@ mod tests {
       let input = egui::RawInput {
          screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(WIDTH, HEIGHT),
+            egui::vec2(WIDTH, MAX_HEIGHT),
          )),
          ..Default::default()
       };
@@ -1519,7 +1544,7 @@ mod tests {
       let input = egui::RawInput {
          screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(WIDTH, HEIGHT),
+            egui::vec2(WIDTH, MAX_HEIGHT),
          )),
          ..Default::default()
       };
@@ -1716,7 +1741,7 @@ mod tests {
       let input = egui::RawInput {
          screen_rect: Some(egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(WIDTH, HEIGHT),
+            egui::vec2(WIDTH, MAX_HEIGHT),
          )),
          ..Default::default()
       };
@@ -1791,16 +1816,16 @@ mod tests {
    /// The panel's vertical budget must fit the host window with room to spare.
    ///
    /// [`layout_height_estimate`] counts every section but not this spare margin, so a
-   /// section added without growing [`HEIGHT`] fails here instead of clipping the app row.
+   /// section added without growing [`MAX_HEIGHT`] fails here instead of clipping the app row.
    /// A group is measured too: its capped destination list and its one-row-shorter scope
-   /// block must stay inside the same fixed window as the full single-destination stack.
+   /// block must stay under the same cap as the full single-destination stack.
    #[test]
    fn layout_estimate_leaves_headroom_in_the_host_window() {
       const MARGIN: f32 = 24.0;
       let estimate = layout_height_estimate();
       assert!(
-         HEIGHT > estimate + MARGIN,
-         "layout estimate {estimate} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+         MAX_HEIGHT > estimate + MARGIN,
+         "layout estimate {estimate} + {MARGIN} margin must stay below MAX_HEIGHT {MAX_HEIGHT}"
       );
       let group = layout_height(true);
       assert!(
@@ -1808,14 +1833,41 @@ mod tests {
          "the grouped stack {group} must fit the budget {estimate} it shares with the picker"
       );
       assert!(
-         HEIGHT > group + MARGIN,
-         "grouped stack {group} + {MARGIN} margin must stay below HEIGHT {HEIGHT}"
+         MAX_HEIGHT > group + MARGIN,
+         "grouped stack {group} + {MARGIN} margin must stay below MAX_HEIGHT {MAX_HEIGHT}"
       );
-      // The list cap is part of the budget: a fourth line would outgrow the fixed window.
+      // The list cap is part of the budget: a fourth line would outgrow the cap.
       assert_eq!(
          destination_lines(&group_of_six()).len(),
          DEST_LINES + 1,
          "three lines plus the remainder is what the estimate counts"
+      );
+   }
+
+   /// A prompt with one destination asks for a shorter window than the cap; the tallest
+   /// shape the estimate budgets for still fits under it.
+   #[test]
+   fn a_short_prompt_measures_short() {
+      let short = prompt(None, false);
+      assert_eq!(
+         scope_options(&short).len(),
+         2,
+         "a named destination would add a scope"
+      );
+      let short_height = measured_height(&short, 0);
+      assert!(
+         short_height < MAX_HEIGHT,
+         "a two-scope prompt measures {short_height}, not the full {MAX_HEIGHT}"
+      );
+
+      let group_height = measured_height(&group_of_six(), 0);
+      assert!(
+         group_height > short_height,
+         "the six-destination list measures {group_height}, taller than {short_height}"
+      );
+      assert!(
+         group_height <= MAX_HEIGHT,
+         "the tallest shape measures {group_height}, within the {MAX_HEIGHT} cap"
       );
    }
 
