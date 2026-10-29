@@ -171,101 +171,129 @@ mod tests {
    }
 
    #[test]
-   fn parses_v4_cidr_and_masks_host_bits() {
-      let net = net("10.1.2.3/8");
-      assert_eq!(net.addr, ip("10.0.0.0"));
-      assert_eq!(net.prefix, 8);
-      assert_eq!(net.to_string(), "10.0.0.0/8");
+   fn a_cidr_parses_and_masks_its_host_bits() {
+      let cases = [
+         ("10.1.2.3/8", "10.0.0.0", 8, "10.0.0.0/8"),
+         (
+            "2001:db8:1::abcd/32",
+            "2001:db8::",
+            32,
+            "2001:db8::/32",
+         ),
+         ("1.2.3.4", "1.2.3.4", 32, "1.2.3.4/32"),
+         ("::1", "::1", 128, "::1/128"),
+      ];
+      for (input, addr, prefix, display) in cases {
+         let net = net(input);
+         assert_eq!(net.addr, ip(addr), "{input}");
+         assert_eq!(net.prefix, prefix, "{input}");
+         assert_eq!(net.to_string(), display, "{input}");
+      }
    }
 
    #[test]
-   fn parses_v6_cidr_and_masks_host_bits() {
-      let net = net("2001:db8:1::abcd/32");
-      assert_eq!(net.addr, ip("2001:db8::"));
-      assert_eq!(net.prefix, 32);
-      assert_eq!(net.to_string(), "2001:db8::/32");
+   fn a_bad_cidr_is_rejected() {
+      let cases = [
+         (
+            "prefix wider than v4",
+            "10.0.0.0/33".parse::<IpNet>(),
+            IpNetError::BadPrefix,
+         ),
+         (
+            "prefix wider than v6",
+            "2001:db8::/129".parse::<IpNet>(),
+            IpNetError::BadPrefix,
+         ),
+         (
+            "v4 prefix passed to new",
+            IpNet::new(ip("10.0.0.1"), 33),
+            IpNetError::BadPrefix,
+         ),
+         (
+            "v6 prefix passed to new",
+            IpNet::new(ip("2001:db8::1"), 129),
+            IpNetError::BadPrefix,
+         ),
+         (
+            "not an address",
+            "not-an-ip/8".parse::<IpNet>(),
+            IpNetError::BadAddress,
+         ),
+         (
+            "missing prefix",
+            "10.0.0.0/".parse::<IpNet>(),
+            IpNetError::MissingPrefix,
+         ),
+         (
+            "two prefixes",
+            "10.0.0.0/8/9".parse::<IpNet>(),
+            IpNetError::BadAddress,
+         ),
+         (
+            "non-numeric prefix",
+            "10.0.0.0/x".parse::<IpNet>(),
+            IpNetError::BadPrefix,
+         ),
+      ];
+      for (case, parsed, expected) in cases {
+         assert_eq!(parsed, Err(expected), "{case}");
+      }
    }
 
    #[test]
-   fn bare_address_gets_full_width_prefix() {
-      assert_eq!(net("1.2.3.4").to_string(), "1.2.3.4/32");
-      assert_eq!(net("::1").to_string(), "::1/128");
-   }
-
-   #[test]
-   fn rejects_prefix_wider_than_family() {
-      assert_eq!(
-         "10.0.0.0/33".parse::<IpNet>(),
-         Err(IpNetError::BadPrefix)
-      );
-      assert_eq!(
-         "2001:db8::/129".parse::<IpNet>(),
-         Err(IpNetError::BadPrefix)
-      );
-      assert_eq!(
-         IpNet::new(ip("10.0.0.1"), 33),
-         Err(IpNetError::BadPrefix)
-      );
-      assert_eq!(
-         IpNet::new(ip("2001:db8::1"), 129),
-         Err(IpNetError::BadPrefix)
-      );
-   }
-
-   #[test]
-   fn rejects_malformed_input() {
-      assert_eq!(
-         "not-an-ip/8".parse::<IpNet>(),
-         Err(IpNetError::BadAddress)
-      );
-      assert_eq!(
-         "10.0.0.0/".parse::<IpNet>(),
-         Err(IpNetError::MissingPrefix)
-      );
-      assert_eq!(
-         "10.0.0.0/8/9".parse::<IpNet>(),
-         Err(IpNetError::BadAddress)
-      );
-      assert_eq!(
-         "10.0.0.0/x".parse::<IpNet>(),
-         Err(IpNetError::BadPrefix)
-      );
-   }
-
-   #[test]
-   fn contains_network_broadcast_and_one_past() {
-      let net = net("192.168.1.0/24");
-      assert!(net.contains(ip("192.168.1.0")), "network address");
-      assert!(
-         net.contains(ip("192.168.1.255")),
-         "broadcast address"
-      );
-      assert!(net.contains(ip("192.168.1.77")));
-      assert!(
-         !net.contains(ip("192.168.2.0")),
-         "one past broadcast"
-      );
-      assert!(
-         !net.contains(ip("192.168.0.255")),
-         "one before network"
-      );
-   }
-
-   #[test]
-   fn contains_v6_edges() {
-      let net = net("2001:db8::/32");
-      assert!(net.contains(ip("2001:db8::")));
-      assert!(net.contains(ip("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")));
-      assert!(
-         !net.contains(ip("2001:db9::")),
-         "one past the prefix"
-      );
-   }
-
-   #[test]
-   fn cross_family_contains_is_false() {
-      assert!(!net("0.0.0.0/0").contains(ip("::1")));
-      assert!(!net("::/0").contains(ip("127.0.0.1")));
+   fn contains_covers_the_network_and_stops_one_past() {
+      let v4 = net("192.168.1.0/24");
+      let v6 = net("2001:db8::/32");
+      let cases = [
+         ("v4 network address", &v4, ip("192.168.1.0"), true),
+         (
+            "v4 broadcast address",
+            &v4,
+            ip("192.168.1.255"),
+            true,
+         ),
+         ("v4 host address", &v4, ip("192.168.1.77"), true),
+         (
+            "v4 one past broadcast",
+            &v4,
+            ip("192.168.2.0"),
+            false,
+         ),
+         (
+            "v4 one before network",
+            &v4,
+            ip("192.168.0.255"),
+            false,
+         ),
+         ("v6 first address", &v6, ip("2001:db8::"), true),
+         (
+            "v6 last address",
+            &v6,
+            ip("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"),
+            true,
+         ),
+         (
+            "v6 one past the prefix",
+            &v6,
+            ip("2001:db9::"),
+            false,
+         ),
+         (
+            "v6 address in a v4 net",
+            &net("0.0.0.0/0"),
+            ip("::1"),
+            false,
+         ),
+         (
+            "v4 address in a v6 net",
+            &net("::/0"),
+            ip("127.0.0.1"),
+            false,
+         ),
+      ];
+      for (case, net, addr, expected) in cases {
+         assert_eq!(net.contains(addr), expected, "{case}");
+      }
    }
 
    #[test]

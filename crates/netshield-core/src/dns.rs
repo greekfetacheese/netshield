@@ -300,155 +300,180 @@ mod tests {
    }
 
    #[test]
-   fn a_answer_is_parsed_with_name_address_and_ttl() {
-      let msg = response(&[a_record(300)]);
-      let records = parse_response(&msg).expect("valid response");
-      assert_eq!(
-         records,
-         vec![DnsRecord {
-            name: "example.com".to_owned(),
-            kind: RecordKind::A,
-            ttl: 300,
-            target: Target::Address(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
-         }]
-      );
-      assert_no_panic_on_truncation(&msg);
+   fn a_and_aaaa_answers_are_parsed() {
+      let aaaa = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+      let cases = [
+         (
+            "A answer",
+            response(&[a_record(300)]),
+            DnsRecord {
+               name: "example.com".to_owned(),
+               kind: RecordKind::A,
+               ttl: 300,
+               target: Target::Address(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+            },
+         ),
+         (
+            "AAAA answer",
+            response(&[answer(&pointer(12), 28, 60, &aaaa)]),
+            DnsRecord {
+               name: "example.com".to_owned(),
+               kind: RecordKind::Aaaa,
+               ttl: 60,
+               target: Target::Address(IpAddr::V6(Ipv6Addr::new(
+                  0x2001, 0x0db8, 0, 0, 0, 0, 0, 1,
+               ))),
+            },
+         ),
+      ];
+      for (case, msg, expected) in cases {
+         assert_eq!(
+            parse_response(&msg).expect("valid response"),
+            vec![expected],
+            "{case}"
+         );
+         assert_no_panic_on_truncation(&msg);
+      }
    }
 
    #[test]
-   fn aaaa_answer_is_parsed() {
-      let rdata = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-      let msg = response(&[answer(&pointer(12), 28, 60, &rdata)]);
-      let records = parse_response(&msg).expect("valid response");
-      assert_eq!(records.len(), 1);
-      assert_eq!(records[0].kind, RecordKind::Aaaa);
-      assert_eq!(
-         records[0].target,
-         Target::Address(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
-         )))
-      );
-      assert_no_panic_on_truncation(&msg);
-   }
-
-   #[test]
-   fn compressed_answer_name_points_back_to_the_question() {
-      let msg = response(&[a_record(120)]);
-      // The answer name is a two-byte pointer to offset 12, the question's first label.
-      let records = parse_response(&msg).expect("valid response");
-      assert_eq!(records[0].name, "example.com");
-      assert_no_panic_on_truncation(&msg);
-   }
-
-   #[test]
-   fn cname_target_may_be_compressed() {
-      // An answer named by a pointer to the question, whose rdata is a pointer to the
-      // canonical name embedded in a second answer's data.
-      let cname = answer(&pointer(12), 5, 60, &pointer(12));
-      let msg = response(&[cname]);
-      let records = parse_response(&msg).expect("valid response");
-      assert_eq!(
-         records,
-         vec![DnsRecord {
-            name: "example.com".to_owned(),
-            kind: RecordKind::Cname,
-            ttl: 60,
-            target: Target::Name("example.com".to_owned()),
-         }]
-      );
-      assert_no_panic_on_truncation(&msg);
-   }
-
-   #[test]
-   fn unrelated_record_between_two_a_answers_is_skipped() {
+   fn compressed_names_and_cnames_resolve_to_the_question() {
+      // Compressed answer names are pointers to offset 12, the question's first label.
       let txt = answer(&pointer(12), 16, 60, b"v=spf1 -all");
-      let msg = response(&[a_record(10), txt, a_record(20)]);
-      let records = parse_response(&msg).expect("valid response");
-      assert_eq!(records.len(), 2);
-      assert_eq!(records[0].ttl, 10);
-      assert_eq!(records[1].ttl, 20);
-      assert_eq!(records[0].kind, RecordKind::A);
-      assert_eq!(records[1].kind, RecordKind::A);
-      assert_no_panic_on_truncation(&msg);
+      let cname = answer(&pointer(12), 5, 60, &pointer(12));
+      let cases = [
+         (
+            "compressed A name",
+            response(&[a_record(120)]),
+            vec![DnsRecord {
+               name: "example.com".to_owned(),
+               kind: RecordKind::A,
+               ttl: 120,
+               target: Target::Address(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+            }],
+         ),
+         (
+            "compressed CNAME target",
+            response(&[cname]),
+            vec![DnsRecord {
+               name: "example.com".to_owned(),
+               kind: RecordKind::Cname,
+               ttl: 60,
+               target: Target::Name("example.com".to_owned()),
+            }],
+         ),
+         (
+            "TXT between two A answers is skipped",
+            response(&[a_record(10), txt, a_record(20)]),
+            vec![
+               DnsRecord {
+                  name: "example.com".to_owned(),
+                  kind: RecordKind::A,
+                  ttl: 10,
+                  target: Target::Address(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+               },
+               DnsRecord {
+                  name: "example.com".to_owned(),
+                  kind: RecordKind::A,
+                  ttl: 20,
+                  target: Target::Address(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+               },
+            ],
+         ),
+      ];
+      for (case, msg, expected) in cases {
+         assert_eq!(
+            parse_response(&msg).expect("valid response"),
+            expected,
+            "{case}"
+         );
+         assert_no_panic_on_truncation(&msg);
+      }
    }
 
    #[test]
-   fn query_is_not_a_response() {
-      let mut msg = response(&[]);
-      msg[2] = 0x00;
-      assert_eq!(parse_response(&msg), Err(DnsError::NotResponse));
-   }
+   fn a_malformed_answer_is_an_error() {
+      let mut query = response(&[]);
+      query[2] = 0x00;
 
-   #[test]
-   fn forward_pointer_is_a_pointer_loop() {
-      let mut msg = response(&[]);
+      let mut forward = response(&[]);
       // Answer name at the end of the question points forward, past itself.
-      let at = msg.len();
-      msg.extend_from_slice(&pointer((at + 2) as u16));
-      msg[6..8].copy_from_slice(&1u16.to_be_bytes());
-      assert_eq!(parse_response(&msg), Err(DnsError::PointerLoop));
-   }
+      let at = forward.len();
+      forward.extend_from_slice(&pointer((at + 2) as u16));
+      forward[6..8].copy_from_slice(&1u16.to_be_bytes());
 
-   #[test]
-   fn nine_pointer_chain_is_too_many_pointers() {
       // Ten questions: the first name is the root, and every later name points at the
       // previous one, so decoding the last name takes nine backwards jumps.
-      let mut msg = header(0x80, 10, 0);
-      msg.push(0);
-      msg.extend_from_slice(&1u16.to_be_bytes());
-      msg.extend_from_slice(&1u16.to_be_bytes());
+      let mut chain = header(0x80, 10, 0);
+      chain.push(0);
+      chain.extend_from_slice(&1u16.to_be_bytes());
+      chain.extend_from_slice(&1u16.to_be_bytes());
       let mut previous = HEADER_LEN as u16;
       for _ in 1..10 {
-         let at = msg.len() as u16;
-         msg.extend_from_slice(&pointer(previous));
-         msg.extend_from_slice(&1u16.to_be_bytes());
-         msg.extend_from_slice(&1u16.to_be_bytes());
+         let at = chain.len() as u16;
+         chain.extend_from_slice(&pointer(previous));
+         chain.extend_from_slice(&1u16.to_be_bytes());
+         chain.extend_from_slice(&1u16.to_be_bytes());
          previous = at;
       }
-      assert_eq!(
-         parse_response(&msg),
-         Err(DnsError::TooManyPointers)
-      );
-   }
 
-   #[test]
-   fn label_longer_than_63_is_a_bad_name() {
-      let mut msg = header(0x80, 0, 1);
-      msg.push(64);
-      msg.extend_from_slice(&[b'a'; 64]);
-      msg.push(0);
-      assert_eq!(parse_response(&msg), Err(DnsError::BadName));
-   }
+      let mut long_label = header(0x80, 0, 1);
+      long_label.push(64);
+      long_label.extend_from_slice(&[b'a'; 64]);
+      long_label.push(0);
 
-   #[test]
-   fn name_longer_than_255_is_a_bad_name() {
-      let mut msg = header(0x80, 0, 1);
+      let mut long_name = header(0x80, 0, 1);
       for _ in 0..5 {
-         msg.push(63);
-         msg.extend_from_slice(&[b'a'; 63]);
+         long_name.push(63);
+         long_name.extend_from_slice(&[b'a'; 63]);
       }
-      msg.push(0);
-      assert_eq!(parse_response(&msg), Err(DnsError::BadName));
-   }
+      long_name.push(0);
 
-   #[test]
-   fn rdlength_past_the_end_is_truncated() {
-      let mut msg = response(&[]);
-      msg[6..8].copy_from_slice(&1u16.to_be_bytes());
-      msg.extend_from_slice(&pointer(12));
-      msg.extend_from_slice(&1u16.to_be_bytes()); // A
-      msg.extend_from_slice(&1u16.to_be_bytes()); // IN
-      msg.extend_from_slice(&60u32.to_be_bytes());
-      msg.extend_from_slice(&8u16.to_be_bytes()); // claims 8 bytes of rdata
-      msg.extend_from_slice(&[93, 184, 216, 34]); // only 4 present
-      assert_eq!(parse_response(&msg), Err(DnsError::Truncated));
-   }
+      let mut past_end = response(&[]);
+      past_end[6..8].copy_from_slice(&1u16.to_be_bytes());
+      past_end.extend_from_slice(&pointer(12));
+      past_end.extend_from_slice(&1u16.to_be_bytes()); // A
+      past_end.extend_from_slice(&1u16.to_be_bytes()); // IN
+      past_end.extend_from_slice(&60u32.to_be_bytes());
+      past_end.extend_from_slice(&8u16.to_be_bytes()); // claims 8 bytes of rdata
+      past_end.extend_from_slice(&[93, 184, 216, 34]); // only 4 present
 
-   #[test]
-   fn a_record_with_sixteen_bytes_of_rdata_is_truncated() {
-      let rdata = [0u8; 16];
-      let msg = response(&[answer(&pointer(12), 1, 60, &rdata)]);
-      assert_eq!(parse_response(&msg), Err(DnsError::Truncated));
+      let cases = [
+         (
+            "query is not a response",
+            query,
+            DnsError::NotResponse,
+         ),
+         ("forward pointer", forward, DnsError::PointerLoop),
+         (
+            "nine-pointer chain",
+            chain,
+            DnsError::TooManyPointers,
+         ),
+         (
+            "label longer than 63",
+            long_label,
+            DnsError::BadName,
+         ),
+         (
+            "name longer than 255",
+            long_name,
+            DnsError::BadName,
+         ),
+         (
+            "rdlength past the end",
+            past_end,
+            DnsError::Truncated,
+         ),
+         (
+            "16-byte A record rdata",
+            response(&[answer(&pointer(12), 1, 60, &[0u8; 16])]),
+            DnsError::Truncated,
+         ),
+      ];
+      for (case, msg, expected) in cases {
+         assert_eq!(parse_response(&msg), Err(expected), "{case}");
+      }
    }
 
    #[test]

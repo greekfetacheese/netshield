@@ -112,24 +112,42 @@ mod tests {
    }
 
    #[test]
-   fn inserted_name_is_the_primary() {
-      let mut cache = DnsCache::new();
-      cache.insert(v4(93, 184, 216, 34), "example.com", 300, 1_000);
+   fn names_for_one_address_are_most_recent_first() {
+      let primary_ip = v4(93, 184, 216, 34);
+      let mut primary = DnsCache::new();
+      primary.insert(primary_ip, "example.com", 300, 1_000);
       assert_eq!(
-         cache.primary(v4(93, 184, 216, 34), 1_000),
-         Some("example.com")
+         primary.primary(primary_ip, 1_000),
+         Some("example.com"),
+         "inserted name is the primary"
       );
-   }
 
-   #[test]
-   fn two_names_for_one_address_are_most_recent_first() {
-      let ip = v4(93, 184, 216, 34);
+      let ip = v4(93, 184, 216, 36);
       let mut cache = DnsCache::new();
       cache.insert(ip, "first.example", 300, 1_000);
       cache.insert(ip, "second.example", 300, 1_001);
       assert_eq!(
          cache.names_for(ip, 1_001),
-         vec!["second.example", "first.example"]
+         vec!["second.example", "first.example"],
+         "most recent first"
+      );
+
+      let refreshed = v4(93, 184, 216, 35);
+      let mut cache = DnsCache::new();
+      cache.insert(refreshed, "a.example", 300, 0);
+      cache.insert(refreshed, "b.example", 300, 1);
+      cache.insert(refreshed, "a.example", 300, 2);
+      assert_eq!(cache.len(), 2, "refresh does not duplicate");
+      assert_eq!(
+         cache.names_for(refreshed, 2),
+         vec!["a.example", "b.example"],
+         "refreshed entry is most recent"
+      );
+      // The refreshed entry outlives its original expiry.
+      assert_eq!(
+         cache.primary(refreshed, 300),
+         Some("a.example"),
+         "refreshed expiry"
       );
    }
 
@@ -175,23 +193,6 @@ mod tests {
       );
       assert!(cache.names_for(v4(2, 2, 2, 2), 10).is_empty());
       assert_eq!(cache.expire(10), 0);
-   }
-
-   #[test]
-   fn reinserting_refreshes_recency_without_duplicating() {
-      let ip = v4(93, 184, 216, 35);
-      let mut cache = DnsCache::new();
-      cache.insert(ip, "a.example", 300, 0);
-      cache.insert(ip, "b.example", 300, 1);
-      cache.insert(ip, "a.example", 300, 2);
-
-      assert_eq!(cache.len(), 2);
-      assert_eq!(
-         cache.names_for(ip, 2),
-         vec!["a.example", "b.example"]
-      );
-      // The refreshed entry outlives its original expiry.
-      assert_eq!(cache.primary(ip, 300), Some("a.example"));
    }
 
    #[test]
