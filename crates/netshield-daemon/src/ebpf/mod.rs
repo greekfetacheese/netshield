@@ -762,17 +762,16 @@ mod tests {
    use super::*;
 
    #[test]
-   fn a_sendto_program_is_unchanged() {
+   fn the_programs_encode_the_documented_instructions() {
+      // `sendto` reads the sockaddr pointer from the syscall argument at its offset.
       let at_48 = program(7, Destination::SockaddrAt(48));
       let at_24 = program(7, Destination::SockaddrAt(24));
       assert_eq!(at_48[0], ldx_dw(3, 1, 48));
       assert_eq!(at_24[0], ldx_dw(3, 1, 24));
       assert_eq!(at_48.len(), 39);
       assert_eq!(at_24.len(), 39);
-   }
 
-   #[test]
-   fn a_sendmsg_program_reads_the_msghdr() {
+      // `sendmsg` reads the msghdr, then copies its name and length onto the stack.
       let insns = program(7, Destination::MsghdrAt(24));
       assert_eq!(
          insns[0],
@@ -801,10 +800,7 @@ mod tests {
       // The same record tail as `sendto`, so the key and value stay identical.
       assert_eq!(insns.len(), 10 + 38);
       assert_eq!(&insns[10..], &record_tail(7)[..]);
-   }
 
-   #[test]
-   fn a_sendmmsg_program_uses_the_first_msghdrs_name() {
       // The first `mmsghdr`'s `msg_hdr` is at offset 0 of the array, so `msgvec` is read
       // exactly like `sendmsg`'s `msg`: one prologue serves both.
       let sendmsg = program(7, Destination::MsghdrAt(24));
@@ -821,7 +817,8 @@ mod tests {
    }
 
    #[test]
-   fn a_v4_destination_is_the_first_four_bytes() {
+   fn the_key_carries_the_destination() {
+      // A v4 address is the first four bytes of the key's address field.
       let key = flow_key(
          1000,
          (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 53),
@@ -832,10 +829,8 @@ mod tests {
       let mut expected = [0u8; 16];
       expected[..4].copy_from_slice(&[127, 0, 0, 1]);
       assert_eq!(key.addr, expected);
-   }
 
-   #[test]
-   fn a_v6_destination_fills_the_key() {
+      // A v6 address fills the whole field.
       let ip = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
       let key = flow_key(0, (IpAddr::V6(ip), 443));
       assert_eq!(key.family, libc::AF_INET6 as u16);
@@ -847,10 +842,8 @@ mod tests {
    fn a_worker_thread_is_named_by_its_process() {
       assert_eq!(sender_pid((4242u64 << 32) | 4243), 4242);
       assert_eq!(sender_pid((4242u64 << 32) | 4242), 4242);
-   }
 
-   #[test]
-   fn a_record_without_a_process_id_is_a_miss() {
+      // A record without a process id names nothing `/proc` can be read for.
       assert_eq!(sender_pid(0), 0);
       // A tid without a tgid names no process that `/proc` can be read for.
       assert_eq!(sender_pid(4243), 0);

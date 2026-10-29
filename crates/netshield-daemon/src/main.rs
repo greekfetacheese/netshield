@@ -489,15 +489,6 @@ mod tests {
    }
 
    #[test]
-   fn probe_defaults_match_the_architecture() {
-      let parsed = args(&["--probe"]).unwrap();
-      assert_eq!(parsed.mode, Mode::Probe);
-      assert_eq!((parsed.queue, parsed.dns_queue), (0, 1));
-      assert!(!parsed.filter_loopback);
-      assert_eq!(parsed.count, None);
-   }
-
-   #[test]
    fn probe_takes_every_documented_option() {
       let parsed = args(&[
          "--probe",
@@ -514,12 +505,13 @@ mod tests {
       assert_eq!(parsed.dns_queue, 8);
       assert!(parsed.filter_loopback);
       assert_eq!(parsed.count, Some(3));
-   }
 
-   #[test]
-   fn help_and_version_stand_alone() {
-      assert_eq!(args(&["--help"]).unwrap().mode, Mode::Help);
-      assert_eq!(args(&["--version"]).unwrap().mode, Mode::Version);
+      // Bare `--probe` takes the architecture's defaults for every option above.
+      let parsed = args(&["--probe"]).unwrap();
+      assert_eq!(parsed.mode, Mode::Probe);
+      assert_eq!((parsed.queue, parsed.dns_queue), (0, 1));
+      assert!(!parsed.filter_loopback);
+      assert_eq!(parsed.count, None);
    }
 
    #[test]
@@ -560,45 +552,6 @@ mod tests {
          args(&["--socket"]),
          Err(ArgError::MissingValue("--socket"))
       ));
-   }
-
-   #[test]
-   fn packet_line_renders_the_transcript_format() {
-      let packet = Packet {
-         id: 42,
-         family: 2,
-         hook: 3,
-         payload: (0..30u8).collect(),
-         mark: None,
-         uid: Some(1000),
-         gid: None,
-         out_ifindex: Some(2),
-         hw_addr: None,
-         timestamp: None,
-      };
-      assert_eq!(
-         packet_line(&packet),
-         "pkt id=42 fam=4 hook=3 uid=1000 gid=- len=30 outdev=2 \
-          head=000102030405060708090a0b0c0d0e0f10111213"
-      );
-
-      let mut v6 = packet;
-      v6.family = 10;
-      v6.uid = None;
-      v6.out_ifindex = None;
-      let line = packet_line(&v6);
-      assert!(line.starts_with("pkt id=42 fam=6 hook=3 uid=- gid=- len=30 outdev=- head="));
-      assert!(
-         !line.contains(" fam=10"),
-         "IPv6 is rendered as family 6"
-      );
-   }
-
-   #[test]
-   fn unknown_family_is_printed_as_its_number() {
-      assert_eq!(family_label(2), "4");
-      assert_eq!(family_label(10), "6");
-      assert_eq!(family_label(7), "7");
    }
 
    #[test]

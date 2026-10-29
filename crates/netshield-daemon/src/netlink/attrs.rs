@@ -120,7 +120,7 @@ mod tests {
    use super::*;
 
    #[test]
-   fn single_attribute_round_trip() {
+   fn attributes_round_trip() {
       let mut buf = Vec::new();
       push_attr(&mut buf, 9, b"abc");
       assert_eq!(buf.len(), 8, "3-byte payload pads to 8");
@@ -137,10 +137,7 @@ mod tests {
       assert_eq!(attrs.len(), 1);
       assert_eq!(attrs[0].kind, 9);
       assert_eq!(attrs[0].payload, b"abc");
-   }
 
-   #[test]
-   fn multiple_attributes_round_trip() {
       let mut buf = Vec::new();
       push_attr(&mut buf, 1, b"a");
       push_attr_u32(&mut buf, 2, 0x0102_0304);
@@ -160,17 +157,15 @@ mod tests {
    }
 
    #[test]
-   fn padding_is_not_counted_in_len() {
+   fn padding_follows_the_attribute_length() {
       let mut buf = Vec::new();
       push_attr(&mut buf, 1, b"a");
       push_attr(&mut buf, 2, b"b");
       assert_eq!(u16::from_ne_bytes([buf[0], buf[1]]), 5);
       // The second attribute starts at the 4-byte boundary, not at 5.
       assert_eq!(buf[8..10], [5, 0]);
-   }
 
-   #[test]
-   fn four_byte_payload_gets_no_padding() {
+      // A 4-byte payload already ends on the boundary and gets no padding.
       let mut buf = Vec::new();
       push_attr(&mut buf, 1, &[1, 2, 3, 4]);
       assert_eq!(buf.len(), 8);
@@ -189,22 +184,18 @@ mod tests {
    }
 
    #[test]
-   fn truncated_final_attribute_is_an_error() {
+   fn a_malformed_attribute_buffer_is_an_error() {
       // Announces 8 bytes but only 6 are present.
       let buf = [8, 0, 1, 0, b'a', b'b'];
       let result: Vec<_> = AttrReader::new(&buf).collect();
       assert_eq!(result, [Err(AttrError::Truncated)]);
-   }
 
-   #[test]
-   fn length_below_header_is_an_error() {
+      // A length smaller than the header it must include.
       let buf = [3, 0, 9, 0];
       let result: Vec<_> = AttrReader::new(&buf).collect();
       assert_eq!(result, [Err(AttrError::BadLength)]);
-   }
 
-   #[test]
-   fn empty_buffer_yields_no_items() {
+      // An empty buffer is not an error, it simply holds no attribute.
       assert_eq!(AttrReader::new(&[]).count(), 0);
    }
 

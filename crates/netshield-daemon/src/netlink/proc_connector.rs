@@ -348,7 +348,7 @@ mod tests {
    }
 
    #[test]
-   fn exec_frame_decodes_to_its_pid() {
+   fn exec_and_exit_frames_decode_to_their_pid() {
       let bytes = message(1, 1, 2, 4242);
       assert_eq!(
          parse_message(&bytes),
@@ -358,10 +358,7 @@ mod tests {
       let mut events = Vec::new();
       assert_eq!(drain_events(&datagram(&[bytes]), &mut events), 1);
       assert_eq!(events, vec![ProcEvent::Exec { pid: 4242 }]);
-   }
 
-   #[test]
-   fn exit_frame_decodes_to_its_pid() {
       // `PROC_EVENT_EXIT` is bit 31 set; a signed or truncated comparison would read it
       // as an unknown event.
       let bytes = message(1, 1, 0x8000_0000, 777);
@@ -399,7 +396,8 @@ mod tests {
    }
 
    #[test]
-   fn messages_for_another_connector_are_ignored() {
+   fn unrelated_messages_are_ignored() {
+      // Another connector's index or val pair is not a proc event.
       assert_eq!(parse_message(&message(2, 1, 2, 1)), None);
       assert_eq!(parse_message(&message(1, 2, 2, 1)), None);
       assert_eq!(
@@ -407,10 +405,7 @@ mod tests {
          None,
          "an unrelated connector index/val pair is not a proc event"
       );
-   }
 
-   #[test]
-   fn unknown_event_types_are_ignored() {
       // `PROC_EVENT_FORK` is 1; this module only tracks exec and exit.
       assert_eq!(parse_message(&message(1, 1, 1, 1)), None);
       assert_eq!(parse_message(&message(1, 1, 0, 1)), None);

@@ -425,53 +425,97 @@ mod tests {
    }
 
    #[test]
-   fn attach_twice_then_resolve_returns_all_three_ids() {
-      let mut pending = PendingPrompts::new();
+   fn attaching_a_packet_to_an_open_prompt_answers_every_packet_once() {
+      // A retransmission is a new packet id, so every attach must land on the same prompt,
+      // and a duplicate id must not be answered twice.
       let start = Instant::now();
-      let connection = conn(443);
-      let flow = connection.flow_key();
-      let id = pending.open(connection.clone(), 10, TIMEOUT, start).id();
+      for (attached, expected) in [
+         (&[11u32, 12][..], vec![10, 11, 12]),
+         (&[10, 11, 11][..], vec![10, 11]),
+      ] {
+         let mut pending = PendingPrompts::new();
+         let connection = conn(443);
+         let flow = connection.flow_key();
+         let id = pending.open(connection.clone(), 10, TIMEOUT, start).id();
+         for packet_id in attached {
+            assert_eq!(pending.attach(&flow, *packet_id), Some(id));
+         }
 
-      assert_eq!(pending.attach(&flow, 11), Some(id));
-      assert_eq!(pending.attach(&flow, 12), Some(id));
+         let resolved = pending.resolve(id).expect("still open");
+         let record = resolved.record;
+         assert_eq!(record.packet_ids().collect::<Vec<_>>(), expected);
+         assert_eq!(record.dests.len(), 1);
+         assert_eq!(
+            record.first().map(|dest| &dest.connection),
+            Some(&connection)
+         );
+         assert_eq!(record.deadline, Some(start + TIMEOUT));
+         assert_eq!(pending.len(), 0);
+      }
 
-      let resolved = pending.resolve(id).expect("still open");
-      let record = resolved.record;
+      // Every packet of every destination in the group is answered by one resolve.
+      let mut pending = PendingPrompts::new();
+      let group = pending.open(conn(443), 10, TIMEOUT, start).id();
+      pending.open(conn(8443), 11, TIMEOUT, start);
+      pending.attach(&conn(8443).flow_key(), 12);
+      let other = pending
+         .open(
+            app_conn("/usr/bin/curl", 9443),
+            20,
+            TIMEOUT,
+            start,
+         )
+         .id();
+      pending.attach(&app_conn("/usr/bin/curl", 9443).flow_key(), 21);
+
+      let resolved = pending.resolve(group).expect("group is open");
+      let answered: Vec<u32> = resolved.record.packet_ids().collect();
+      assert_eq!(answered, vec![10, 11, 12]);
+      let mut unique = answered.clone();
+      unique.sort_unstable();
+      unique.dedup();
       assert_eq!(
-         record.packet_ids().collect::<Vec<_>>(),
-         vec![10, 11, 12]
+         unique.len(),
+         answered.len(),
+         "no packet is answered twice"
       );
-      assert_eq!(record.dests.len(), 1);
+
+      let survivor = pending.get(other).expect("the other group is untouched");
       assert_eq!(
-         record.first().map(|dest| &dest.connection),
-         Some(&connection)
+         survivor.packet_ids().collect::<Vec<_>>(),
+         vec![20, 21]
       );
-      assert_eq!(record.deadline, Some(start + TIMEOUT));
-      assert_eq!(pending.len(), 0);
+      assert_eq!(survivor.dests.len(), 1);
+      assert_eq!(pending.len(), 1);
    }
 
    #[test]
-   fn a_duplicate_packet_id_is_attached_once() {
-      let mut pending = PendingPrompts::new();
-      let connection = conn(443);
-      let flow = connection.flow_key();
-      let id = pending.open(connection, 10, TIMEOUT, Instant::now()).id();
-
-      pending.attach(&flow, 10);
-      pending.attach(&flow, 11);
-      pending.attach(&flow, 11);
-
-      let record = pending.resolve(id).expect("still open").record;
-      assert_eq!(
-         record.packet_ids().collect::<Vec<_>>(),
-         vec![10, 11]
-      );
-   }
-
-   #[test]
-   fn a_second_attempt_joins_the_open_prompt_instead_of_opening_another() {
+   fn a_second_flow_of_the_same_app_joins_the_same_prompt() {
+      // A second destination of one app joins the open prompt as a new destination.
       let mut pending = PendingPrompts::new();
       let start = Instant::now();
+      let first = pending.open(conn(443), 10, TIMEOUT, start);
+      let second = pending.open(conn(8443), 11, TIMEOUT, start);
+
+      assert_eq!(first.id(), second.id(), "one prompt for the app");
+      assert_eq!(second, Opened::Joined(first.id()));
+      assert_eq!(pending.len(), 1);
+
+      let record = pending.get(first.id()).expect("open");
+      assert_eq!(
+         record.dests.len(),
+         2,
+         "both destinations are listed"
+      );
+      assert_eq!(record.dests[0].packet_ids, vec![10]);
+      assert_eq!(record.dests[1].packet_ids, vec![11]);
+      assert_eq!(
+         record.dests[1].connection.remote.port, 8443,
+         "the joined destination keeps its own address"
+      );
+
+      // The same flow again is an attach, not a new destination, and keeps the first clock.
+      let mut pending = PendingPrompts::new();
       let first = pending.open(conn(443), 10, TIMEOUT, start);
       let second = pending.open(
          conn(443),
@@ -498,35 +542,39 @@ mod tests {
          Some(start + TIMEOUT),
          "the first deadline stands"
       );
-   }
 
-   #[test]
-   fn flows_of_one_app_share_a_prompt() {
+      // A packet attaches to the prompt for its own app, never to another app's.
       let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let first = pending.open(conn(443), 10, TIMEOUT, start);
-      let second = pending.open(conn(8443), 11, TIMEOUT, start);
+      let (first, second, third) = open_three(&mut pending, start);
 
-      assert_eq!(first.id(), second.id(), "one prompt for the app");
-      assert_eq!(second, Opened::Joined(first.id()));
-      assert_eq!(pending.len(), 1);
-
-      let record = pending.get(first.id()).expect("open");
       assert_eq!(
-         record.dests.len(),
-         2,
-         "both destinations are listed"
+         pending.attach(&app_conn("/usr/bin/curl", 8443).flow_key(), 21),
+         Some(second),
+         "the prompt for that app owns the packet"
       );
-      assert_eq!(record.dests[0].packet_ids, vec![10]);
-      assert_eq!(record.dests[1].packet_ids, vec![11]);
       assert_eq!(
-         record.dests[1].connection.remote.port, 8443,
-         "the joined destination keeps its own address"
+         pending.get(second).expect("open").packet_ids().collect::<Vec<_>>(),
+         vec![20, 21]
+      );
+      assert_eq!(
+         pending.get(first).expect("open").packet_ids().collect::<Vec<_>>(),
+         vec![10],
+         "another prompt did not absorb the packet"
+      );
+      assert_eq!(
+         pending.get(third).expect("open").packet_ids().collect::<Vec<_>>(),
+         vec![30]
+      );
+      assert_eq!(
+         pending.get(second).expect("open").deadline,
+         Some(start + Duration::from_secs(1) + TIMEOUT),
+         "a retransmission does not move the deadline"
       );
    }
 
    #[test]
-   fn flows_of_different_apps_do_not_share() {
+   fn flows_of_different_apps_get_their_own_prompt() {
+      // Two apps are two prompts, each listed after the other and each on its own clock.
       let mut pending = PendingPrompts::new();
       let start = Instant::now();
       let first = pending.open(conn(443), 10, TIMEOUT, start);
@@ -551,12 +599,9 @@ mod tests {
          Some(start + Duration::from_secs(1) + TIMEOUT),
          "every prompt has its own clock"
       );
-   }
 
-   #[test]
-   fn two_apps_get_two_live_prompts() {
+      // Both prompts are live at once, with ids from one counter.
       let mut pending = PendingPrompts::new();
-      let start = Instant::now();
       let first = pending.open(conn(443), 10, TIMEOUT, start);
       let second = pending.open(
          app_conn("/usr/bin/curl", 8443),
@@ -582,6 +627,10 @@ mod tests {
          1,
          "the second prompt reports the first as open alongside it"
       );
+
+      // A packet for a flow that never opened a prompt attaches to nothing.
+      let mut pending = PendingPrompts::new();
+      assert_eq!(pending.attach(&conn(443).flow_key(), 1), None);
    }
 
    #[test]
@@ -611,12 +660,9 @@ mod tests {
          vec![second]
       );
       assert!(pending.is_empty());
-   }
 
-   #[test]
-   fn resolving_one_prompt_leaves_the_other_open() {
+      // Answering one prompt leaves the other open, and the survivor still expires.
       let mut pending = PendingPrompts::new();
-      let start = Instant::now();
       let first = pending.open(conn(443), 10, TIMEOUT, start).id();
       let second = pending
          .open(
@@ -641,6 +687,177 @@ mod tests {
          expired.iter().map(|resolved| resolved.record.id).collect::<Vec<_>>(),
          vec![second],
          "the survivor still expires on its own clock"
+      );
+   }
+
+   #[test]
+   fn taking_a_covered_destination_keeps_the_rest_of_the_group_open() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let id = pending.open(conn(443), 10, TIMEOUT, start).id();
+      pending.open(conn(8443), 20, TIMEOUT, start);
+
+      let covered = conn(443).flow_key();
+      let taken = pending.take_dests(id, &[covered]).expect("the destination is listed");
+      assert_eq!(taken.dests.len(), 1);
+      assert_eq!(taken.dests[0].packet_ids, vec![10]);
+      let DestRemoval::Remaining(remaining) = taken.outcome else {
+         panic!("the group still has a destination");
+      };
+      assert_eq!(remaining.id, id);
+      assert_eq!(remaining.dests.len(), 1);
+      assert_eq!(remaining.dests[0].packet_ids, vec![20]);
+      assert!(
+         pending.is_active(id),
+         "the oldest prompt is still listed first"
+      );
+
+      let taken = pending
+         .take_dests(id, &[conn(8443).flow_key()])
+         .expect("the last destination is listed");
+      assert!(matches!(taken.outcome, DestRemoval::Resolved(_)));
+      assert!(pending.is_empty());
+
+      // A prompt that was already taken answers nothing a second time.
+      let mut pending = PendingPrompts::new();
+      let flow = conn(443).flow_key();
+      let id = pending.open(conn(443), 10, TIMEOUT, start).id();
+      assert!(pending.resolve(id).is_some());
+
+      assert_eq!(pending.resolve(id), None, "already answered");
+      assert_eq!(
+         pending.attach(&flow, 11),
+         None,
+         "a resolved flow no longer accepts packets"
+      );
+   }
+
+   #[test]
+   fn head_id_and_queued_records_follow_arrival_order() {
+      // The head is the oldest prompt, and drains in arrival order.
+      let mut pending = PendingPrompts::new();
+      assert_eq!(
+         pending.head_id(),
+         None,
+         "an empty set has no oldest prompt"
+      );
+
+      let start = Instant::now();
+      let (first, second, third) = open_three(&mut pending, start);
+      assert_eq!(
+         pending.head_id(),
+         Some(first),
+         "the oldest is listed first"
+      );
+      pending.resolve(first);
+      assert_eq!(
+         pending.head_id(),
+         Some(second),
+         "the next-oldest prompt becomes the front of the list"
+      );
+      pending.resolve(second);
+      assert_eq!(pending.head_id(), Some(third));
+      pending.resolve(third);
+      assert_eq!(pending.head_id(), None, "the set drained");
+
+      // The snapshot lists every open prompt, oldest first, with its own clock.
+      let mut pending = PendingPrompts::new();
+      let (first, second, third) = open_three(&mut pending, start);
+
+      let records = pending.queued_records();
+      assert_eq!(
+         records.iter().map(|record| record.id).collect::<Vec<_>>(),
+         vec![first, second, third],
+         "every open prompt is returned, oldest first"
+      );
+      assert_eq!(
+         records[0].packet_ids().collect::<Vec<_>>(),
+         vec![10]
+      );
+      assert_eq!(records[0].deadline, Some(start + TIMEOUT));
+      assert_eq!(
+         records[1].deadline,
+         Some(start + Duration::from_secs(1) + TIMEOUT)
+      );
+      assert_eq!(pending.len(), 3);
+
+      // The snapshot is a clone: mutating it never touches the live prompt.
+      let mut pending = PendingPrompts::new();
+      let (first, _second, third) = open_three(&mut pending, start);
+
+      let mut records = pending.queued_records();
+      let mut record = records.pop().expect("the third prompt is open");
+      assert_eq!(record.id, third);
+      record.dests[0].packet_ids.push(99);
+      assert_eq!(
+         pending.get(third).expect("still open").packet_ids().collect::<Vec<_>>(),
+         vec![30],
+         "mutating the snapshot must not touch the live prompt"
+      );
+      assert!(
+         pending.is_active(first),
+         "the snapshot left the set alone"
+      );
+
+      // Answering every open prompt removes them by id.
+      for record in pending.queued_records() {
+         assert!(pending.resolve(record.id).is_some());
+      }
+      assert!(pending.is_empty());
+   }
+
+   #[test]
+   fn take_all_empties_the_set_and_returns_every_prompt() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      pending.open(conn(443), 10, TIMEOUT, start);
+      pending.open(
+         app_conn("/usr/bin/curl", 8443),
+         20,
+         TIMEOUT,
+         start,
+      );
+
+      let mut taken = pending.take_all();
+      taken.sort_by_key(|record| record.packet_ids().next());
+      assert_eq!(taken.len(), 2);
+      assert_eq!(
+         taken[0].packet_ids().collect::<Vec<_>>(),
+         vec![10]
+      );
+      assert_eq!(
+         taken[1].packet_ids().collect::<Vec<_>>(),
+         vec![20]
+      );
+      assert!(pending.is_empty());
+      assert_eq!(pending.attach(&conn(443).flow_key(), 11), None);
+      assert!(pending.take_all().is_empty());
+
+      // Ids come from one counter and are never handed out twice.
+      let mut pending = PendingPrompts::new();
+      let first = pending.open(conn(443), 1, TIMEOUT, start).id();
+      pending.resolve(first);
+      let second = pending.open(conn(443), 2, TIMEOUT, start).id();
+      assert_ne!(first, second);
+   }
+
+   #[test]
+   fn an_unknown_app_never_groups() {
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      let first = pending.open(unknown_conn(443), 10, TIMEOUT, start);
+      let second = pending.open(unknown_conn(8443), 20, TIMEOUT, start);
+
+      assert_ne!(first.id(), second.id());
+      assert_eq!(pending.len(), 2);
+      assert_eq!(
+         pending.get(first.id()).expect("open").dests.len(),
+         1,
+         "an unattributed flow gets a destination of its own"
+      );
+      assert_eq!(
+         pending.get(second.id()).expect("open").dests.len(),
+         1
       );
    }
 
@@ -700,262 +917,5 @@ mod tests {
          0,
          "an unknown id reports nothing open"
       );
-   }
-
-   #[test]
-   fn an_unknown_app_never_groups() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let first = pending.open(unknown_conn(443), 10, TIMEOUT, start);
-      let second = pending.open(unknown_conn(8443), 20, TIMEOUT, start);
-
-      assert_ne!(first.id(), second.id());
-      assert_eq!(pending.len(), 2);
-      assert_eq!(
-         pending.get(first.id()).expect("open").dests.len(),
-         1,
-         "an unattributed flow gets a destination of its own"
-      );
-      assert_eq!(
-         pending.get(second.id()).expect("open").dests.len(),
-         1
-      );
-   }
-
-   #[test]
-   fn a_group_answers_every_packet_once() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let group = pending.open(conn(443), 10, TIMEOUT, start).id();
-      pending.open(conn(8443), 11, TIMEOUT, start);
-      pending.attach(&conn(8443).flow_key(), 12);
-      let other = pending
-         .open(
-            app_conn("/usr/bin/curl", 9443),
-            20,
-            TIMEOUT,
-            start,
-         )
-         .id();
-      pending.attach(&app_conn("/usr/bin/curl", 9443).flow_key(), 21);
-
-      let resolved = pending.resolve(group).expect("group is open");
-      let answered: Vec<u32> = resolved.record.packet_ids().collect();
-      assert_eq!(answered, vec![10, 11, 12]);
-      let mut unique = answered.clone();
-      unique.sort_unstable();
-      unique.dedup();
-      assert_eq!(
-         unique.len(),
-         answered.len(),
-         "no packet is answered twice"
-      );
-
-      let survivor = pending.get(other).expect("the other group is untouched");
-      assert_eq!(
-         survivor.packet_ids().collect::<Vec<_>>(),
-         vec![20, 21]
-      );
-      assert_eq!(survivor.dests.len(), 1);
-      assert_eq!(pending.len(), 1);
-   }
-
-   #[test]
-   fn taking_a_covered_destination_keeps_the_rest_of_the_group_open() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let id = pending.open(conn(443), 10, TIMEOUT, start).id();
-      pending.open(conn(8443), 20, TIMEOUT, start);
-
-      let covered = conn(443).flow_key();
-      let taken = pending.take_dests(id, &[covered]).expect("the destination is listed");
-      assert_eq!(taken.dests.len(), 1);
-      assert_eq!(taken.dests[0].packet_ids, vec![10]);
-      let DestRemoval::Remaining(remaining) = taken.outcome else {
-         panic!("the group still has a destination");
-      };
-      assert_eq!(remaining.id, id);
-      assert_eq!(remaining.dests.len(), 1);
-      assert_eq!(remaining.dests[0].packet_ids, vec![20]);
-      assert!(
-         pending.is_active(id),
-         "the oldest prompt is still listed first"
-      );
-
-      let taken = pending
-         .take_dests(id, &[conn(8443).flow_key()])
-         .expect("the last destination is listed");
-      assert!(matches!(taken.outcome, DestRemoval::Resolved(_)));
-      assert!(pending.is_empty());
-   }
-
-   #[test]
-   fn attach_without_an_open_prompt_is_none() {
-      let mut pending = PendingPrompts::new();
-      assert_eq!(pending.attach(&conn(443).flow_key(), 1), None);
-   }
-
-   #[test]
-   fn a_packet_joining_a_prompt_attaches_to_it_not_to_another() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let (first, second, third) = open_three(&mut pending, start);
-
-      assert_eq!(
-         pending.attach(&app_conn("/usr/bin/curl", 8443).flow_key(), 21),
-         Some(second),
-         "the prompt for that app owns the packet"
-      );
-      assert_eq!(
-         pending.get(second).expect("open").packet_ids().collect::<Vec<_>>(),
-         vec![20, 21]
-      );
-      assert_eq!(
-         pending.get(first).expect("open").packet_ids().collect::<Vec<_>>(),
-         vec![10],
-         "another prompt did not absorb the packet"
-      );
-      assert_eq!(
-         pending.get(third).expect("open").packet_ids().collect::<Vec<_>>(),
-         vec![30]
-      );
-      assert_eq!(
-         pending.get(second).expect("open").deadline,
-         Some(start + Duration::from_secs(1) + TIMEOUT),
-         "a retransmission does not move the deadline"
-      );
-   }
-
-   #[test]
-   fn resolving_a_taken_prompt_returns_none() {
-      let mut pending = PendingPrompts::new();
-      let flow = conn(443).flow_key();
-      let now = Instant::now();
-      let id = pending.open(conn(443), 10, TIMEOUT, now).id();
-      assert!(pending.resolve(id).is_some());
-
-      assert_eq!(pending.resolve(id), None, "already answered");
-      assert_eq!(
-         pending.attach(&flow, 11),
-         None,
-         "a resolved flow no longer accepts packets"
-      );
-   }
-
-   #[test]
-   fn head_id_is_the_arrival_front_and_none_when_empty() {
-      let mut pending = PendingPrompts::new();
-      assert_eq!(
-         pending.head_id(),
-         None,
-         "an empty set has no oldest prompt"
-      );
-
-      let start = Instant::now();
-      let (first, second, third) = open_three(&mut pending, start);
-      assert_eq!(
-         pending.head_id(),
-         Some(first),
-         "the oldest is listed first"
-      );
-      pending.resolve(first);
-      assert_eq!(
-         pending.head_id(),
-         Some(second),
-         "the next-oldest prompt becomes the front of the list"
-      );
-      pending.resolve(second);
-      assert_eq!(pending.head_id(), Some(third));
-      pending.resolve(third);
-      assert_eq!(pending.head_id(), None, "the set drained");
-   }
-
-   #[test]
-   fn queued_records_returns_every_open_prompt_in_arrival_order() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let (first, second, third) = open_three(&mut pending, start);
-
-      let records = pending.queued_records();
-      assert_eq!(
-         records.iter().map(|record| record.id).collect::<Vec<_>>(),
-         vec![first, second, third],
-         "every open prompt is returned, oldest first"
-      );
-      assert_eq!(
-         records[0].packet_ids().collect::<Vec<_>>(),
-         vec![10]
-      );
-      assert_eq!(records[0].deadline, Some(start + TIMEOUT));
-      assert_eq!(
-         records[1].deadline,
-         Some(start + Duration::from_secs(1) + TIMEOUT)
-      );
-      assert_eq!(pending.len(), 3);
-   }
-
-   #[test]
-   fn queued_records_returns_clones_not_the_live_records() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let (first, _second, third) = open_three(&mut pending, start);
-
-      let mut records = pending.queued_records();
-      let mut record = records.pop().expect("the third prompt is open");
-      assert_eq!(record.id, third);
-      record.dests[0].packet_ids.push(99);
-      assert_eq!(
-         pending.get(third).expect("still open").packet_ids().collect::<Vec<_>>(),
-         vec![30],
-         "mutating the snapshot must not touch the live prompt"
-      );
-      assert!(
-         pending.is_active(first),
-         "the snapshot left the set alone"
-      );
-
-      // Answering every open prompt removes them by id.
-      for record in pending.queued_records() {
-         assert!(pending.resolve(record.id).is_some());
-      }
-      assert!(pending.is_empty());
-   }
-
-   #[test]
-   fn take_all_empties_the_set_and_returns_every_prompt() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      pending.open(conn(443), 10, TIMEOUT, start);
-      pending.open(
-         app_conn("/usr/bin/curl", 8443),
-         20,
-         TIMEOUT,
-         start,
-      );
-
-      let mut taken = pending.take_all();
-      taken.sort_by_key(|record| record.packet_ids().next());
-      assert_eq!(taken.len(), 2);
-      assert_eq!(
-         taken[0].packet_ids().collect::<Vec<_>>(),
-         vec![10]
-      );
-      assert_eq!(
-         taken[1].packet_ids().collect::<Vec<_>>(),
-         vec![20]
-      );
-      assert!(pending.is_empty());
-      assert_eq!(pending.attach(&conn(443).flow_key(), 11), None);
-      assert!(pending.take_all().is_empty());
-   }
-
-   #[test]
-   fn ids_are_unique_and_never_reused() {
-      let mut pending = PendingPrompts::new();
-      let start = Instant::now();
-      let first = pending.open(conn(443), 1, TIMEOUT, start).id();
-      pending.resolve(first);
-      let second = pending.open(conn(443), 2, TIMEOUT, start).id();
-      assert_ne!(first, second);
    }
 }

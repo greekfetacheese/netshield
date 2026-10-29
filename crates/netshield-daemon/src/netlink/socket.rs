@@ -442,7 +442,8 @@ mod tests {
    }
 
    #[test]
-   fn length_past_the_buffer_is_an_error() {
+   fn a_malformed_datagram_is_an_error() {
+      // A length past the end of the buffer is `Truncated`.
       let datagram = header(64, 0x0300, 0, 1);
       let result: Vec<_> = MessageIter::new(&datagram).collect();
       assert_eq!(result.len(), 1);
@@ -450,10 +451,8 @@ mod tests {
          result[0].as_ref().unwrap_err(),
          &MsgError::Truncated
       );
-   }
 
-   #[test]
-   fn zero_length_is_an_error() {
+      // A zero length is `BadLength`.
       let datagram = header(0, 0x0300, 0, 1);
       let result: Vec<_> = MessageIter::new(&datagram).collect();
       assert_eq!(result.len(), 1);
@@ -461,23 +460,19 @@ mod tests {
          result[0].as_ref().unwrap_err(),
          &MsgError::BadLength
       );
-   }
 
-   #[test]
-   fn empty_datagram_yields_no_messages() {
+      // An empty datagram holds no message at all.
       assert_eq!(MessageIter::new(&[]).count(), 0);
    }
 
    #[test]
-   fn ack_with_minus_one_is_eperm() {
+   fn an_ack_reports_success_and_eperm() {
       let payload = (-1i32).to_ne_bytes();
       let err = ack_status(&payload).unwrap_err();
       assert_eq!(err.raw_os_error(), Some(libc::EPERM));
       assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-   }
 
-   #[test]
-   fn ack_is_matched_through_the_message_iterator() {
+      // The same error is reachable through the message iterator, matching the seq.
       let datagram = frame(NLMSG_ERROR, 0, 5, &(-1i32).to_ne_bytes());
       let msg = MessageIter::new(&datagram).next().unwrap().unwrap();
       assert_eq!(msg.msg_type, NLMSG_ERROR);
@@ -486,10 +481,8 @@ mod tests {
          ack_status(msg.payload).unwrap_err().raw_os_error(),
          Some(libc::EPERM)
       );
-   }
 
-   #[test]
-   fn ack_with_zero_is_success() {
+      // Zero is success.
       assert!(ack_status(&0i32.to_ne_bytes()).is_ok());
    }
 

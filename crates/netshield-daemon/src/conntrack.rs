@@ -736,7 +736,7 @@ mod tests {
    }
 
    #[test]
-   fn the_tag_keeps_another_tools_mark_out() {
+   fn the_tag_is_distinct_from_another_tools_mark() {
       fn matches((mark, mask): (u32, u32), candidate: u32) -> bool {
          candidate & mask == mark
       }
@@ -766,10 +766,7 @@ mod tests {
          "revoking uid 1001 must not match uid 1000's entry"
       );
       assert!(!matches(uid_1000, uid_1001.0));
-   }
 
-   #[test]
-   fn a_uid_that_would_collide_with_the_tag_is_handled() {
       // A uid may set either of the tag's two top bits. OR-ing the tag would then alias a
       // smaller uid (`0x4000_0001` looks exactly like uid 1) or leave the tag space, so
       // the encoder refuses rather than deleting another owner's flows. Linux uids that
@@ -871,10 +868,7 @@ mod tests {
          parse_entry(&v6),
          Some(Flow::V6(source, 60000, destination, 53))
       );
-   }
 
-   #[test]
-   fn an_entry_without_a_tuple_is_skipped() {
       // A well-formed entry whose original tuple is not there: parse_entry must answer
       // "no flow", not an error, so one odd entry cannot discard the rest of the dump.
       let mut payload = Vec::new();
