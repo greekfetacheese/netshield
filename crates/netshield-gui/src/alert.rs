@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use egui::{Color32, RichText, TextStyle, Ui};
+use egui::{RichText, TextStyle, Ui};
 use egui_elements::Theme;
 use netshield_core::connection::Family;
 use netshield_core::ipc::{ConnectionView, DecideRequest, PromptRequest, ScopeChoice};
@@ -78,15 +78,6 @@ const PREVIEW_APP_CHARS: usize = 20;
 
 /// Longest host kept in a scope row before it is elided.
 const PREVIEW_HOST_CHARS: usize = 26;
-
-/// Red fill of the Deny button. White text keeps the contrast well above 4.5:1.
-const DENY_FILL: Color32 = Color32::from_rgb(0xB3, 0x2D, 0x2D);
-
-/// Green fill of the Allow button.
-const ALLOW_FILL: Color32 = Color32::from_rgb(0x2E, 0x8B, 0x45);
-
-/// Both action buttons use white text on a saturated fill.
-const BUTTON_TEXT: Color32 = Color32::WHITE;
 
 /// Which destination scope the alert offers for one prompt.
 ///
@@ -686,13 +677,15 @@ fn action_row(
 ) -> Option<AlertAction> {
    let mut action = None;
    let row = button_row(waiting);
+   let colors = Theme::current(ui.ctx()).colors;
    if row.len() == 2 {
       // The historical shape, byte for byte: two equal columns, Deny then Allow.
       ui.columns(2, |columns| {
-         let deny =
-            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
          let deny_width = columns[0].available_width();
-         if columns[0].add_sized(egui::vec2(deny_width, BUTTON_HEIGHT), deny).clicked() {
+         let deny = egui_elements::Button::new("Deny")
+            .min_size(egui::vec2(deny_width, BUTTON_HEIGHT))
+            .bg_color(colors.error);
+         if columns[0].add(deny).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -700,12 +693,11 @@ fn action_row(
             )));
          }
 
-         let allow = egui::Button::new(
-            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
-         )
-         .fill(ALLOW_FILL);
          let allow_width = columns[1].available_width();
-         if columns[1].add_sized(egui::vec2(allow_width, BUTTON_HEIGHT), allow).clicked() {
+         let allow = egui_elements::Button::new(allow_label(prompt, state))
+            .min_size(egui::vec2(allow_width, BUTTON_HEIGHT))
+            .bg_color(colors.success);
+         if columns[1].add(allow).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -721,11 +713,10 @@ fn action_row(
    ui.with_layout(
       egui::Layout::right_to_left(egui::Align::Center),
       |ui| {
-         let allow = egui::Button::new(
-            RichText::new(allow_label(prompt, state)).color(BUTTON_TEXT).strong(),
-         )
-         .fill(ALLOW_FILL);
-         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), allow).clicked() {
+         let allow = egui_elements::Button::new(allow_label(prompt, state))
+            .min_size(egui::vec2(width, BUTTON_HEIGHT))
+            .bg_color(colors.success);
+         if ui.add(allow).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -733,9 +724,10 @@ fn action_row(
             )));
          }
 
-         let deny =
-            egui::Button::new(RichText::new("Deny").color(BUTTON_TEXT).strong()).fill(DENY_FILL);
-         if ui.add_sized(egui::vec2(width, BUTTON_HEIGHT), deny).clicked() {
+         let deny = egui_elements::Button::new("Deny")
+            .min_size(egui::vec2(width, BUTTON_HEIGHT))
+            .bg_color(colors.error);
+         if ui.add(deny).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
                prompt,
@@ -745,10 +737,7 @@ fn action_row(
 
          if row.contains(&AlertButton::Later) {
             let later = ui
-               .add_sized(
-                  egui::vec2(width, BUTTON_HEIGHT),
-                  egui::Button::new("Later"),
-               )
+               .add(egui_elements::Button::new("Later").min_size(egui::vec2(width, BUTTON_HEIGHT)))
                .on_hover_text(format!(
                   "Show the next prompt · {}",
                   app_name(&prompt.connection)
@@ -1044,6 +1033,7 @@ fn endpoint(view: &ConnectionView) -> String {
 mod tests {
    use std::net::{IpAddr, Ipv4Addr};
 
+   use egui::Color32;
    use netshield_core::connection::L4Proto;
 
    use super::*;
@@ -1522,6 +1512,59 @@ mod tests {
       }
       output.drop_without_applying_deltas();
       painted
+   }
+
+   /// Every filled rectangle the panel paints, so a test can read the button fills.
+   fn painted_fills(ctx: &egui::Context, request: &PromptRequest, waiting: usize) -> Vec<Color32> {
+      let input = egui::RawInput {
+         screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(WIDTH, HEIGHT),
+         )),
+         ..Default::default()
+      };
+      let output = ctx.run_ui(input, |root| {
+         let mut state = AlertState::new();
+         ui(root, request, &mut state, 18.0, waiting);
+      });
+      let mut fills = Vec::new();
+      fn collect(shape: &egui::Shape, out: &mut Vec<Color32>) {
+         match shape {
+            egui::Shape::Rect(rect) => out.push(rect.fill),
+            egui::Shape::Vec(shapes) => {
+               for shape in shapes {
+                  collect(shape, out);
+               }
+            }
+            _ => {}
+         }
+      }
+      for clipped in &output.shapes {
+         collect(&clipped.shape, &mut fills);
+      }
+      output.drop_without_applying_deltas();
+      fills
+   }
+
+   #[test]
+   fn the_buttons_use_the_theme_colours() {
+      let ctx = egui::Context::default();
+      crate::theme::install(&ctx);
+      let theme = Theme::current(&ctx);
+      let request = prompt(Some("www.google.com"), true);
+
+      // Both action-row branches carry the theme's semantic colours.
+      for waiting in [0usize, 2] {
+         let fills = painted_fills(&ctx, &request, waiting);
+         assert!(
+            fills.contains(&theme.colors.error),
+            "Deny uses the theme's error colour: {fills:?}"
+         );
+         assert!(
+            fills.contains(&theme.colors.success),
+            "Allow uses the theme's success colour: {fills:?}"
+         );
+      }
    }
 
    /// A group whose rows cover a named host, an IPv4 endpoint, an IPv6 endpoint and a
