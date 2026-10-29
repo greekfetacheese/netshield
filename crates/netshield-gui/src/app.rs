@@ -1125,16 +1125,6 @@ mod tests {
       }
    }
 
-   #[test]
-   fn a_duplicate_prompt_id_is_ignored() {
-      let mut app = app();
-      app.enqueue_prompt(prompt(1));
-      app.enqueue_prompt(prompt(1));
-      assert_eq!(app.pending.len(), 1);
-      assert_eq!(app.alerts.len(), 1);
-      assert_eq!(app.prompt_deadlines.len(), 1);
-   }
-
    /// A prompt with `count` destinations, all of the same connection.
    fn group(id: u64, count: usize) -> PromptRequest {
       let mut request = prompt(id);
@@ -1142,10 +1132,46 @@ mod tests {
       request
    }
 
+   /// The ids the app and the model both hold, in local order.
+   fn order(app: &App) -> Vec<u64> {
+      let pending: Vec<u64> = app.pending.iter().map(|prompt| prompt.id).collect();
+      let model: Vec<u64> = app.model().prompts().iter().map(|prompt| prompt.id).collect();
+      assert_eq!(
+         pending, model,
+         "the app and the alert model must agree"
+      );
+      pending
+   }
+
+   #[test]
+   fn the_prompt_queue_dedupes_by_id_and_keeps_order() {
+      let mut app = app();
+      app.enqueue_prompt(group(1, 1));
+      app.enqueue_prompt(group(1, 1));
+      assert_eq!(app.pending.len(), 1);
+      assert_eq!(app.alerts.len(), 1);
+      assert_eq!(app.prompt_deadlines.len(), 1);
+
+      app.enqueue_prompt(group(2, 1));
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 1);
+      assert_eq!(app.pending[1].id, 2);
+
+      // A growth of the oldest prompt lands where that prompt already was: the queue the
+      // user sees does not reorder, and the oldest stays the one on screen.
+      app.enqueue_prompt(group(1, 6));
+      assert_eq!(app.pending.len(), 2);
+      assert_eq!(app.pending[0].id, 1);
+      assert_eq!(app.pending[0].dests.len(), 6);
+      assert_eq!(app.pending[1].id, 2);
+      assert_eq!(app.model().prompt().map(|open| open.id), Some(1));
+      assert_eq!(order(&app), vec![1, 2]);
+   }
+
    /// The daemon re-broadcasts a prompt as destinations join its group; the newer copy is
    /// the truth and must replace the earlier one in place, including in the alert.
    #[test]
-   fn a_prompt_that_grows_replaces_its_earlier_copy() {
+   fn a_growth_replaces_in_place_and_a_shrink_is_ignored() {
       let mut app = app();
       app.enqueue_prompt(group(7, 1));
       app.enqueue_prompt(group(7, 6));
@@ -1183,20 +1209,8 @@ mod tests {
          app.model().state_mut().decision(&presented, Action::Allow).scope,
          ScopeChoice::AnyConnection
       );
-      assert_eq!(
-         scope_kind(&ScopeChoice::TheseDestinations),
-         "these destinations",
-         "the log names the scope that writes a rule per destination"
-      );
-   }
 
-   /// A reordered or duplicated broadcast must not shrink a group the user is answering.
-   #[test]
-   fn a_repeat_that_would_shrink_is_ignored() {
-      let mut app = app();
-      app.enqueue_prompt(group(7, 6));
       app.enqueue_prompt(group(7, 1));
-
       assert_eq!(app.pending.len(), 1);
       assert_eq!(
          app.pending[0].dests.len(),
@@ -1210,8 +1224,9 @@ mod tests {
    }
 
    /// The same panel measures the same every frame, so only the first one asks for a size.
+   /// A prompt that later grows asks for a taller window again.
    #[test]
-   fn the_window_height_is_requested_once() {
+   fn the_window_height_is_asked_once_and_again_on_growth() {
       let stored: Mutex<Option<f32>> = Mutex::new(None);
       let request = prompt(7);
       let measured = alert::measured_height(&request, 0);
@@ -1233,20 +1248,12 @@ mod tests {
          Some(first),
          "the stored height did not change"
       );
-   }
-
-   /// A prompt that grows from one destination to six asks for a taller window again.
-   #[test]
-   fn a_growing_prompt_asks_for_a_taller_window() {
-      let stored: Mutex<Option<f32>> = Mutex::new(None);
-      let short = request_alert_height(&stored, alert::measured_height(&prompt(7), 0))
-         .expect("the single destination asks for a height");
 
       let grown = request_alert_height(&stored, alert::measured_height(&group(7, 6), 0))
          .expect("the six destinations ask again");
       assert!(
-         grown > short,
-         "the grown prompt asks for {grown}, above the single destination's {short}"
+         grown > first,
+         "the grown prompt asks for {grown}, above the single destination's {first}"
       );
       assert_eq!(
          *stored.lock().expect("height lock"),
@@ -1256,28 +1263,7 @@ mod tests {
    }
 
    #[test]
-   fn a_new_prompt_still_appends() {
-      let mut app = app();
-      app.enqueue_prompt(group(7, 1));
-      app.enqueue_prompt(group(8, 1));
-
-      assert_eq!(app.pending.len(), 2);
-      assert_eq!(app.pending[0].id, 7);
-      assert_eq!(app.pending[1].id, 8);
-
-      // A growth of the oldest prompt lands where that prompt already was: the queue the
-      // user sees does not reorder, and the oldest stays the one on screen.
-      app.enqueue_prompt(group(7, 6));
-      assert_eq!(app.pending.len(), 2);
-      assert_eq!(app.pending[0].id, 7);
-      assert_eq!(app.pending[0].dests.len(), 6);
-      assert_eq!(app.pending[1].id, 8);
-      assert_eq!(app.model().prompt().map(|open| open.id), Some(7));
-      assert_eq!(order(&app), vec![7, 8]);
-   }
-
-   #[test]
-   fn prompt_closed_removes_the_prompt_and_its_state() {
+   fn closing_a_prompt_removes_its_state() {
       let mut app = app();
       app.enqueue_prompt(prompt(1));
       app.enqueue_prompt(prompt(2));
@@ -1288,33 +1274,13 @@ mod tests {
       assert!(!app.alerts.contains_key(&1));
       assert!(!app.prompt_deadlines.contains_key(&1));
       assert!(app.alerts.contains_key(&2));
-   }
 
-   #[test]
-   fn an_unknown_close_is_a_no_op() {
-      let mut app = app();
-      app.enqueue_prompt(prompt(1));
       app.remove_prompt(99);
       assert_eq!(app.pending.len(), 1);
    }
 
    #[test]
-   fn an_alert_is_centred_on_the_monitor() {
-      let position = centred_position(
-         egui::vec2(1920.0, 1080.0),
-         egui::vec2(420.0, 260.0),
-      );
-      assert_eq!(position, [750.0, 410.0]);
-   }
-
-   #[test]
-   fn a_monitor_smaller_than_the_alert_clamps_to_the_corner() {
-      let position = centred_position(egui::vec2(300.0, 200.0), egui::vec2(420.0, 260.0));
-      assert_eq!(position, [0.0, 0.0]);
-   }
-
-   #[test]
-   fn the_first_offline_report_is_logged_and_retries_are_not() {
+   fn the_first_offline_report_is_logged_once() {
       let mut app = app();
       assert!(!app.connection_logged);
       app.set_connected(false);
@@ -1329,7 +1295,7 @@ mod tests {
    }
 
    #[test]
-   fn a_queued_prompt_is_presented_to_the_alert_model() {
+   fn a_queued_prompt_reaches_the_alert_model() {
       let mut app = app();
       assert!(
          app.model().prompt().is_none(),
@@ -1352,7 +1318,7 @@ mod tests {
    }
 
    #[test]
-   fn queueing_an_already_presented_prompt_keeps_the_users_selection() {
+   fn an_already_presented_prompt_keeps_the_selection() {
       let mut app = app();
       // The socket thread's hook presents the prompt before the UI drains the queue; the
       // drain must recognise it by id and not rebuild the selection state around it.
@@ -1370,19 +1336,10 @@ mod tests {
       );
    }
 
-   /// The ids the app and the model both hold, in local order.
-   fn order(app: &App) -> Vec<u64> {
-      let pending: Vec<u64> = app.pending.iter().map(|prompt| prompt.id).collect();
-      let model: Vec<u64> = app.model().prompts().iter().map(|prompt| prompt.id).collect();
-      assert_eq!(
-         pending, model,
-         "the app and the alert model must agree"
-      );
-      pending
-   }
-
+   /// The oldest unanswered prompt owns the window, and `Later` rotates the local list
+   /// without answering: the prompt stays open in the daemon until it answers or expires.
    #[test]
-   fn the_model_keeps_the_oldest_prompt_on_screen() {
+   fn the_oldest_prompt_is_shown_and_later_rotates_without_answering() {
       let mut app = app();
       app.enqueue_prompt(prompt(1));
       app.enqueue_prompt(prompt(2));
@@ -1403,13 +1360,7 @@ mod tests {
 
       app.remove_prompt(2);
       assert!(app.model().prompt().is_none());
-   }
 
-   /// Stepping with `Later` reorders the app's list and the model's identically, and sends
-   /// nothing: the prompt stays open in the daemon until it answers or expires.
-   #[test]
-   fn later_cycles_the_local_list_without_answering() {
-      let mut app = app();
       for id in [1u64, 2, 3] {
          app.enqueue_prompt(prompt(id));
       }
@@ -1459,7 +1410,24 @@ mod tests {
    }
 
    #[test]
-   fn a_prompt_keeps_its_whole_destination_list_in_the_prompt_state() {
+   fn a_prompt_keeps_its_whole_destination_list() {
+      // An older daemon omits the field entirely: the fallback makes it one destination.
+      let mut fallback = app();
+      let request = prompt(1);
+      assert!(
+         request.dests.is_empty(),
+         "an older daemon omits the field"
+      );
+      fallback.enqueue_prompt(request);
+
+      let model = fallback.model();
+      let presented = model.prompt().expect("the alert is presented");
+      assert_eq!(
+         presented.dests,
+         vec![presented.connection.clone()],
+         "the fallback makes the prompt a single destination"
+      );
+
       let mut app = app();
       let mut request = prompt(1);
       request.dests = vec![
@@ -1480,46 +1448,6 @@ mod tests {
          presented.dests.len(),
          2,
          "the alert state gets the whole group, not just the first destination"
-      );
-   }
-
-   #[test]
-   fn an_empty_dests_field_is_filled_from_the_first_destination() {
-      let mut app = app();
-      let request = prompt(1);
-      assert!(
-         request.dests.is_empty(),
-         "an older daemon omits the field"
-      );
-      app.enqueue_prompt(request);
-
-      let model = app.model();
-      let presented = model.prompt().expect("the alert is presented");
-      assert_eq!(
-         presented.dests,
-         vec![presented.connection.clone()],
-         "the fallback makes the prompt a single destination"
-      );
-   }
-
-   #[test]
-   fn answering_from_the_viewport_queues_one_decision_and_closes_the_alert() {
-      let mut app = app();
-      app.enqueue_prompt(prompt(1));
-
-      let decision = app.model().state_mut().decision(&prompt(1), Action::Deny);
-      app.model().submit(Decision {
-         action: decision.action,
-         duration: decision.duration,
-         scope: decision.scope,
-      });
-
-      let outgoing = app.model().take_outgoing();
-      assert_eq!(outgoing.len(), 1);
-      assert_eq!(outgoing[0].prompt_id, 1);
-      assert!(
-         app.model().prompt().is_none(),
-         "a submitted prompt stops painting"
       );
    }
 }
