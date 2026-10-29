@@ -12,7 +12,7 @@
 //! logged. They are never repaired into a guess, because the rule engine has an explicit
 //! `Unknown` matcher and a guessed owner could inherit another application's allow.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -99,6 +99,9 @@ type FlowKey = (L4Proto, (IpAddr, u16), (IpAddr, u16));
 
 /// The flow class whose consecutive misses are tracked for the operator warning.
 type MissKey = (Option<u32>, L4Proto, u16);
+
+/// One socket-table row, keyed by inode: its endpoints and the protocol that printed it.
+type SocketRow = ((IpAddr, u16), (IpAddr, u16), L4Proto);
 
 /// The identity of one process, learned while its `/proc` entry was still readable.
 ///
@@ -1128,6 +1131,19 @@ pub enum FlowOwner<'a> {
    All,
 }
 
+/// One live socket, with the process that holds it.
+///
+/// A revocation that must *judge* a flow (a mode change, a fresh start) needs the same evidence a
+/// rule is matched against, so the holder's identity travels with the flow rather than being
+/// re-derived by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveFlow {
+   pub flow: Flow,
+   pub proto: L4Proto,
+   pub identity: CachedIdentity,
+   pub pid: u32,
+}
+
 /// The flows a revocation should reject, in the shape `firewall::kill_flows` takes.
 ///
 /// The socket table is the source of truth, not conntrack: conntrack only knows a flow this
@@ -1136,14 +1152,10 @@ pub enum FlowOwner<'a> {
 /// decision change. `/proc/net` prints the same tuple the reject sets match on, for every
 /// socket that exists, whoever created it.
 ///
-/// A row that no reject rule could ever match is skipped rather than enlarging the set:
-/// see [`revocable`].
-pub fn live_flows(owner: FlowOwner<'_>) -> Vec<Flow> {
-   let wanted = match owner {
-      FlowOwner::All => None,
-      FlowOwner::Exe(path) => Some(executable_inodes(path)),
-   };
-   let mut flows = Vec::new();
+/// The descriptor scan is what pairs a flow with its holder, so this is a full `/proc` sweep and
+/// belongs on a decision change, never on the packet path.
+pub fn live_flows(owner: FlowOwner<'_>) -> Vec<LiveFlow> {
+   let mut rows: HashMap<u32, SocketRow> = HashMap::new();
    for (proto, family) in [
       (L4Proto::Tcp, Family::V4),
       (L4Proto::Tcp, Family::V6),
@@ -1157,51 +1169,54 @@ pub fn live_flows(owner: FlowOwner<'_>) -> Vec<Flow> {
          continue;
       };
       for (local, remote, inode) in socket_rows(&text, family) {
-         let Ok(inode) = u32::try_from(inode) else {
-            continue;
-         };
-         if let Some(wanted) = &wanted
-            && !wanted.contains(&inode)
-         {
-            continue;
-         }
-         if let Some(flow) = revocable(local, remote, inode)
-            && !flows.contains(&flow)
-         {
-            flows.push(flow);
+         if let Ok(inode) = u32::try_from(inode) {
+            rows.insert(inode, (local, remote, proto));
          }
       }
    }
-   flows
-}
+   if rows.is_empty() {
+      return Vec::new();
+   }
 
-/// The socket inodes held by every process running `path`.
-///
-/// `/proc/<pid>/exe` is the evidence a rule's `AppMatcher::Exe` is matched against, so this
-/// is per application and never per uid: the desktop user owns every application they run,
-/// and a uid-wide revoke would reset all of them. A process whose `exe` cannot be read is
-/// skipped rather than guessed.
-fn executable_inodes(path: &Path) -> HashSet<u32> {
-   let mut inodes = HashSet::new();
    let Some(pids) = numeric_pids() else {
-      return inodes;
+      return Vec::new();
    };
+   let mut flows: Vec<LiveFlow> = Vec::new();
    for pid in pids {
       let Some(identity) = identity_at(pid, Path::new(PROC)) else {
          continue;
       };
-      if identity.exe.as_deref() != Some(path) {
+      if let FlowOwner::Exe(path) = owner
+         && identity.exe.as_deref() != Some(path)
+      {
          continue;
       }
-      match socket_inodes(pid) {
-         Ok(held) => inodes.extend(held),
+      let held = match socket_inodes(pid) {
+         Ok(held) => held,
          // A truncated scan still found the freshest descriptors; a vanished process has
          // nothing left to revoke.
-         Err(ScanError::Budget(held)) => inodes.extend(held),
-         Err(ScanError::Unreadable) => {}
+         Err(ScanError::Budget(held)) => held,
+         Err(ScanError::Unreadable) => continue,
+      };
+      for inode in held {
+         let Some((local, remote, proto)) = rows.get(&inode) else {
+            continue;
+         };
+         let Some(flow) = revocable(*local, *remote, inode) else {
+            continue;
+         };
+         if flows.iter().any(|live| live.flow == flow) {
+            continue;
+         }
+         flows.push(LiveFlow {
+            flow,
+            proto: *proto,
+            identity: identity.clone(),
+            pid,
+         });
       }
    }
-   inodes
+   flows
 }
 
 /// The flow a socket-table row describes, when a reject rule could match it.

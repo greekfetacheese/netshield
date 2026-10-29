@@ -37,16 +37,16 @@ use netshield_core::ipc::{
 };
 use netshield_core::packet::{L4Payload, ParsedPacket, parse};
 use netshield_core::rule::{Action, AppMatcher, Duration as RuleDuration, Rule, RuleId};
-use netshield_core::{DestMatcher, IpNet, ScopeRequest, rule_from_scope};
+use netshield_core::{DestMatcher, Family, IpNet, ProcessInfo, ScopeRequest, rule_from_scope};
 
 use crate::ebpf;
-use crate::firewall::{self, FirewallError};
+use crate::firewall::{self, FirewallError, Flow};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
 use crate::policy::{Applied, Decision, Policy};
-use crate::proc::{Attributor, FlowOwner, Missing, ProcessCache, live_flows};
+use crate::proc::{Attributor, FlowOwner, LiveFlow, Missing, ProcessCache, live_flows};
 use crate::store::{RuleStore, StoreError};
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
@@ -98,6 +98,16 @@ enum Revoke {
    /// desktop session shares.
    Exe(PathBuf),
    All,
+   /// Every flow the policy does not allow. A flow an enabled rule allows keeps running: a mode
+   /// change must not reset what a rule still permits, and a restart must not drop the connection
+   /// of an application the owner already allowed.
+   Mismatched {
+      /// Also reset a flow the policy would now prompt for — true for a mode change (a flow
+      /// silently allowed must not outlive the move to prompting) and false at startup (the flow
+      /// was established before this daemon could decide it, and the app is asked again the next
+      /// time it connects).
+      kill_prompted: bool,
+   },
 }
 
 /// What a rule change revokes.
@@ -330,10 +340,13 @@ impl Daemon {
    /// `Nothing` revokes nothing: a rule that governs no live process, or one that was never an
    /// application rule, must not touch a running flow.
    fn revoke_flows(&mut self, who: Revoke, reason: &str) {
-      let flows = match who {
+      let flows: Vec<Flow> = match who {
          Revoke::Nothing => return,
-         Revoke::Exe(path) => live_flows(FlowOwner::Exe(&path)),
-         Revoke::All => live_flows(FlowOwner::All),
+         Revoke::Exe(path) => {
+            live_flows(FlowOwner::Exe(&path)).into_iter().map(|live| live.flow).collect()
+         }
+         Revoke::All => live_flows(FlowOwner::All).into_iter().map(|live| live.flow).collect(),
+         Revoke::Mismatched { kill_prompted } => self.mismatched_flows(kill_prompted),
       };
       match firewall::kill_flows(
          self.config.table_name(),
@@ -342,6 +355,71 @@ impl Daemon {
       ) {
          Ok(count) => info!("revoked {count} flow(s): {reason}"),
          Err(err) => warn!("could not revoke the flows for {reason}: {err}"),
+      }
+   }
+
+   /// The live flows the policy does not allow.
+   ///
+   /// Each flow is judged by [`Policy::decide`], the same decision a packet takes, so the rules and
+   /// any live `Once` grant apply unchanged.
+   fn mismatched_flows(&mut self, kill_prompted: bool) -> Vec<Flow> {
+      let now = now_secs();
+      let mut flows = Vec::new();
+      for live in live_flows(FlowOwner::All) {
+         let connection = self.socket_connection(&live);
+         let decision = self.policy.decide(&connection, now);
+         if revokes(&decision, kill_prompted) {
+            flows.push(live.flow);
+         }
+      }
+      flows
+   }
+
+   /// A [`Connection`] for a socket the socket table already described.
+   ///
+   /// This is the connection the packet path builds, from the same facts: the holder's identity (a
+   /// rule is matched on `exe`), the endpoints, the protocol and the name the DNS cache learned for
+   /// the address.
+   fn socket_connection(&mut self, live: &LiveFlow) -> Connection {
+      let (local, remote) = match &live.flow {
+         Flow::V4(from, from_port, to, to_port) => (
+            Endpoint {
+               addr: IpAddr::V4(*from),
+               port: *from_port,
+            },
+            Endpoint {
+               addr: IpAddr::V4(*to),
+               port: *to_port,
+            },
+         ),
+         Flow::V6(from, from_port, to, to_port) => (
+            Endpoint {
+               addr: IpAddr::V6(*from),
+               port: *from_port,
+            },
+            Endpoint {
+               addr: IpAddr::V6(*to),
+               port: *to_port,
+            },
+         ),
+      };
+      let domain = self.domain_for(remote.addr);
+      Connection {
+         family: match live.flow {
+            Flow::V4(..) => Family::V4,
+            Flow::V6(..) => Family::V6,
+         },
+         proto: live.proto,
+         local,
+         remote,
+         process: Attribution::Process(ProcessInfo {
+            pid: live.pid,
+            uid: live.identity.uid,
+            exe: live.identity.exe.clone(),
+            comm: Some(live.identity.comm.clone()).filter(|comm| !comm.is_empty()),
+            cmdline: None,
+         }),
+         domain,
       }
    }
 }
@@ -361,6 +439,15 @@ fn decided(decision: &Decision) -> Option<(Verdict, Resolution)> {
       Decision::Allow { .. } => Some((Verdict::Accept, Resolution::Allowed)),
       Decision::Deny { .. } => Some((Verdict::Drop, Resolution::Denied)),
       Decision::Prompt => None,
+   }
+}
+
+/// Whether a decision change must reset a flow the policy just judged.
+fn revokes(decision: &Decision, kill_prompted: bool) -> bool {
+   match decision {
+      Decision::Deny { .. } => true,
+      Decision::Prompt => kill_prompted,
+      Decision::Allow { .. } => false,
    }
 }
 
@@ -538,9 +625,16 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    daemon.publish_rules();
    daemon.publish_status();
    // Before any packet is served: every live flow on the machine was established while the daemon
-   // was not running and was never checked by it, so it must not outlive the restart. The table is
-   // already installed, without which the kill would have nothing to reject against.
-   daemon.revoke_flows(Revoke::All, "the daemon started");
+   // was not running and was never checked by it, so a denied flow must not outlive the restart. The
+   // table is already installed, without which the kill would have nothing to reject against. The
+   // flows the policy allows or would only prompt for are left alone: a restart must not drop the
+   // connection of an application the owner already allowed.
+   daemon.revoke_flows(
+      Revoke::Mismatched {
+         kill_prompted: false,
+      },
+      "the daemon started",
+   );
    info!(
       "netshieldd running: queue {} for flows, queue {} for DNS, control {}",
       daemon.config.queue_num,
@@ -655,11 +749,17 @@ impl Daemon {
       }
       self.mode = requested;
       // Either direction between silent and alert is a decision change for every live flow on the
-      // machine, so all of them are reset and the apps reconnect into the mode now in effect. This
-      // is the point of the switch: a flow silently allowed must not outlive the move to
-      // prompting, and one allowed under a prompt must not keep running unanswered if the mode
-      // goes silent. It runs once per change, not per flow.
-      self.revoke_flows(Revoke::All, "the mode changed");
+      // machine, so the denied ones and the ones the policy would now prompt for are reset and the
+      // apps reconnect into the mode now in effect. This is the point of the switch: a flow silently
+      // allowed must not outlive the move to prompting, and one allowed under a prompt must not keep
+      // running unanswered if the mode goes silent. What a rule still allows keeps running. It runs
+      // once per change, not per flow.
+      self.revoke_flows(
+         Revoke::Mismatched {
+            kill_prompted: true,
+         },
+         "the mode changed",
+      );
       match self.mode {
          Mode::Silent => {
             if !self.silent_warned {
@@ -2038,6 +2138,20 @@ mod tests {
       on_shutdown_signal(libc::SIGTERM);
       assert!(SHUTDOWN.load(Ordering::SeqCst));
       SHUTDOWN.store(false, Ordering::SeqCst);
+   }
+
+   /// A policy-aware revocation spares what the policy allows and resets what it denies.
+   #[test]
+   fn a_mismatched_revoke_spares_what_the_policy_allows() {
+      let allowed = Decision::Allow { rule: None };
+      let denied = Decision::Deny { rule: None };
+      assert!(!revokes(&allowed, false));
+      assert!(!revokes(&allowed, true));
+      assert!(revokes(&denied, false));
+      assert!(revokes(&denied, true));
+      // A flow the policy would now prompt for: a mode change resets it, a fresh start leaves it.
+      assert!(revokes(&Decision::Prompt, true));
+      assert!(!revokes(&Decision::Prompt, false));
    }
 
    #[test]
