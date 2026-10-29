@@ -8,8 +8,8 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use egui::{RichText, TextStyle, Ui};
-use egui_elements::Theme;
+use egui::{Align, Color32, Layout, RichText, Stroke, TextStyle, Ui, vec2};
+use egui_elements::{Button, Theme};
 use netshield_core::connection::Family;
 use netshield_core::ipc::{ConnectionView, DecideRequest, PromptRequest, ScopeChoice};
 use netshield_core::rule::{Action, Duration};
@@ -677,14 +677,39 @@ fn action_row(
 ) -> Option<AlertAction> {
    let mut action = None;
    let row = button_row(waiting);
-   let colors = Theme::current(ui.ctx()).colors;
+   let theme = Theme::current(ui.ctx());
+   let normal = theme.typography.large;
+   let border_hover = theme.colors.text;
+
+   // Manually override the error & success color because the Theme's color
+   // is not good enough
+   let error = Color32::from_rgba_premultiplied(166, 0, 12, 255);
+   let success = Color32::from_rgba_premultiplied(0, 139, 60, 255);
+
+   let mut deny_visuals = theme.button_visuals();
+   deny_visuals.bg = error;
+   deny_visuals.bg_click = error;
+   deny_visuals.bg_hover = error;
+   deny_visuals.border_hover = Stroke::new(1.0, border_hover);
+
+   let mut allow_visuals = theme.button_visuals();
+   allow_visuals.bg = success;
+   allow_visuals.bg_click = success;
+   allow_visuals.bg_hover = success;
+   allow_visuals.border_hover = Stroke::new(1.0, border_hover);
+
+   let deny_text = RichText::new("Deny").size(normal);
+   let allow_text = RichText::new(allow_label(prompt, state)).size(normal);
+   let later_text = RichText::new("Later").size(normal);
+
    if row.len() == 2 {
       // The historical shape, byte for byte: two equal columns, Deny then Allow.
       ui.columns(2, |columns| {
          let deny_width = columns[0].available_width();
-         let deny = egui_elements::Button::new("Deny")
-            .min_size(egui::vec2(deny_width, BUTTON_HEIGHT))
-            .bg_color(colors.error);
+         let deny = Button::new(deny_text)
+            .label_align(Align::Center)
+            .visuals(deny_visuals)
+            .min_size(vec2(deny_width, BUTTON_HEIGHT));
          if columns[0].add(deny).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
@@ -694,9 +719,11 @@ fn action_row(
          }
 
          let allow_width = columns[1].available_width();
-         let allow = egui_elements::Button::new(allow_label(prompt, state))
-            .min_size(egui::vec2(allow_width, BUTTON_HEIGHT))
-            .bg_color(colors.success);
+
+         let allow = Button::new(allow_text)
+            .label_align(Align::Center)
+            .visuals(allow_visuals)
+            .min_size(vec2(allow_width, BUTTON_HEIGHT));
          if columns[1].add(allow).clicked() {
             action = Some(AlertAction::Decide(decision_for(
                state,
@@ -710,44 +737,50 @@ fn action_row(
 
    let spacing = ui.spacing().item_spacing.x;
    let width = ((ui.available_width() - spacing * 2.0) / 3.0).max(0.0);
-   ui.with_layout(
-      egui::Layout::right_to_left(egui::Align::Center),
-      |ui| {
-         let allow = egui_elements::Button::new(allow_label(prompt, state))
-            .min_size(egui::vec2(width, BUTTON_HEIGHT))
-            .bg_color(colors.success);
-         if ui.add(allow).clicked() {
-            action = Some(AlertAction::Decide(decision_for(
-               state,
-               prompt,
-               Action::Allow,
-            )));
-         }
 
-         let deny = egui_elements::Button::new("Deny")
-            .min_size(egui::vec2(width, BUTTON_HEIGHT))
-            .bg_color(colors.error);
-         if ui.add(deny).clicked() {
-            action = Some(AlertAction::Decide(decision_for(
-               state,
-               prompt,
-               Action::Deny,
-            )));
-         }
+   ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+      let allow = Button::new(allow_text)
+         .label_align(Align::Center)
+         .visuals(allow_visuals)
+         .min_size(vec2(width, BUTTON_HEIGHT));
 
-         if row.contains(&AlertButton::Later) {
-            let later = ui
-               .add(egui_elements::Button::new("Later").min_size(egui::vec2(width, BUTTON_HEIGHT)))
-               .on_hover_text(format!(
-                  "Show the next prompt · {}",
-                  app_name(&prompt.connection)
-               ));
-            if later.clicked() {
-               action = Some(AlertAction::Later);
-            }
+      if ui.add(allow).clicked() {
+         action = Some(AlertAction::Decide(decision_for(
+            state,
+            prompt,
+            Action::Allow,
+         )));
+      }
+
+      let deny = Button::new(deny_text)
+         .label_align(Align::Center)
+         .visuals(deny_visuals)
+         .min_size(vec2(width, BUTTON_HEIGHT));
+
+      if ui.add(deny).clicked() {
+         action = Some(AlertAction::Decide(decision_for(
+            state,
+            prompt,
+            Action::Deny,
+         )));
+      }
+
+      if row.contains(&AlertButton::Later) {
+         let later = ui
+            .add(
+               Button::new(later_text)
+                  .label_align(Align::Center)
+                  .min_size(vec2(width, BUTTON_HEIGHT)),
+            )
+            .on_hover_text(format!(
+               "Show the next prompt · {}",
+               app_name(&prompt.connection)
+            ));
+         if later.clicked() {
+            action = Some(AlertAction::Later);
          }
-      },
-   );
+      }
+   });
    action
 }
 
