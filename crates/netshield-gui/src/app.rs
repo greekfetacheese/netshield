@@ -138,6 +138,12 @@ pub struct App {
    /// Whether this app hid the window to the tray. `ViewportCommand::Visible` is not
    /// echoed back into `ViewportInfo`, so this flag is the single source of truth.
    hidden_to_tray: bool,
+   /// Whether the root window is somewhere the user can see it: not minimized and not
+   /// hidden to the tray. Set on every pass from the same value the socket thread is told,
+   /// and read by `ui` to skip drawing an unseen window -- a drawn frame re-arms the
+   /// Connections page's one-second repaint timer, which is what kept a minimized window
+   /// running a pass (and a paint) every second.
+   attended: bool,
    /// Set when the tray asked to quit, so the close path below lets the close through
    /// instead of turning it into another hide.
    allow_close: bool,
@@ -278,6 +284,7 @@ impl App {
          tray: None,
          tray_tried: false,
          hidden_to_tray: false,
+         attended: true,
          allow_close: false,
       }
    }
@@ -350,6 +357,7 @@ impl App {
       // after the window is back installs it.
       let attended =
          !self.hidden_to_tray && !ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+      self.attended = attended;
       let mut events = Vec::new();
       if let Some(client) = &self.ipc {
          client.attend(attended);
@@ -915,6 +923,15 @@ impl eframe::App for App {
    }
 
    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+      // A window nobody can see needs no frame: eframe runs this pass anyway (it treats the
+      // root viewport as visible for its whole life) and drawing it re-arms the Connections
+      // page's one-second repaint timer, which kept a minimized window repainting every
+      // second. Nothing here is lost: on restore the window gets one pass, `attended` is true
+      // by then, and the backlog the socket thread kept is installed by `update`.
+      if !self.attended {
+         return;
+      }
+
       if self.alert {
          self.root_alert(ui);
          return;
