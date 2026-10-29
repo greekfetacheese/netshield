@@ -343,31 +343,35 @@ impl App {
       {
          *slot = Some(ctx.clone());
       }
-      // Prompts are buffered rather than queued inside the drain: queueing needs `&mut
-      // self`, and the drain holds an immutable borrow of the client.
-      let mut arrived = Vec::new();
-      let mut closed = Vec::new();
-      // Buffered for the same reason as the prompts: the transition setter needs `&mut
-      // self`, and the drain holds a borrow of the client.
-      let mut transitions = Vec::new();
+      // eframe 0.37 runs a full ui pass and paints on every repaint request even when the root
+      // window is iconified or hidden to the tray -- it decides that from `ViewportInfo::visible`,
+      // which it only sets at construction, so a daemon event otherwise costs a whole frame.
+      // While nobody is looking the socket thread keeps the traffic instead; the first pass
+      // after the window is back installs it.
+      let attended =
+         !self.hidden_to_tray && !ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+      let mut events = Vec::new();
       if let Some(client) = &self.ipc {
-         while let Some(event) = client.poll() {
-            match event {
-               ipc::IpcEvent::Connected(state) => transitions.push(state),
-               ipc::IpcEvent::Message(response) => match *response {
-                  Response::Connection(event) => self.log.push(&event),
-                  Response::Status(status) => {
-                     self.mode = status.mode;
-                     self.status = Some(status);
-                  }
-                  Response::Prompt(prompt) => arrived.push(prompt),
-                  Response::PromptClosed { id, .. } => closed.push(id),
-                  Response::Rules { rules } => self.rules.install(rules),
-                  _ => {}
-               },
+         client.attend(attended);
+         if attended {
+            let (buffered, dropped) = client.take_backlog();
+            if !buffered.is_empty() || dropped > 0 {
+               log::debug!(
+                  "installed {} event(s) buffered while the window was not on screen ({dropped} older ones dropped)",
+                  buffered.len()
+               );
             }
+            events.extend(buffered);
          }
-      } else if self.mock {
+         while let Some(event) = client.poll() {
+            events.push(event);
+         }
+      }
+      for event in events {
+         self.install(event);
+      }
+
+      if self.mock {
          let now = Instant::now();
          for event in self.mock_stream.poll(now) {
             match event {
@@ -388,15 +392,6 @@ impl App {
          }
       }
 
-      for state in transitions {
-         self.set_connected(state);
-      }
-      for prompt in arrived {
-         self.enqueue_prompt(prompt);
-      }
-      for id in closed {
-         self.remove_prompt(id);
-      }
       // The alert's own paint callback answers, steps and expires prompts outside this
       // window's frames, so the local list is refreshed from the model it mutates before
       // anything here reads it.
@@ -424,6 +419,27 @@ impl App {
          self.connection_logged = true;
       }
       self.connected = connected;
+   }
+
+   /// Applies one socket event to the app's state.
+   ///
+   /// Split out of the drain so the events kept for an unseen window are installed by the
+   /// same code: `poll` borrows the client, so the drain collects and this applies.
+   fn install(&mut self, event: ipc::IpcEvent) {
+      match event {
+         ipc::IpcEvent::Connected(state) => self.set_connected(state),
+         ipc::IpcEvent::Message(response) => match *response {
+            Response::Connection(event) => self.log.push(&event),
+            Response::Status(status) => {
+               self.mode = status.mode;
+               self.status = Some(status);
+            }
+            Response::Prompt(prompt) => self.enqueue_prompt(prompt),
+            Response::PromptClosed { id, .. } => self.remove_prompt(id),
+            Response::Rules { rules } => self.rules.install(rules),
+            _ => {}
+         },
+      }
    }
 
    /// Queues one prompt, replacing an earlier copy of the same id.
