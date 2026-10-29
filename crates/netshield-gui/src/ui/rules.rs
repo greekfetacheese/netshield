@@ -5,10 +5,8 @@ use std::cell::Cell;
 use egui::{Color32, RichText, Ui};
 use egui_elements::{Button, ComboBox, Label, Modal};
 use elegance::Switch;
-use netshield_core::ipnet::IpNet;
-use netshield_core::rule::{
-   Action, AppMatcher, DestMatcher, Duration, Rule, RuleId, normalize_host,
-};
+use netshield_core::destlist::{dest_lines, parse_dest_lines};
+use netshield_core::rule::{Action, AppMatcher, DestMatcher, Duration, Rule, RuleId};
 
 /// Verdict colour for an enabled allow rule.
 const ALLOWED: Color32 = Color32::from_rgb(0x6C, 0xC0, 0x7A);
@@ -57,6 +55,35 @@ pub fn dest_label(dest: &DestMatcher) -> String {
       } => format!("*.{host}"),
       DestMatcher::Ip(net) => net.to_string(),
       DestMatcher::Port(port) => format!("port {port}"),
+      DestMatcher::Set(entries) => {
+         let mut label = entries.iter().take(2).map(entry_label).collect::<Vec<_>>().join(", ");
+         if entries.len() > 2 {
+            label.push_str(&format!(" +{}", entries.len() - 2));
+         }
+         label
+      }
+   }
+}
+
+/// One entry of a list, without the phrasing a single-destination rule uses.
+///
+/// The table's `Destination` column has to stay readable, so a list reads `api.github.com,
+/// *.example.org +3` rather than repeating "only" for every entry.
+fn entry_label(entry: &DestMatcher) -> String {
+   match entry {
+      DestMatcher::Domain {
+         host,
+         subdomains: false,
+      } => host.clone(),
+      DestMatcher::Domain {
+         host,
+         subdomains: true,
+      } => format!("*.{host}"),
+      DestMatcher::Ip(net) => net.to_string(),
+      DestMatcher::Port(port) => format!("port {port}"),
+      DestMatcher::Any => "anywhere".to_owned(),
+      // `from_entries` never nests, so this is only reachable for a rule a client invented.
+      DestMatcher::Set(_) => "a list".to_owned(),
    }
 }
 
@@ -289,10 +316,14 @@ impl Draft {
 }
 
 /// The destination scope as the editor's widgets edit it.
+///
+/// A rule scoped to one address and a rule scoped to twenty are the same thing to a person typing
+/// them, so `Ip`, `Domain` and `Set` all become the one text list: the parser collapses a
+/// single-line list back to the plain matcher, which keeps a rule `from_dest` read identical to
+/// what `into_rule` writes.
 enum ScopeDraft {
    Any,
-   Domain { host: String, subdomains: bool },
-   Ip { text: String },
+   Destinations { text: String },
    Port { text: String },
 }
 
@@ -300,24 +331,21 @@ impl ScopeDraft {
    fn from_dest(dest: &DestMatcher) -> Self {
       match dest {
          DestMatcher::Any => Self::Any,
-         DestMatcher::Domain { host, subdomains } => Self::Domain {
-            host: host.clone(),
-            subdomains: *subdomains,
-         },
-         DestMatcher::Ip(net) => Self::Ip {
-            text: net.to_string(),
-         },
          DestMatcher::Port(port) => Self::Port {
             text: port.to_string(),
          },
+         DestMatcher::Ip(_) | DestMatcher::Domain { .. } | DestMatcher::Set(_) => {
+            Self::Destinations {
+               text: dest_lines(dest),
+            }
+         }
       }
    }
 
    fn kind(&self) -> ScopeKind {
       match self {
          Self::Any => ScopeKind::Any,
-         Self::Domain { .. } => ScopeKind::Domain,
-         Self::Ip { .. } => ScopeKind::Ip,
+         Self::Destinations { .. } => ScopeKind::Destinations,
          Self::Port { .. } => ScopeKind::Port,
       }
    }
@@ -329,11 +357,7 @@ impl ScopeDraft {
       }
       *self = match kind {
          ScopeKind::Any => Self::Any,
-         ScopeKind::Domain => Self::Domain {
-            host: String::new(),
-            subdomains: false,
-         },
-         ScopeKind::Ip => Self::Ip {
+         ScopeKind::Destinations => Self::Destinations {
             text: String::new(),
          },
          ScopeKind::Port => Self::Port {
@@ -347,19 +371,17 @@ impl ScopeDraft {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScopeKind {
    Any,
-   Domain,
-   Ip,
+   Destinations,
    Port,
 }
 
 impl ScopeKind {
-   const ALL: [Self; 4] = [Self::Any, Self::Domain, Self::Ip, Self::Port];
+   const ALL: [Self; 3] = [Self::Any, Self::Destinations, Self::Port];
 
    fn label(self) -> &'static str {
       match self {
          Self::Any => "Anywhere",
-         Self::Domain => "Domain",
-         Self::Ip => "IP or CIDR",
+         Self::Destinations => "IPs & domains",
          Self::Port => "Port",
       }
    }
@@ -369,22 +391,11 @@ impl ScopeKind {
 fn validate(draft: &Draft) -> Result<DestMatcher, String> {
    match &draft.scope {
       ScopeDraft::Any => Ok(DestMatcher::Any),
-      ScopeDraft::Domain { host, subdomains } => {
-         let raw = host.trim();
-         if raw.is_empty() {
-            return Err("host is empty".to_owned());
-         }
-         let host = normalize_host(raw).map_err(|err| err.to_string())?;
-         Ok(DestMatcher::Domain {
-            host,
-            subdomains: *subdomains,
-         })
+      // The parser's message already names the offending line, which is the only way the user can
+      // find the typo in a list of thirty entries.
+      ScopeDraft::Destinations { text } => {
+         parse_dest_lines(text).map_err(|error| error.to_string())
       }
-      ScopeDraft::Ip { text } => text
-         .trim()
-         .parse::<IpNet>()
-         .map(DestMatcher::Ip)
-         .map_err(|_| "not a CIDR, e.g. 140.82.0.0/16".to_owned()),
       ScopeDraft::Port { text } => match text.trim().parse::<u16>() {
          Ok(port) if port > 0 => Ok(DestMatcher::Port(port)),
          _ => Err("port must be 1-65535".to_owned()),
@@ -452,12 +463,19 @@ fn scope_field(ui: &mut Ui, draft: &mut Draft) {
 
       match &mut draft.scope {
          ScopeDraft::Any => {}
-         ScopeDraft::Domain { host, subdomains } => {
-            ui.add(egui::TextEdit::singleline(host).hint_text("api.github.com"));
-            ui.checkbox(subdomains, "include subdomains");
-         }
-         ScopeDraft::Ip { text } => {
-            ui.add(egui::TextEdit::singleline(text).hint_text("140.82.0.0/16"));
+         ScopeDraft::Destinations { text } => {
+            ui.add(
+               egui::TextEdit::multiline(text)
+                  .font(egui::TextStyle::Monospace)
+                  .desired_rows(6)
+                  .desired_width(360.0)
+                  .hint_text("api.github.com\n*.example.org\n140.82.0.0/16"),
+            );
+            ui.label(
+               RichText::new("one IP, CIDR or domain per line; *.domain includes subdomains")
+                  .small()
+                  .weak(),
+            );
          }
          ScopeDraft::Port { text } => {
             ui.add(egui::TextEdit::singleline(text).hint_text("443"));
@@ -619,20 +637,32 @@ mod tests {
    #[test]
    fn validate_accepts_good_scopes_and_rejects_bad_ones() {
       assert_eq!(
-         validate(&draft(ScopeDraft::Domain {
-            host: "API.GitHub.com.".to_owned(),
-            subdomains: true,
+         validate(&draft(ScopeDraft::Destinations {
+            text: "API.GitHub.com.\n*.example.org\n140.82.0.0/16\n::1".to_owned(),
+         })),
+         Ok(DestMatcher::Set(vec![
+            DestMatcher::Domain {
+               host: "api.github.com".to_owned(),
+               subdomains: false,
+            },
+            DestMatcher::Domain {
+               host: "example.org".to_owned(),
+               subdomains: true,
+            },
+            DestMatcher::Ip("140.82.0.0/16".parse().unwrap()),
+            DestMatcher::Ip("::1/128".parse().unwrap()),
+         ])),
+         "a mixed list is one scope and hosts are normalised"
+      );
+      assert_eq!(
+         validate(&draft(ScopeDraft::Destinations {
+            text: "  api.github.com  \n".to_owned(),
          })),
          Ok(DestMatcher::Domain {
             host: "api.github.com".to_owned(),
-            subdomains: true,
-         })
-      );
-      assert_eq!(
-         validate(&draft(ScopeDraft::Ip {
-            text: " 140.82.0.0/16 ".to_owned(),
-         })),
-         Ok(DestMatcher::Ip("140.82.0.0/16".parse().unwrap()))
+            subdomains: false,
+         }),
+         "a one-line list saves as the plain matcher"
       );
       assert_eq!(
          validate(&draft(ScopeDraft::Port {
@@ -640,24 +670,13 @@ mod tests {
          })),
          Ok(DestMatcher::Port(443))
       );
-
       assert!(
-         validate(&draft(ScopeDraft::Domain {
-            host: "   ".to_owned(),
-            subdomains: false,
+         validate(&draft(ScopeDraft::Destinations {
+            text: "   ".to_owned(),
          }))
          .is_err(),
-         "an empty host is rejected"
+         "an empty list is not a scope"
       );
-      for bad in ["140.82.0.0/33", "not an ip", "140.82.0.0/"] {
-         assert!(
-            validate(&draft(ScopeDraft::Ip {
-               text: bad.to_owned(),
-            }))
-            .is_err(),
-            "CIDR {bad:?} must be rejected"
-         );
-      }
       for bad in ["0", "70000", ""] {
          assert!(
             validate(&draft(ScopeDraft::Port {
@@ -670,20 +689,37 @@ mod tests {
    }
 
    #[test]
-   fn draft_round_trips_a_domain_and_an_any_rule() {
-      let domain = rule(DestMatcher::Domain {
-         host: "github.com".to_owned(),
-         subdomains: true,
-      });
-      let any = rule(DestMatcher::Any);
+   fn draft_round_trips_a_list_a_domain_a_port_and_an_any_rule() {
+      let originals = [
+         rule(DestMatcher::Set(vec![
+            DestMatcher::Domain {
+               host: "api.github.com".to_owned(),
+               subdomains: false,
+            },
+            DestMatcher::Ip("10.0.0.0/8".parse().unwrap()),
+            DestMatcher::Domain {
+               host: "example.org".to_owned(),
+               subdomains: true,
+            },
+         ])),
+         rule(DestMatcher::Domain {
+            host: "github.com".to_owned(),
+            subdomains: true,
+         }),
+         rule(DestMatcher::Port(53)),
+         rule(DestMatcher::Any),
+      ];
 
-      for original in [domain, any] {
+      for original in originals {
          let rebuilt = Draft::from_rule(&original)
             .into_rule(9_999)
             .expect("a rule the draft came from must validate");
          assert_eq!(rebuilt.id, original.id);
          assert_eq!(rebuilt.app, original.app);
-         assert_eq!(rebuilt.dest, original.dest);
+         assert_eq!(
+            rebuilt.dest, original.dest,
+            "an untouched scope must not change"
+         );
          assert_eq!(rebuilt.note, original.note);
          assert_eq!(rebuilt.created_at, original.created_at);
          assert_eq!(rebuilt.hits, original.hits);
@@ -693,6 +729,73 @@ mod tests {
             "an edit stamps the time it was saved"
          );
       }
+   }
+
+   #[test]
+   fn a_multi_line_scope_saves_as_one_set_rule() {
+      let mut draft = draft(ScopeDraft::Destinations {
+         text: "api.github.com\n*.example.org\n140.82.0.0/16".to_owned(),
+      });
+      draft.action = Action::Deny;
+
+      let rule = draft.into_rule(9_999).expect("a well-formed list saves");
+      assert_eq!(
+         rule.dest,
+         DestMatcher::Set(vec![
+            DestMatcher::Domain {
+               host: "api.github.com".to_owned(),
+               subdomains: false,
+            },
+            DestMatcher::Domain {
+               host: "example.org".to_owned(),
+               subdomains: true,
+            },
+            DestMatcher::Ip("140.82.0.0/16".parse().unwrap()),
+         ]),
+         "three entries are one scope, in the order they were typed"
+      );
+      assert_eq!(rule.action, Action::Deny);
+   }
+
+   #[test]
+   fn a_bad_line_is_reported_with_its_number() {
+      let draft = draft(ScopeDraft::Destinations {
+         text: "example.com\n\nnot a host".to_owned(),
+      });
+      let error = validate(&draft).expect_err("a bad line must not save");
+      assert!(
+         error.contains("line 3"),
+         "the message must name the line that failed, got {error:?}"
+      );
+   }
+
+   #[test]
+   fn the_editor_seeds_a_list_rule_as_text() {
+      let original = rule(DestMatcher::Set(vec![
+         DestMatcher::Domain {
+            host: "api.github.com".to_owned(),
+            subdomains: false,
+         },
+         DestMatcher::Ip("10.0.0.0/8".parse().unwrap()),
+         DestMatcher::Domain {
+            host: "example.org".to_owned(),
+            subdomains: true,
+         },
+      ]));
+
+      let opened = Draft::from_rule(&original);
+      assert!(
+         matches!(
+            &opened.scope,
+            ScopeDraft::Destinations { text }
+               if text == "api.github.com\n10.0.0.0/8\n*.example.org"
+         ),
+         "the editor opens a list as one line per entry, subdomains spelled *.host"
+      );
+      assert_eq!(
+         opened.into_rule(9_999).expect("the seeded list validates").dest,
+         original.dest
+      );
    }
 
    #[test]
