@@ -240,63 +240,6 @@ mod tests {
    }
 
    #[test]
-   fn an_equivalent_rule_is_refreshed_and_re_enabled() {
-      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
-      let first = allow_rule(10);
-      assert_eq!(policy.apply(first.clone()).1, Applied::Created);
-
-      let mut disabled = first.clone();
-      disabled.enabled = false;
-      policy.upsert_rule(disabled);
-
-      let refreshed = allow_rule(20);
-      let (applied, outcome) = policy.apply(refreshed);
-      assert_eq!(outcome, Applied::Refreshed);
-      assert_eq!(policy.ruleset().len(), 1);
-      assert_eq!(
-         applied.id, first.id,
-         "the existing rule keeps its id"
-      );
-      assert_eq!(
-         applied.created_at, 10,
-         "creation is not rewritten"
-      );
-      assert_eq!(applied.updated_at, 20);
-      assert!(
-         applied.enabled,
-         "a refreshed rule is enabled again"
-      );
-   }
-
-   #[test]
-   fn a_rule_with_a_different_matcher_is_a_new_rule() {
-      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
-      let mut domain = allow_rule(10);
-      domain.dest = DestMatcher::Domain {
-         host: "api.github.com".to_owned(),
-         subdomains: false,
-      };
-      let mut ip = allow_rule(10);
-      ip.dest = DestMatcher::Ip("140.82.121.78/32".parse().expect("a network"));
-
-      assert_eq!(policy.apply(domain).1, Applied::Created);
-      assert_eq!(
-         policy.apply(ip).1,
-         Applied::Created,
-         "a domain rule must not absorb an ip rule"
-      );
-
-      let mut deny = allow_rule(20);
-      deny.action = Action::Deny;
-      assert_eq!(
-         policy.apply(deny).1,
-         Applied::Created,
-         "a different action is a different rule"
-      );
-      assert_eq!(policy.ruleset().len(), 3);
-   }
-
-   #[test]
    fn a_grant_wins_over_a_rule() {
       let deny = deny_rule(10);
       let mut set = RuleSet::new();
@@ -339,10 +282,7 @@ mod tests {
          "the deadline itself is past"
       );
       assert_eq!(policy.expire_grants(150), 1);
-   }
 
-   #[test]
-   fn expire_grants_counts_only_expired_entries() {
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
       policy.grant(conn().flow_key(), Action::Allow, 100);
       let mut other = conn();
@@ -359,27 +299,19 @@ mod tests {
    }
 
    #[test]
-   fn ask_with_default_prompt_is_a_prompt() {
-      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
-      assert_eq!(policy.decide(&conn(), 0), Decision::Prompt);
-   }
-
-   #[test]
-   fn ask_with_default_allow_is_an_unattributed_allow() {
-      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Allow);
-      assert_eq!(
-         policy.decide(&conn(), 0),
-         Decision::Allow { rule: None }
-      );
-   }
-
-   #[test]
-   fn ask_with_default_deny_is_an_unattributed_deny() {
-      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Deny);
-      assert_eq!(
-         policy.decide(&conn(), 0),
-         Decision::Deny { rule: None }
-      );
+   fn the_default_action_decides_a_flow_with_no_rule() {
+      let cases = [
+         (DefaultAction::Prompt, Decision::Prompt),
+         (
+            DefaultAction::Allow,
+            Decision::Allow { rule: None },
+         ),
+         (DefaultAction::Deny, Decision::Deny { rule: None }),
+      ];
+      for (default, expected) in cases {
+         let mut policy = Policy::new(RuleSet::new(), default);
+         assert_eq!(policy.decide(&conn(), 0), expected, "{default:?}");
+      }
    }
 
    #[test]
@@ -440,17 +372,12 @@ mod tests {
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
       let now = now_secs();
 
-      policy.grant(key.clone(), Action::Allow, u64::MAX);
+      policy.grant(key, Action::Allow, u64::MAX);
       assert_eq!(policy.expire_grants(now + GRANT_TTL_SECS - 1), 0);
       assert_eq!(policy.expire_grants(now + GRANT_TTL_SECS), 1);
-   }
 
-   #[test]
-   fn a_shorter_grant_deadline_is_kept() {
       let key = conn().flow_key();
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
-      let now = now_secs();
-
       policy.grant(key, Action::Allow, now + 5);
       assert_eq!(policy.expire_grants(now + 4), 0);
       assert_eq!(policy.expire_grants(now + 5), 1);

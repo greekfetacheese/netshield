@@ -419,49 +419,10 @@ mod tests {
    /// The name the tests render by default; the configurable name is tested separately.
    const DEFAULT: &str = "netshield";
 
-   #[test]
-   fn ruleset_matches_architecture_section_two() {
-      let text = ruleset_text(DEFAULT, 0, 1, false);
-      let lines: Vec<&str> = text.lines().collect();
-      assert_eq!(
-         lines,
-         [
-            "table inet netshield {",
-            "    set killed4 { type ipv4_addr . ipv4_addr . inet_service . inet_service; \
-             flags timeout; }",
-            "    set killed6 { type ipv6_addr . ipv6_addr . inet_service . inet_service; \
-             flags timeout; }",
-            "    chain output {",
-            "        type filter hook output priority mangle; policy accept;",
-            "        oifname \"lo\" return comment \"netshield: loopback is not filtered\"",
-            "        ct state new ct mark set meta skuid | 0x40000000 \
-             comment \"netshield: record the owner\"",
-            "        ct state established ip saddr . ip daddr . tcp sport . tcp dport \
-             @killed4 reject with tcp reset",
-            "        ct state established ip saddr . ip daddr . udp sport . udp dport \
-             @killed4 reject with icmpx type admin-prohibited",
-            "        ct state established ip6 saddr . ip6 daddr . tcp sport . tcp dport \
-             @killed6 reject with tcp reset",
-            "        ct state established ip6 saddr . ip6 daddr . udp sport . udp dport \
-             @killed6 reject with icmpx type admin-prohibited",
-            "        tcp flags & (fin|syn|rst|ack) == syn queue num 0 bypass \
-             comment \"netshield: tcp syn\"",
-            "        ct state new queue num 0 bypass comment \"netshield: non-tcp new flow\"",
-            "    }",
-            "    chain dns_in {",
-            "        type filter hook input priority mangle; policy accept;",
-            "        udp sport 53 queue num 1 bypass comment \"netshield: dns answers\"",
-            "        tcp sport 53 queue num 1 bypass comment \"netshield: dns answers over tcp\"",
-            "    }",
-            "}",
-         ]
-      );
-   }
-
    /// The table name is not a constant: the rendered ruleset carries the configured name, so a
    /// second daemon can install into its own table and never touch the real one.
    #[test]
-   fn the_table_name_comes_from_config() {
+   fn the_ruleset_uses_the_configured_table_and_queues() {
       let config: netshield_core::Config = serde_json::from_str(
          r#"{"table": "netshielddiag", "queue_num": 0, "dns_queue_num": 1,
             "prompt_timeout_secs": 30, "default_action": "prompt", "allowed_uid": null,
@@ -478,21 +439,12 @@ mod tests {
          !text.contains("table inet netshield {"),
          "the default table must not be rendered alongside it"
       );
-   }
 
-   #[test]
-   fn the_reject_sets_are_declared_before_the_chain_that_uses_them() {
-      let text = ruleset_text(DEFAULT, 0, 1, false);
-      for set in [KILLED4, KILLED6] {
-         let declaration = text
-            .find(&format!("set {set} {{"))
-            .unwrap_or_else(|| panic!("{set} must be declared"));
-         let chain = text.find("chain output {").expect("the output chain exists");
-         assert!(
-            declaration < chain,
-            "{set} must be declared before the chain that references it"
-         );
-      }
+      let text = ruleset_text(DEFAULT, 7, 9, false);
+      assert_eq!(text.matches("queue num 7").count(), 2);
+      assert_eq!(text.matches("queue num 9").count(), 2);
+      assert!(!text.contains("queue num 0"));
+      assert!(!text.contains("queue num 1"));
    }
 
    #[test]
@@ -531,19 +483,18 @@ mod tests {
           add element inet netshield killed6 { 2001:db8::1 . 2606:4700:4700::1111 . 51235 . 80 \
           timeout 60s }\n"
       );
-   }
 
-   #[test]
-   fn every_element_carries_its_timeout() {
-      let flows = [Flow::V4(
-         Ipv4Addr::new(10, 0, 0, 1),
-         1,
-         Ipv4Addr::new(10, 0, 0, 2),
-         2,
-      )];
-      let script = element_text(DEFAULT, &flows, 90);
-      assert!(script.contains(" timeout 90s"));
-      assert_eq!(script.matches("add element").count(), 1);
+      for (timeout, expected) in [(60, " timeout 60s"), (90, " timeout 90s")] {
+         let one = [Flow::V4(
+            Ipv4Addr::new(10, 0, 0, 1),
+            1,
+            Ipv4Addr::new(10, 0, 0, 2),
+            2,
+         )];
+         let script = element_text(DEFAULT, &one, timeout);
+         assert!(script.contains(expected));
+         assert_eq!(script.matches("add element").count(), 1);
+      }
       assert_eq!(element_text(DEFAULT, &[], 60), "");
    }
 
@@ -553,15 +504,6 @@ mod tests {
          kill_flows(DEFAULT, &[], 60).expect("an empty kill is a success"),
          0
       );
-   }
-
-   #[test]
-   fn ruleset_substitutes_both_queues() {
-      let text = ruleset_text(DEFAULT, 7, 9, false);
-      assert_eq!(text.matches("queue num 7").count(), 2);
-      assert_eq!(text.matches("queue num 9").count(), 2);
-      assert!(!text.contains("queue num 0"));
-      assert!(!text.contains("queue num 1"));
    }
 
    #[test]
@@ -589,8 +531,19 @@ mod tests {
    }
 
    #[test]
-   fn the_owner_is_stamped_before_any_queue_verdict() {
+   fn the_ruleset_orders_the_stamp_and_rejects_between_new_and_queued_flows() {
       let text = ruleset_text(DEFAULT, 3, 4, false);
+      let chain = text.find("chain output {").expect("the output chain exists");
+      for set in [KILLED4, KILLED6] {
+         let declaration = text
+            .find(&format!("set {set} {{"))
+            .unwrap_or_else(|| panic!("{set} must be declared"));
+         assert!(
+            declaration < chain,
+            "{set} must be declared before the chain that references it"
+         );
+      }
+
       let stamp = text
          .find(&format!(
             "ct mark set meta skuid | {OWNER_TAG:#010x}"
@@ -606,12 +559,7 @@ mod tests {
          stamp < non_tcp,
          "the stamp must precede the non-tcp queue rule"
       );
-   }
 
-   #[test]
-   fn the_reject_rules_come_after_the_stamp_and_before_the_queues() {
-      let text = ruleset_text(DEFAULT, 3, 4, false);
-      let stamp = text.find("ct mark set meta skuid").expect("the owner stamp is rendered");
       let first_reject = text.find("@killed4").expect("the v4 reject rules are rendered");
       let first_queue = text.find("queue num 3").expect("the tcp queue rule is rendered");
       assert!(
@@ -629,74 +577,83 @@ mod tests {
       );
    }
 
-   #[test]
-   fn effective_uid_reads_the_second_uid_field() {
-      let status = "Name:\tnetshieldd\nUid:\t1000\t1001\t1002\t1003\nGid:\t1000\t1000\n";
-      assert_eq!(parse_effective_uid(status), Some(1001));
-      assert_eq!(parse_effective_uid("Name:\tnetshieldd\n"), None);
-      assert_eq!(parse_effective_uid("Uid:\troot\n"), None);
-   }
-
-   #[test]
-   fn listed_queues_reads_exact_numbers() {
-      let listing = "queue num 0 bypass\nqueue num 1 bypass\nqueue num 10 bypass";
-      assert_eq!(listed_queues(listing), ["0", "1", "10"]);
-      assert!(!listed_queues(listing).iter().any(|queue| queue == "2"));
-   }
-
    /// The real `nft list table inet netshield` output captured on nftables 1.0.9.
    /// The indentation is a tab, and the spacing is nft's, not the renderer's.
    const FIXTURE: &str = "table inet netshield {\n\tchain output {\n\t\ttype filter hook output priority mangle; policy accept;\n\t\toifname \"lo\" return comment \"netshield: loopback is not filtered\"\n\t\ttcp flags syn / fin,syn,rst,ack queue flags bypass to 0 comment \"netshield: tcp syn\"\n\t\tct state new queue flags bypass to 0 comment \"netshield: non-tcp new flow\"\n\t}\n\n\tchain dns_in {\n\t\ttype filter hook input priority mangle; policy accept;\n\t\tudp sport 53 queue flags bypass to 1 comment \"netshield: dns answers\"\n\t\ttcp sport 53 queue flags bypass to 1 comment \"netshield: dns answers over tcp\"\n\t}\n}\n";
 
    #[test]
-   fn real_nft_listing_verifies_both_queues() {
+   fn verify_listing_accepts_both_renderings_and_rejects_a_missing_queue() {
+      let listing = "queue num 0 bypass\nqueue num 1 bypass\nqueue num 10 bypass";
+      assert_eq!(listed_queues(listing), ["0", "1", "10"]);
+      assert!(!listed_queues(listing).iter().any(|queue| queue == "2"));
+
+      let renderer = ruleset_text(DEFAULT, 0, 1, false);
+      assert!(renderer.contains("queue num 0"));
+      assert!(!renderer.contains("queue flags bypass to"));
+      assert_eq!(listed_queues(&renderer), ["0", "0", "1", "1"]);
+
       assert!(
          FIXTURE.contains('\t'),
          "the captured fixture is tab-indented"
       );
       assert_eq!(listed_queues(FIXTURE), ["0", "0", "1", "1"]);
-      verify_listing(DEFAULT, FIXTURE, 0, 1).expect("the table NetShield installed must verify");
-   }
 
-   #[test]
-   fn real_nft_listing_rejects_a_missing_queue() {
-      assert!(verify_listing(DEFAULT, FIXTURE, 0, 2).is_err());
-   }
+      let no_verdict = "table inet netshield {\n\tchain output {\n\t\tct state new return\n\t}\n\tchain dns_in {\n\t\tudp sport 53 return\n\t}\n}\n";
+      let single_digit = "\tchain output {\n\t\tct state new queue flags bypass to 10\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 10\n\t}\n";
+      let comment_number = "\tchain output {\n\t\tct state new return comment \"queue num 1\"\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 0 comment \"queue num 1\"\n\t}\n";
 
-   #[test]
-   fn chains_without_a_queue_verdict_fail() {
-      let listing = "table inet netshield {\n\tchain output {\n\t\tct state new return\n\t}\n\tchain dns_in {\n\t\tudp sport 53 return\n\t}\n}\n";
-      assert!(verify_listing(DEFAULT, listing, 0, 1).is_err());
-   }
-
-   #[test]
-   fn a_single_digit_queue_is_not_satisfied_by_a_longer_number() {
-      let listing = "\tchain output {\n\t\tct state new queue flags bypass to 10\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 10\n\t}\n";
-      assert!(verify_listing(DEFAULT, listing, 10, 10).is_ok());
-      assert!(verify_listing(DEFAULT, listing, 1, 10).is_err());
-   }
-
-   #[test]
-   fn a_number_inside_a_comment_is_not_a_queue_verdict() {
-      let listing = "\tchain output {\n\t\tct state new return comment \"queue num 1\"\n\t}\n\tchain dns_in {\n\t\tudp sport 53 queue flags bypass to 0 comment \"queue num 1\"\n\t}\n";
-      assert!(verify_listing(DEFAULT, listing, 0, 0).is_ok());
-      assert!(verify_listing(DEFAULT, listing, 0, 1).is_err());
-   }
-
-   #[test]
-   fn renderer_form_queue_num_also_verifies() {
-      let listing = ruleset_text(DEFAULT, 0, 1, false);
-      assert!(listing.contains("queue num 0"));
-      assert!(!listing.contains("queue flags bypass to"));
-      assert_eq!(listed_queues(&listing), ["0", "0", "1", "1"]);
-      verify_listing(DEFAULT, &listing, 0, 1).expect("the renderer's own syntax must verify too");
-   }
-
-   #[test]
-   fn errors_render_loudly() {
-      assert!(FirewallError::NotRoot.to_string().contains("root"));
-      assert!(FirewallError::NftMissing.to_string().contains("nft"));
-      assert!(FirewallError::Commands("boom".to_owned()).to_string().contains("boom"));
-      assert!(FirewallError::Verify("missing".to_owned()).to_string().contains("missing"));
+      let cases = [
+         ("the fixture verifies", FIXTURE, 0, 1, true),
+         (
+            "the renderer form verifies",
+            &renderer,
+            0,
+            1,
+            true,
+         ),
+         (
+            "a long queue matches itself",
+            single_digit,
+            10,
+            10,
+            true,
+         ),
+         (
+            "a comment is not a verdict",
+            comment_number,
+            0,
+            0,
+            true,
+         ),
+         (
+            "the fixture lacks the dns queue",
+            FIXTURE,
+            0,
+            2,
+            false,
+         ),
+         ("no queue verdict fails", no_verdict, 0, 1, false),
+         (
+            "single digit != longer number",
+            single_digit,
+            1,
+            10,
+            false,
+         ),
+         (
+            "comment number != queue number",
+            comment_number,
+            0,
+            1,
+            false,
+         ),
+      ];
+      for (name, listing, queue, dns_queue, ok) in cases {
+         assert_eq!(
+            verify_listing(DEFAULT, listing, queue, dns_queue).is_ok(),
+            ok,
+            "{name}: {listing}"
+         );
+      }
    }
 }

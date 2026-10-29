@@ -802,16 +802,17 @@ mod tests {
       assert!(!peer_allowed(1001, Some(1000)));
    }
 
-   #[test]
-   fn socket_ownership_defaults_to_root_root_when_no_uid_is_allowed() {
-      assert_eq!(socket_ownership(None), (0, 0, 0o660));
-   }
-
    // The successful chown is not tested: it needs root and a real user's passwd entry,
    // and the socket path is a live filesystem object. The decision and the failure
    // ordering are unit-tested below.
    #[test]
    fn socket_ownership_keeps_the_mode_after_a_chown() {
+      assert_eq!(
+         socket_ownership(None),
+         (0, 0, 0o660),
+         "no allowed uid means root owns the socket"
+      );
+
       let (uid, gid, mode) = socket_ownership(Some(0));
       assert_eq!((uid, gid), (0, 0), "root's primary group is 0");
       assert_eq!(
@@ -854,7 +855,7 @@ mod tests {
    }
 
    #[test]
-   fn a_frame_round_trips_through_the_reader() {
+   fn the_frame_reader_caps_the_line_length() {
       let mut input = Cursor::new(b"{\"kind\":\"subscribe\"}\n{\"kind\":\"status\"}\n".to_vec());
       let mut buffered = Vec::new();
       let first = read_frame(&mut input, &mut buffered).expect("readable").expect("a frame");
@@ -871,10 +872,7 @@ mod tests {
          read_frame(&mut input, &mut buffered).expect("readable").is_none(),
          "end of stream"
       );
-   }
 
-   #[test]
-   fn an_endless_line_is_refused_once_it_exceeds_the_limit() {
       let endless = vec![b'a'; FRAME_LIMIT + READ_CHUNK + 1];
       let mut input = Cursor::new(endless);
       let mut buffered = Vec::new();
@@ -882,10 +880,7 @@ mod tests {
          read_frame(&mut input, &mut buffered),
          Err(ReadError::TooLong)
       ));
-   }
 
-   #[test]
-   fn a_frame_at_the_limit_is_still_accepted() {
       let mut body = vec![b' '; FRAME_LIMIT - 1];
       body.push(b'\n');
       let mut input = Cursor::new(body);
@@ -918,7 +913,7 @@ mod tests {
    }
 
    #[test]
-   fn client_and_status_snapshots_are_published_through_the_handle() {
+   fn the_handle_publishes_status_rules_and_mode() {
       let shared = shared();
       let handle = IpcHandle {
          shared: Arc::clone(&shared),
@@ -935,9 +930,32 @@ mod tests {
          "the server owns the mode state"
       );
 
-      let state = shared.state.lock().expect("ipc state");
-      assert_eq!(state.rules, vec![rule]);
-      assert_eq!(state.status, Some(status(Mode::Alert, 1)));
+      {
+         let state = shared.state.lock().expect("ipc state");
+         assert_eq!(state.rules, vec![rule]);
+         assert_eq!(state.status, Some(status(Mode::Alert, 1)));
+      }
+
+      let (server, mut client) = pair();
+      let uid = our_uid().expect("our own uid");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+      client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
+
+      let mut buffered = Vec::new();
+      match read_response(&mut client, &mut buffered) {
+         Response::Status(status) => assert_eq!(status.mode, Mode::Silent),
+         other => panic!("expected Status, got {other:?}"),
+      }
+      assert_eq!(handle.mode(), Mode::Silent);
+
+      drop(client);
+      reader.join().expect("reader thread");
    }
 
    #[test]
@@ -1045,35 +1063,6 @@ mod tests {
          Response::Error { message } => assert!(message.contains("Hello")),
          other => panic!("expected Error, got {other:?}"),
       }
-      reader.join().expect("reader thread");
-   }
-
-   #[test]
-   fn set_mode_updates_the_published_snapshot() {
-      let (server, mut client) = pair();
-      let shared = shared();
-      let handle = IpcHandle {
-         shared: Arc::clone(&shared),
-      };
-      handle.set_status(status(Mode::Alert, 0));
-      let uid = our_uid().expect("our own uid");
-      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
-
-      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
-      client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
-         .expect("send");
-      client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
-
-      let mut buffered = Vec::new();
-      match read_response(&mut client, &mut buffered) {
-         Response::Status(status) => assert_eq!(status.mode, Mode::Silent),
-         other => panic!("expected Status, got {other:?}"),
-      }
-      assert_eq!(handle.mode(), Mode::Silent);
-
-      drop(client);
       reader.join().expect("reader thread");
    }
 
