@@ -13,7 +13,8 @@ which phase is current.
    implementation detail: `netshield-core` has `serde` + `serde_json` and nothing else; the
    daemon adds `libc`, `log`, `redb` (the rule store) and `serde`/`serde_json` (the control
    protocol is JSON, and both crates are already in the tree via core); the GUI adds the
-   egui stack pinned to the versions in `Cargo.toml`. Anything else needs the orchestrator's
+   egui stack pinned to the versions in `Cargo.toml`, plus `serde`/`serde_json` for its own
+   preferences file (`~/.config/netshield/gui.json`). Anything else needs the orchestrator's
    approval first.
 3. **No async runtime.** Threads and blocking I/O. Never introduce `tokio`/`async-std`.
 4. **No `unsafe` outside `netshield-daemon/src/netlink/`** (and the `/proc` reads if a

@@ -6,6 +6,7 @@ mod connlog;
 mod ipc;
 mod logging;
 mod mock;
+mod prefs;
 mod ruleset;
 mod theme;
 mod tray;

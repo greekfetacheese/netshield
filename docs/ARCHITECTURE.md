@@ -322,6 +322,11 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 ## 9. Storage and packaging
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
+- `$XDG_CONFIG_HOME/netshield/gui.json` (`~/.config/netshield/gui.json`) — the GUI's own
+  preferences: the Connections log's caps, `rows_per_app` (default 100, range 10–1000) and
+  `max_apps` (default 32, range 1–128). Written atomically by the unprivileged GUI and never
+  read by the daemon; a missing or unparsable file means the defaults, and out-of-range values
+  are clamped.
 - `/etc/netshield/rules.db` — a redb database keyed by rule id, one record per `Forever`
   rule, written per record (never rewritten wholesale) and committed with
   `Durability::Immediate`. It is opened before the firewall is installed, so loading is load

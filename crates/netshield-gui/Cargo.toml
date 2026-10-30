@@ -17,6 +17,7 @@ egui-elements = { version = "1.4.0", features = ["elegance"] }
 egui-elegance = "0.17"
 egui-lucide = "0.2"
 netshield-core = { path = "../netshield-core" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 

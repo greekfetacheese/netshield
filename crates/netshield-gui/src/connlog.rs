@@ -172,6 +172,34 @@ impl ConnectionLog {
       self.version += 1;
    }
 
+   /// Replaces both caps, keeping the history that still fits.
+   ///
+   /// Lowering a cap drops the oldest rows past it and, past `max_apps`, the quietest
+   /// application -- the same losses a push would have caused, counted in `dropped` so the
+   /// heading stays honest. Returns whether anything changed, so the caller knows whether
+   /// the new caps are worth writing down.
+   pub fn set_caps(&mut self, per_app: usize, max_apps: usize) -> bool {
+      if self.per_app == per_app && self.max_apps == max_apps {
+         return false;
+      }
+      self.per_app = per_app;
+      self.max_apps = max_apps;
+
+      let mut evicted = 0_u64;
+      for log in &mut self.apps {
+         while log.rows.len() > per_app {
+            log.rows.pop_front();
+            evicted += 1;
+         }
+      }
+      self.dropped += evicted;
+      while self.apps.len() > max_apps {
+         self.evict_the_quietest();
+      }
+      self.version += 1;
+      true
+   }
+
    /// Drops the application that has been quiet longest, so a new one fits.
    ///
    /// Ties break on the name, so the choice never depends on hash order.
@@ -411,5 +439,71 @@ mod tests {
          vec!["charlie", "alpha"],
          "the quietest app goes, not the first one inserted"
       );
+   }
+
+   #[test]
+   fn lowering_the_rows_cap_keeps_the_newest_rows() {
+      let mut log = ConnectionLog::new(10, 32);
+      for at in 0..10 {
+         log.push(&event(at, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      }
+
+      assert!(log.set_caps(3, 32), "a changed cap is a change");
+      assert_eq!(log.len(), 3);
+      assert_eq!(
+         log.dropped(),
+         7,
+         "the trimmed rows are counted, not hidden"
+      );
+      assert_eq!(log.rows().next().map(|row| row.at), Some(7));
+      assert_eq!(log.rows().last().map(|row| row.at), Some(9));
+   }
+
+   #[test]
+   fn lowering_the_apps_cap_drops_the_quietest_app() {
+      let mut log = ConnectionLog::new(10, 3);
+      for (at, name) in [(10, "alpha"), (20, "bravo"), (30, "charlie")] {
+         let mut connection = view(IpAddr::V4(Ipv4Addr::LOCALHOST));
+         connection.app_name = name.to_owned();
+         log.push(&event(at, connection));
+      }
+
+      assert!(log.set_caps(10, 2));
+      assert_eq!(
+         log.rows().map(|row| row.app.as_str()).collect::<Vec<_>>(),
+         vec!["bravo", "charlie"],
+         "the app whose newest row is oldest goes"
+      );
+      assert_eq!(log.dropped(), 1);
+   }
+
+   #[test]
+   fn raising_a_cap_keeps_every_row() {
+      let mut log = ConnectionLog::new(4, 4);
+      for at in 0..4 {
+         log.push(&event(at, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      }
+      let version = log.version();
+
+      assert!(log.set_caps(1000, 128));
+      assert_eq!(log.len(), 4);
+      assert_eq!(log.dropped(), 0);
+      assert!(
+         log.version() > version,
+         "the cache sees the new caps"
+      );
+   }
+
+   #[test]
+   fn an_unchanged_cap_is_not_a_change() {
+      let mut log = ConnectionLog::new(100, 32);
+      log.push(&event(0, view(IpAddr::V4(Ipv4Addr::LOCALHOST))));
+      let version = log.version();
+
+      assert!(
+         !log.set_caps(100, 32),
+         "nothing moved, so nothing is written"
+      );
+      assert_eq!(log.version(), version);
    }
 }
