@@ -90,7 +90,7 @@ pub struct AttributeStats {
    pub misses: u64,
    /// Lookups that stopped because a scan budget was exceeded.
    pub scan_budget_exhausted: u64,
-   /// Flows `/proc` could not resolve that the kernel's send registry attributed instead.
+   /// Flows whose sender the send registry named for the log.
    pub registry_hits: u64,
    /// Answers the send registry refused because `/proc` contradicted them: the pid was gone, or it
    /// belonged to another uid. Non-zero here means the probe is recording flows that attribution
@@ -316,10 +316,15 @@ struct FdCacheEntry {
 type SocketInode = (u32, Option<SystemTime>);
 
 /// A cached flow→owner answer.
+///
+/// `inode` is the socket the answer came from, and it is the only reason a hit may be trusted: a
+/// 5-tuple is reproducible — the owner closes its socket and another process binds the same local
+/// port to the same remote — while the kernel does not recycle an inode under a live socket.
 #[derive(Clone, Copy, Debug)]
 struct FlowCacheEntry {
    pid: u32,
    uid: u32,
+   inode: u32,
    at: Instant,
 }
 
@@ -509,13 +514,10 @@ impl Attributor {
             ..context
          };
          let missing = self.missing_kind(uid);
-         if missing == Missing::SocketGone
-            && let Some(attribution) = self.attribute_from_senders(flow, local, remote, uid, now)
-         {
-            return Attributed {
-               attribution,
-               missing: None,
-            };
+         if missing == Missing::SocketGone {
+            // The registry can name a likely sender, but its answer is not evidence (see the function),
+            // so the verdict below stays the owner's configured closed-flow action.
+            self.record_registry_guess(local, remote, uid);
          }
          return self.unknown(&context, Some(missing), reason, now);
       }
@@ -570,13 +572,10 @@ impl Attributor {
          }
          CandidateOwner::Missing => {
             let missing = self.missing_kind(uid);
-            if missing == Missing::SocketGone
-               && let Some(attribution) = self.attribute_from_senders(flow, local, remote, uid, now)
-            {
-               return Attributed {
-                  attribution,
-                  missing: None,
-               };
+            if missing == Missing::SocketGone {
+               // The registry can name a likely sender, but its answer is not evidence (see the function),
+               // so the verdict below stays the owner's configured closed-flow action.
+               self.record_registry_guess(local, remote, uid);
             }
             return self.unknown(
                &context,
@@ -656,6 +655,7 @@ impl Attributor {
          FlowCacheEntry {
             pid: hit.pid,
             uid: hit.uid,
+            inode: hit.inode,
             at: now,
          },
          (context.uid, context.proto, context.remote.1),
@@ -667,26 +667,29 @@ impl Attributor {
       }
    }
 
-   /// Attributes a flow the scan could not resolve, from the kernel's record of recent senders.
+   /// Names the pid the kernel's send registry suggests for this flow, for the log only.
    ///
-   /// This is the fallback for a socket that was closed before the scan ran: the record is taken
-   /// at syscall time, so it exists for a socket that does not. It never overrides `/proc` — it is
-   /// only asked after the scan failed — and it refuses an answer that `/proc` contradicts: the
-   /// pid must still exist, must still be owned by the packet's uid, and its identity is read from
-   /// `/proc` like any other, so a recycled pid cannot inherit another application's policy.
-   fn attribute_from_senders(
+   /// The registry's key is `(uid, remote)`: no local port, no inode, no pid. Two processes of one uid
+   /// sending to the same remote are therefore indistinguishable in it, so an answer here can never be
+   /// evidence about *this* flow — it used to be, and that handed one application's allow rules to
+   /// another. It is still worth logging, because an operator debugging a flow `/proc` lost wants to
+   /// know which application probably sent it. The verdict stays whatever the owner configured for a
+   /// closed flow (`unattributable_closed_flow`), decided by the caller from `Missing::SocketGone`.
+   fn record_registry_guess(
       &mut self,
-      flow: FlowKey,
       local: (IpAddr, u16),
       remote: (IpAddr, u16),
       uid: Option<u32>,
-      now: Instant,
-   ) -> Option<Attribution> {
-      let senders = self.senders.as_ref()?;
-      let uid = uid?;
+   ) {
+      let Some(senders) = self.senders.as_ref() else {
+         return;
+      };
+      let Some(uid) = uid else {
+         return;
+      };
       let Some(pid) = senders.recent_sender(uid, remote) else {
          self.stats.registry_misses += 1;
-         return None;
+         return;
       };
       let owner = read_pid_uid(pid);
       if owner != Some(uid) {
@@ -695,22 +698,19 @@ impl Attributor {
             "send registry named pid {pid} for {remote:?}, but the packet's uid is {uid} and \
              /proc says that pid is {owner:?}"
          );
-         return None;
+         return;
       }
-      let process = self.process_identity(pid, uid)?;
-      self.remember_success(
-         flow,
-         FlowCacheEntry { pid, uid, at: now },
-         (Some(uid), flow.0, remote.1),
-      );
+      if self.process_identity(pid, uid).is_none() {
+         return;
+      }
       self.stats.registry_hits += 1;
       debug!(
-         "attributed {} -> {}:{} to pid {pid} from the send registry",
+         "the send registry suggests pid {pid} for {} -> {}:{} (log only; the flow's verdict is \
+          the closed-flow action)",
          endpoint_label(local),
          endpoint_label(remote),
          remote.1
       );
-      Some(Attribution::Process(process))
    }
 
    /// Resolves a pid's identity, preferring the connector cache.
@@ -839,7 +839,20 @@ impl Attributor {
          self.flow_owners.remove(&flow);
          return None;
       }
-      Some((entry.pid, entry.uid))
+      // The cached answer must still be backed by a socket this pid holds. `cached_owner` is the
+      // evidence: it is only ever written from a real /proc scan, and a disagreement with the
+      // packet's uid already drops it.
+      match self.cached_owner(entry.inode, uid) {
+         Some((pid, owner_uid, _)) if pid == entry.pid && owner_uid == entry.uid => {
+            Some((entry.pid, entry.uid))
+         }
+         _ => {
+            // The socket behind this tuple is gone or changed hands, so the answer describes the
+            // previous owner. Fall through to a real lookup.
+            self.flow_owners.remove(&flow);
+            None
+         }
+      }
    }
 
    /// Records a success: it clears the flow's negative marker and the flow class's miss
@@ -2087,7 +2100,7 @@ mod tests {
    }
 
    #[test]
-   fn the_registry_answer_is_counted_apart_from_a_miss() {
+   fn the_registry_names_a_pid_without_deciding_the_flow() {
       let asked = Arc::new(AtomicUsize::new(0));
       let senders = FakeSenders {
          answer: Some(std::process::id()),
@@ -2099,19 +2112,15 @@ mod tests {
       let attributed = attributor.attribute(local, remote, L4Proto::Udp, Some(own_uid()));
 
       assert_eq!(
-         attributed.missing, None,
-         "a registry hit leaves no missing reason"
+         attributed.missing,
+         Some(Missing::SocketGone),
+         "the registry must not change the closed-flow verdict"
       );
-      match &attributed.attribution {
-         Attribution::Process(process) => {
-            assert_eq!(process.pid, std::process::id());
-            assert_eq!(process.uid, own_uid());
-         }
-         Attribution::Unknown => panic!(
-            "the registry named our pid but the flow stayed unknown; stats {:?}",
-            attributor.stats()
-         ),
-      }
+      assert!(
+         matches!(attributed.attribution, Attribution::Unknown),
+         "a registry answer must never become an identity: stats {:?}",
+         attributor.stats()
+      );
       assert_eq!(
          asked.load(Ordering::Relaxed),
          1,
@@ -2180,6 +2189,63 @@ mod tests {
       assert_eq!(attributor.stats().registry_hits, 0);
       assert_eq!(attributor.stats().registry_misses, 1);
       assert_eq!(attributor.stats().registry_refusals, 0);
+   }
+
+   #[test]
+   fn a_recycled_tuple_cannot_reuse_the_cached_owner() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_000),
+         v4([192, 0, 2, 9], 443),
+      );
+      let now = Instant::now();
+      let entry = FlowCacheEntry {
+         pid: 1234,
+         uid: 1000,
+         inode: 4242,
+         at: now,
+      };
+      attributor.remember_flow(flow, entry);
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now),
+         None,
+         "an answer whose socket is no longer in the inode cache is not evidence"
+      );
+
+      // A failed hit drops the entry, so store it again to test the two agreeing cases.
+      attributor.remember_flow(flow, entry);
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 4321,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now),
+         None,
+         "the inode now belongs to a different pid, so the cached owner is stale"
+      );
+
+      attributor.remember_flow(flow, entry);
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now),
+         Some((1234, 1000)),
+         "a hit backed by the same pid holding the same inode stands"
+      );
    }
 
    #[test]
@@ -2758,6 +2824,16 @@ mod tests {
          FlowCacheEntry {
             pid: 4242,
             uid: 1000,
+            inode: 4242,
+            at: start,
+         },
+      );
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 4242,
+            uid: 1000,
+            created: None,
             at: start,
          },
       );
@@ -2823,6 +2899,7 @@ mod tests {
          FlowCacheEntry {
             pid: 1,
             uid: 1000,
+            inode: 1,
             at: start,
          },
       );
@@ -2841,6 +2918,7 @@ mod tests {
             FlowCacheEntry {
                pid: 1,
                uid: 1,
+               inode: 1,
                at: start,
             },
          );
@@ -2880,9 +2958,19 @@ mod tests {
          FlowCacheEntry {
             pid: 777,
             uid: 1000,
+            inode: 777,
             at: start,
          },
          class,
+      );
+      attributor.inode_to_pid.insert(
+         777,
+         InodeCacheEntry {
+            pid: 777,
+            uid: 1000,
+            created: None,
+            at: start,
+         },
       );
       assert!(!attributor.flow_misses.contains_key(&key));
       assert!(!attributor.miss_streaks.contains_key(&class));
