@@ -800,7 +800,37 @@ impl Daemon {
                );
                self.publish_status();
             }
+            // Nothing else puts the table back: a flush, a foreign `nft` edit, or a failed
+            // install at startup leaves the machine unfiltered until the daemon restarts, and a
+            // restart is a 2 s window with no queue bound — which the kernel accepts. So the
+            // check that notices the table is gone is also the one that repairs it.
+            self.reinstall_table();
          }
+      }
+   }
+
+   /// Puts the table back after a failed verify.
+   ///
+   /// `force` is the right flag here and the only difference from a first install: a table that
+   /// exists but does not verify is exactly the case this handles, and [`firewall::install`]
+   /// deletes it before writing, so a rewritten table is replaced rather than reported as a
+   /// second instance. The attempt is bounded by [`TABLE_VERIFY_INTERVAL`] because only
+   /// [`Self::verify_table`] calls this, so a broken `nft` costs one fork per interval, never one
+   /// per packet. A failed attempt stays at `debug!`: the transition already logged the
+   /// operator-facing error, and repeating it every 30 s would bury it.
+   fn reinstall_table(&mut self) {
+      let table = self.config.table_name().to_owned();
+      let queue = self.config.queue_num;
+      let dns_queue = self.config.dns_queue_num;
+      let result = firewall::install(&table, queue, dns_queue, false, true)
+         .and_then(|()| firewall::verify(&table, queue, dns_queue));
+      match result {
+         Ok(()) => {
+            self.table_verified = true;
+            info!("table inet {table} was reinstalled after a failed verify; enforcement resumed");
+            self.publish_status();
+         }
+         Err(err) => debug!("could not reinstall table inet {table}: {err}"),
       }
    }
 
