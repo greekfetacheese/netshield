@@ -611,10 +611,30 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       store.rules().len(),
       config.rules_path.display()
    );
-   let table_verified = adopt_or_install(&config)?;
-
+   // The queues are bound before the table exists, and the order is load-bearing: both queue
+   // rules carry `bypass`, which makes the kernel accept every packet while no process is bound
+   // to a queue. A crash restart inherits the previous daemon's table, so adopting it first would
+   // leave every new flow accepted for as long as the bind took. Opening a queue needs no rule —
+   // only `CAP_NET_ADMIN` — so binding first costs nothing and turns that window into "queued,
+   // and decided a moment later".
    let (ipc, queue, dns_queue) = match start_runtime(&config) {
       Ok(started) => started,
+      Err(err) => {
+         // Nothing was installed yet, so the only thing to undo is a socket this attempt bound.
+         if let Err(remove_err) = ipc_server::remove_socket_file(&config.socket_path) {
+            warn!("could not remove the control socket after a startup failure: {remove_err}");
+         }
+         return Err(err);
+      }
+   };
+   // The line an operator (and the startup-ordering check) reads to see the queues came first.
+   info!(
+      "bound NFQUEUE {} for flows and {} for DNS answers; installing the table",
+      config.queue_num, config.dns_queue_num
+   );
+
+   let table_verified = match adopt_or_install(&config) {
+      Ok(verified) => verified,
       Err(err) => {
          remove_table_quietly(config.table_name());
          if let Err(remove_err) = ipc_server::remove_socket_file(&config.socket_path) {
