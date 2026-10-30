@@ -1,12 +1,16 @@
-//! The Settings page: the read-only daemon settings.
+//! The Settings page: the read-only daemon settings and the GUI's own log caps.
 //!
-//! The operation mode lives in the top bar, always visible; this page only reports the
-//! current state. The timeout and socket are daemon-side settings too, so the page shows
-//! them as text instead of pretending the GUI can change them.
+//! The operation mode lives in the top bar, always visible; this page reports the current daemon
+//! state and edits the one thing the GUI owns itself -- how much connection history it keeps.
+//! The timeout and socket are daemon-side settings, so the page shows them as text instead of
+//! pretending the GUI can change them.
 
 use egui::{Color32, RichText, Ui};
+use elegance::Slider;
 use netshield_core::config::Config;
 use netshield_core::ipc::Mode;
+
+use crate::prefs::{self, Prefs};
 
 /// Warning text colour for the Silent-mode consequence.
 const AMBER: Color32 = Color32::from_rgb(0xE0, 0xA8, 0x4A);
@@ -14,11 +18,11 @@ const AMBER: Color32 = Color32::from_rgb(0xE0, 0xA8, 0x4A);
 /// Background of the muted amber block; dark enough to stay below the warning text.
 const AMBER_BG: Color32 = Color32::from_rgb(0x3A, 0x2E, 0x14);
 
-/// Draws the page.
+/// Draws the page; returns whether either log cap was changed this frame.
 ///
 /// The mode switch is in the top bar, so this reports the current mode and the Silent-mode
 /// consequence instead of offering a control the shell already owns.
-pub fn show(ui: &mut Ui, current: Mode) {
+pub fn show(ui: &mut Ui, current: Mode, prefs: &mut Prefs) -> bool {
    ui.heading("Settings");
    ui.add_space(4.0);
 
@@ -47,6 +51,21 @@ pub fn show(ui: &mut Ui, current: Mode) {
          });
    }
 
+   section(ui, "Connection log");
+   ui.label(
+      RichText::new(
+         "How much history the Connections page keeps in memory. A change takes effect at \
+          once: the oldest rows past a lower cap are dropped and counted as dropped.",
+      )
+      .weak(),
+   );
+   let mut changed = ui
+      .add(Slider::new(&mut prefs.rows_per_app, prefs::ROWS_PER_APP).label("Rows per application"))
+      .changed();
+   changed |= ui
+      .add(Slider::new(&mut prefs.max_apps, prefs::MAX_APPS).label("Applications tracked at once"))
+      .changed();
+
    section(ui, "Prompt timeout");
    let config = Config::default();
    ui.label(format!(
@@ -64,6 +83,8 @@ pub fn show(ui: &mut Ui, current: Mode) {
    section(ui, "Control socket");
    ui.label(RichText::new(config.socket_path.display().to_string()).monospace());
    ui.label(RichText::new("The GUI connects to this socket as an unprivileged user.").weak());
+
+   changed
 }
 
 /// A separated section heading; every section after the first gets a rule above it.

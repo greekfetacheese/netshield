@@ -17,16 +17,14 @@ use crate::{
    Cli,
    connlog::ConnectionLog,
    ipc::{self, Decider, IpcClient},
+   prefs::Prefs,
    ruleset::Ruleset,
    work,
 };
 
-/// Rows the Connections log keeps per application. One process opening hundreds of flows must
-/// not evict every other process' history.
-const LOG_ROWS_PER_APP: usize = 100;
-
-/// Applications the log tracks at once; the quietest is evicted to make room for a new one.
-const LOG_MAX_APPS: usize = 32;
+/// How long a changed log cap waits before the preferences file is written, so one drag of a
+/// slider is one write instead of one per frame.
+const PREFS_SAVE_DELAY: Duration = Duration::from_millis(400);
 
 /// How often the GUI asks the daemon for a status snapshot.
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
@@ -68,7 +66,15 @@ pub struct App {
    /// `false`, so comparing states alone would leave the first failure unrecorded -- the
    /// exact line that proves an autostarted GUI looked at the socket at all.
    connection_logged: bool,
+   /// The Connections history; its caps come from `prefs` and change live from the
+   /// Settings page.
    log: ConnectionLog,
+   /// The GUI's own preferences: the log's caps, loaded from the user's config file at
+   /// startup and written back when a slider moves.
+   prefs: Prefs,
+   /// When the caps changed last, if the file has not been written since. `None` means
+   /// there is nothing to write.
+   prefs_save_at: Option<Instant>,
    mock: bool,
    /// `--alert`: the root window is the alert instead of the main navigation shell.
    alert: bool,
@@ -179,6 +185,7 @@ impl Page {
 impl App {
    /// Builds the app and, outside mock mode, starts talking to the daemon.
    pub fn new(cli: Cli) -> Self {
+      let prefs = Prefs::load();
       let ui_waker: UiWaker = Arc::new(Mutex::new(None));
       let alert_model: Arc<Mutex<AlertModel>> = Arc::new(Mutex::new(AlertModel::new()));
       let alert_height: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
@@ -259,7 +266,9 @@ impl App {
          socket: cli.socket,
          connected: false,
          connection_logged: false,
-         log: ConnectionLog::new(LOG_ROWS_PER_APP, LOG_MAX_APPS),
+         log: ConnectionLog::new(prefs.rows_per_app, prefs.max_apps),
+         prefs,
+         prefs_save_at: None,
          mock: cli.mock,
          alert: cli.alert,
          pending: Vec::new(),
@@ -408,6 +417,14 @@ impl App {
       // window's frames, so the local list is refreshed from the model it mutates before
       // anything here reads it.
       self.sync_pending();
+
+      // A dragged cap changes on every frame; the file is written once the value settles.
+      if let Some(at) = self.prefs_save_at
+         && Instant::now() >= at
+      {
+         self.prefs_save_at = None;
+         self.prefs.save();
+      }
 
       let now = Instant::now();
       if now < self.next_refresh {
@@ -893,7 +910,14 @@ impl App {
                });
             }
          }
-         Page::Settings => ui::settings::show(ui, self.mode),
+         Page::Settings => {
+            if ui::settings::show(ui, self.mode, &mut self.prefs) {
+               // Live: the log keeps what still fits instead of waiting for a restart.
+               self.log.set_caps(self.prefs.rows_per_app, self.prefs.max_apps);
+               self.prefs_save_at = Some(Instant::now() + PREFS_SAVE_DELAY);
+               ui.ctx().request_repaint_after(PREFS_SAVE_DELAY);
+            }
+         }
          Page::Status => ui::status::show(ui, self.status.as_ref(), unix_now()),
       }
    }

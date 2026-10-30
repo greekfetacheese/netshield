@@ -1644,6 +1644,7 @@ dependencies = [
  "egui-lucide",
  "log",
  "netshield-core",
+ "serde",
  "serde_json",
  "tray-icon",
 ]
