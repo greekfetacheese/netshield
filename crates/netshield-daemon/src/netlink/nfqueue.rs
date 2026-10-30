@@ -67,9 +67,13 @@ const PACKET_HDR_LEN: usize = 7;
 /// `nfqnl_msg_verdict_hdr` is packed: big-endian `verdict`, big-endian `packet_id`.
 const VERDICT_HDR_LEN: usize = 8;
 
-/// The maximum length of one queued packet: with `copy_range = 0xFFFF` the kernel copies
-/// up to this many bytes of the datagram.
-const QUEUE_MAXLEN: u32 = 4096;
+/// The maximum number of packets the kernel may hold for one queue at a time.
+///
+/// A full queue **drops** (the instance never sets `NFQA_CFG_F_FAIL_OPEN`), so this is the slack
+/// between a burst of new flows and the daemon's scan-paced drain: too small and ordinary browsing
+/// loses connections, too large and a stalled daemon pins memory instead. 8192 leaves headroom for a
+/// burst while keeping the worst case near the per-packet copy the kernel already made.
+const QUEUE_MAXLEN: u32 = 8192;
 const COPY_RANGE: u32 = 0xFFFF;
 
 /// The message type for every nfnetlink queue message.
@@ -580,7 +584,7 @@ mod tests {
          &[8, 0, 3, 0],
          "attr: len 8, type QUEUE_MAXLEN"
       );
-      assert_eq!(&msg[24..28], &4096u32.to_be_bytes());
+      assert_eq!(&msg[24..28], &QUEUE_MAXLEN.to_be_bytes());
 
       // CONFIG/FLAGS: two attributes -> 36 bytes, value UID_GID | CONNTRACK.
       let msg = frame(

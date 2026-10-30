@@ -726,6 +726,29 @@ impl Attributor {
    fn process_identity(&mut self, pid: u32, uid: u32) -> Option<ProcessInfo> {
       if let Some(cached) = self.cached_identity(pid) {
          if cached.uid == uid {
+            // The cache is a memory of an earlier `/proc` read, and the only thing that ever
+            // invalidates it is the proc connector. If that feed is unavailable or drops a
+            // message, an `execve` would otherwise leave this pid answering with the previous
+            // binary for the rest of its life — the very value the allow rules are keyed on.
+            // One `readlink` is the cheap positive evidence: a readable link that disagrees means
+            // the cache is stale, so forget it and report no identity at all. `None` reaches
+            // `attribute_scanned` as `Missing::NotOurs` and `Attribution::Unknown`, i.e. the prompt
+            // path or the closed-flow action, never an allow rule. An unreadable link is the
+            // vanished-process case the cache exists for, so the cached answer stands.
+            if let Ok(live) = fs::read_link(format!("{PROC}/{pid}/exe"))
+               && cached.exe.as_deref() != Some(live.as_path())
+            {
+               if let Ok(mut cache) = self.process_cache.lock() {
+                  cache.forget(pid);
+               }
+               debug!(
+                  "cached identity for pid {pid} disagrees with /proc/{pid}/exe ({} vs {:?}); \
+                   dropping it",
+                  live.display(),
+                  cached.exe
+               );
+               return None;
+            }
             // `cmdline` is not an identity field, so it is not cached; read it when the
             // process is still around and leave it empty when the cache is all that is
             // left, which is exactly the vanished-process case.
@@ -848,7 +871,20 @@ impl Attributor {
       // evidence: it is only ever written from a real /proc scan, and a disagreement with the
       // packet's uid already drops it.
       match self.cached_owner(entry.inode, uid) {
-         Some((pid, owner_uid, _)) if pid == entry.pid && owner_uid == entry.uid => {
+         Some((pid, owner_uid, created)) if pid == entry.pid && owner_uid == entry.uid => {
+            // The same comparison `attribute_scanned` makes, and it belongs here too: every later
+            // packet of this tuple answers from this cache, so leaving it out confined the
+            // exec-after-connect refusal to a flow's first packet. A miss here falls through to a
+            // real lookup, which re-runs the check and turns it into `Unknown`.
+            if let Some(identity) = self.cached_identity(entry.pid)
+               && identity.uid == entry.uid
+               && let (Some(created), Some(image_started)) = (created, identity.image_started)
+               && image_started > created + SLACK
+            {
+               self.warn_exec_after_connect(entry.pid, &identity.exe, now);
+               self.flow_owners.remove(&flow);
+               return None;
+            }
             Some((entry.pid, entry.uid))
          }
          _ => {
@@ -3478,6 +3514,33 @@ mod tests {
       *attributor.process_cache.lock().expect("process cache") = cache;
    }
 
+   /// Seeds the cache with the exe this process is actually running.
+   ///
+   /// `process_identity` verifies a cached identity against the live `/proc/<pid>/exe`, so a fixture
+   /// that invents an exe for this process's own pid now exercises the disagreement path instead of
+   /// what its test is about. These tests want the cache to agree: the refusal they assert must come
+   /// from the image timestamp, not from a stale link.
+   fn seed_live_identity(
+      attributor: &Attributor,
+      pid: u32,
+      image_started: Option<SystemTime>,
+   ) -> PathBuf {
+      let exe = std::fs::read_link("/proc/self/exe").expect("our own exe");
+      let mut cache = ProcessCache::new();
+      cache.insert(
+         pid,
+         CachedIdentity {
+            exe: Some(exe.clone()),
+            comm: "firefox".to_owned(),
+            uid: own_uid(),
+            starttime: 1,
+            image_started,
+         },
+      );
+      *attributor.process_cache.lock().expect("process cache") = cache;
+      exe
+   }
+
    /// Runs the post-scan decision on a synthetic UDP flow, as `lookup` would after a hit.
    fn scanned_decision(
       attributor: &mut Attributor,
@@ -3517,12 +3580,7 @@ mod tests {
       let socket_created = SystemTime::now() - StdDuration::from_secs(5);
       let mut attributor = Attributor::new();
       // The cached image started after the socket was created: an exec followed connect().
-      seed_identity(
-         &attributor,
-         pid,
-         "/usr/bin/allowed",
-         Some(SystemTime::now()),
-      );
+      seed_live_identity(&attributor, pid, Some(SystemTime::now()));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
             Ok(vec![(inode, Some(socket_created))])
@@ -3553,12 +3611,7 @@ mod tests {
       let image_started = SystemTime::now() - StdDuration::from_secs(30);
       let socket_created = SystemTime::now();
       let mut attributor = Attributor::new();
-      seed_identity(
-         &attributor,
-         pid,
-         "/usr/bin/allowed",
-         Some(image_started),
-      );
+      let exe = seed_live_identity(&attributor, pid, Some(image_started));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
             Ok(vec![(inode, Some(socket_created))])
@@ -3578,7 +3631,8 @@ mod tests {
             assert_eq!(process.pid, pid);
             assert_eq!(
                process.exe,
-               Some(PathBuf::from("/usr/bin/allowed"))
+               Some(exe),
+               "the cached identity's exe is what reaches the connection"
             );
          }
          Attribution::Unknown => panic!("the image predates the socket, so it opened it"),
@@ -3594,12 +3648,7 @@ mod tests {
       let inode = 987_654u32;
       let mut attributor = Attributor::new();
       // A missing observation must never become an accusation, even when the image is new.
-      seed_identity(
-         &attributor,
-         pid,
-         "/usr/bin/allowed",
-         Some(SystemTime::now()),
-      );
+      seed_live_identity(&attributor, pid, Some(SystemTime::now()));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
             Ok(vec![(inode, None)])
@@ -3787,6 +3836,71 @@ mod tests {
          shared.lock().expect("process cache").len(),
          0,
          "the stale identity is dropped"
+      );
+   }
+
+   #[test]
+   fn a_cached_identity_that_disagrees_with_the_live_exe_is_dropped() {
+      let mut attributor = Attributor::new();
+      let pid = std::process::id();
+      let uid = own_uid();
+      // The cache remembers a binary this process is not running: exactly the state a missed
+      // exec event leaves behind.
+      seed_identity(&attributor, pid, "/usr/bin/curl", None);
+      assert!(
+         attributor.process_identity(pid, uid).is_none(),
+         "a live exe link that disagrees with the cached one must not be an answer"
+      );
+      assert!(
+         attributor.cached_identity(pid).is_none(),
+         "the stale entry is forgotten, so the next attribution reads /proc fresh"
+      );
+   }
+
+   #[test]
+   fn a_cached_flow_whose_image_postdates_the_socket_is_not_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_002),
+         v4([192, 0, 2, 9], 443),
+      );
+      let start = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 5555,
+            at: start,
+         },
+      );
+      // The pid still holds the inode, but its image started after the socket existed: the flow
+      // was opened by a previous image and must not inherit this one's rules.
+      attributor.inode_to_pid.insert(
+         5555,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: Some(SystemTime::now() - StdDuration::from_secs(60)),
+            at: start,
+         },
+      );
+      attributor.process_cache.lock().expect("process cache").insert(
+         1234,
+         CachedIdentity {
+            exe: Some(PathBuf::from("/usr/bin/allowed")),
+            comm: "allowed".to_owned(),
+            uid: 1000,
+            starttime: 1,
+            image_started: Some(SystemTime::now()),
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), start),
+         None,
+         "an image younger than the socket must not answer from the flow cache"
       );
    }
 }
