@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration as StdDuration;
 
 use log::{debug, info, warn};
 use netshield_core::Rule;
@@ -53,6 +54,22 @@ const READ_CHUNK: usize = 4096;
 /// and caps what a peer that stops reading can make the daemon hold in memory. A client
 /// that cannot drain a queue this deep is not reading at all, so the packet path wins.
 const CLIENT_QUEUE_FRAMES: usize = 1024;
+
+/// How long one frame may take to reach a control client before its writer gives up.
+///
+/// A GUI that has not drained 64 KiB in five seconds is gone: either it stopped reading
+/// or the peer is hostile. Without this bound the writer thread parks inside `write_all`
+/// for ever after the client is shed, holding its socket and its stack, so a peer that
+/// connects and never reads would grow the daemon by one thread per connection. The writer
+/// must not outlive the client, so a timed-out write ends the thread instead of retrying.
+const WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+/// Concurrent control clients the daemon serves before refusing new ones.
+///
+/// A desktop has one GUI and maybe a CLI probe, so 64 concurrent control connections is
+/// already pathological: the limit turns "a peer that connects and never reads" from a
+/// thread and socket leak into a refusal, while leaving ample room for the real clients.
+const MAX_CLIENTS: usize = 64;
 
 /// Why the control socket could not be created.
 #[derive(Debug)]
@@ -300,8 +317,15 @@ fn enqueue(client: &Client, bytes: &[u8]) -> Enqueue {
 ///
 /// The thread owns the write half, so frames leave in the order they were enqueued. It
 /// exits when the client is unregistered (the last sender is dropped) or a write fails;
-/// either way the failure stays on this thread instead of the packet path.
+/// either way the failure stays on this thread instead of the packet path. The socket
+/// carries [`WRITE_TIMEOUT`], so a peer that never reads makes the write fail with
+/// `WouldBlock`/`TimedOut` after that bound instead of parking the thread for ever; every
+/// write error, including `BrokenPipe`/`ConnectionReset`, ends the writer without a retry.
 fn write_frames(mut writer: UnixStream, receiver: mpsc::Receiver<Vec<u8>>) {
+   if let Err(err) = writer.set_write_timeout(Some(WRITE_TIMEOUT)) {
+      debug!("control client writer cannot bound its write, stopping: {err}");
+      return;
+   }
    for bytes in receiver {
       if let Err(err) = writer.write_all(&bytes) {
          debug!("control client writer stopped: {err}");
@@ -320,7 +344,20 @@ struct Shared {
 }
 
 impl Shared {
+   /// Registers a client and starts its writer thread.
+   ///
+   /// The count is checked and the new entry inserted under one lock, so concurrent
+   /// acceptors cannot both slip past [`MAX_CLIENTS`]. A refusal is an
+   /// [`io::ErrorKind::ConnectionAborted`] error and leaves the registry untouched; the
+   /// caller drops the socket.
    fn register(&self, stream: &UnixStream) -> io::Result<u64> {
+      let mut clients = self.clients.lock().expect("client registry");
+      if clients.len() >= MAX_CLIENTS {
+         return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("control client limit of {MAX_CLIENTS} reached"),
+         ));
+      }
       let writer = stream.try_clone()?;
       let id = self.next_client.fetch_add(1, Ordering::Relaxed);
       let (queue, receiver) = mpsc::sync_channel(CLIENT_QUEUE_FRAMES);
@@ -328,7 +365,7 @@ impl Shared {
       thread::Builder::new()
          .name(name)
          .spawn(move || write_frames(writer, receiver))?;
-      self.clients.lock().expect("client registry").insert(
+      clients.insert(
          id,
          Client {
             queue,
@@ -987,6 +1024,49 @@ mod tests {
       UnixStream::pair().expect("socketpair")
    }
 
+   /// The `/proc` prefix the daemon's writer threads appear under.
+   ///
+   /// Linux truncates a thread name to 15 bytes, so `netshield-ipc-writer-<id>` reads back
+   /// as `netshield-ipc-w`; the shortened prefix is what the kernel actually reports.
+   const WRITER_PREFIX: &str = "netshield-ipc-w";
+
+   /// The ids of this process's threads whose `/proc` name starts with `prefix`.
+   ///
+   /// Ids rather than a count: tests share the process and exactly one other test may have
+   /// a writer thread parked for up to [`WRITE_TIMEOUT`], so "our writer is gone" is "no id
+   /// outside the baseline set is alive", which cannot be satisfied by an unrelated thread
+   /// dying at the same moment.
+   fn threads_named(prefix: &str) -> Vec<u32> {
+      let tasks = fs::read_dir("/proc/self/task").expect("this process's thread directory");
+      tasks
+         .filter_map(Result::ok)
+         .filter(|task| {
+            fs::read_to_string(task.path().join("comm"))
+               .is_ok_and(|comm| comm.trim_end().starts_with(prefix))
+         })
+         .filter_map(|task| task.file_name().to_str()?.parse().ok())
+         .collect()
+   }
+
+   /// Serialises the tests that create many writer threads, so they never overlap.
+   fn serial() -> std::sync::MutexGuard<'static, ()> {
+      static LOCK: Mutex<()> = Mutex::new(());
+      LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+   }
+
+   /// Polls `predicate` every 100 ms until `deadline`, returning whether it became true.
+   fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool) -> bool {
+      loop {
+         if predicate() {
+            return true;
+         }
+         if Instant::now() >= deadline {
+            return false;
+         }
+         thread::sleep(StdDuration::from_millis(100));
+      }
+   }
+
    /// The policy the pre-existing tests run under: the configured uid may change state
    /// because no `gui_path` is set, which is the compatibility branch.
    fn policy(allowed_uid: Option<u32>) -> GuiPolicy {
@@ -1164,6 +1244,87 @@ mod tests {
          handle.clients(),
          0,
          "a client that cannot keep up must be unregistered"
+      );
+   }
+
+   #[test]
+   fn a_shed_client_stops_its_writer_thread() {
+      let _serial = serial();
+      // Another test's writer could still be alive here, so only the return to this
+      // baseline is asserted, and the poll below waits for every writer to be gone.
+      let baseline = threads_named(WRITER_PREFIX);
+
+      let shared = shared();
+      let (server, _client) = pair();
+
+      // The same deterministic setup as `a_client_that_never_reads_cannot_stall_the_loop`:
+      // fill this direction's socket buffer from the server end before the writer exists,
+      // so the writer blocks on its first byte and is parked in `write_all`, not merely
+      // holding a full queue.
+      {
+         let mut filler = server.try_clone().expect("fill the socket buffer");
+         filler.set_nonblocking(true).expect("non-blocking");
+         let chunk = [b'x'; READ_CHUNK];
+         while filler.write(&chunk).is_ok() {}
+         filler.set_nonblocking(false).expect("blocking again");
+      }
+      // The peer end is never read from here on.
+
+      shared.register(&server).expect("register the silent client");
+      // The name is applied by the thread itself; a count taken before that would miss the
+      // writer and let the test pass without ever observing a parked one, so confirm the
+      // thread is visible before shedding it.
+      assert!(
+         wait_until(Instant::now() + StdDuration::from_secs(2), || {
+            threads_named(WRITER_PREFIX).iter().any(|id| !baseline.contains(id))
+         }),
+         "the registered client's writer thread never appeared"
+      );
+
+      let status = status(Mode::Alert, 0);
+      for _ in 0..CLIENT_QUEUE_FRAMES + 50 {
+         shared.broadcast(&Response::Status(status.clone()));
+      }
+      assert_eq!(shared.clients(), 0, "a silent client is shed");
+
+      // The writer is parked in a write that the socket timeout now bounds; it can only
+      // disappear once that `write_all` returns and the thread runs off the end of its
+      // loop, so this waits out `WRITE_TIMEOUT` plus scheduling slack.
+      let deadline = Instant::now() + WRITE_TIMEOUT * 3;
+      assert!(
+         wait_until(deadline, || {
+            threads_named(WRITER_PREFIX).iter().all(|id| baseline.contains(id))
+         }),
+         "a shed client's writer thread outlived WRITE_TIMEOUT: {:?} writer thread(s) still \
+          alive, baseline {baseline:?}",
+         threads_named(WRITER_PREFIX)
+      );
+   }
+
+   #[test]
+   fn the_client_registry_refuses_more_than_the_limit() {
+      let _serial = serial();
+      let shared = shared();
+      // Hold every peer end so no writer sees EOF and no socket is dropped early.
+      let mut peers = Vec::with_capacity(MAX_CLIENTS);
+      for _ in 0..MAX_CLIENTS {
+         let (server, peer) = pair();
+         shared.register(&server).expect("register within the limit");
+         peers.push(peer);
+      }
+      assert_eq!(shared.clients(), MAX_CLIENTS);
+
+      let (server, _peer) = pair();
+      let err = shared.register(&server).expect_err("the registry is full");
+      assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+      assert!(
+         err.to_string().contains(&MAX_CLIENTS.to_string()),
+         "the refusal must name the limit, got: {err}"
+      );
+      assert_eq!(
+         shared.clients(),
+         MAX_CLIENTS,
+         "a refused client must not be registered"
       );
    }
 
