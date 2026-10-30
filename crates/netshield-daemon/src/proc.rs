@@ -3764,6 +3764,29 @@ mod tests {
       assert_eq!(stat_starttime("7 (short)"), None);
    }
 
+   /// `starttime` is a CLOCK_MONOTONIC age, so it must be subtracted from the same clock.
+   #[test]
+   fn an_image_start_time_is_measured_against_the_monotonic_clock() {
+      let wall = SystemTime::UNIX_EPOCH + StdDuration::from_secs(1_000_000);
+      assert_eq!(
+         image_started_from(50_000, 600_000_000_000, wall),
+         Some(wall.checked_sub(StdDuration::from_secs(100)).unwrap())
+      );
+   }
+
+   /// A start time ahead of the clock is a torn read, not a start in the future.
+   #[test]
+   fn a_start_time_ahead_of_the_clock_is_unknown() {
+      assert_eq!(
+         image_started_from(
+            70_000,
+            60_000_000_000,
+            SystemTime::UNIX_EPOCH + StdDuration::from_secs(5)
+         ),
+         None
+      );
+   }
+
    #[test]
    fn a_cached_identity_never_answers_for_an_unheld_inode() {
       // The flow is not in any socket table, so the scan finds no owner. Even though the
