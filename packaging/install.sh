@@ -127,6 +127,7 @@ install_config() {
   "unattributable_closed_flow": "drop",
   "allowed_uid": $allowed_uid,
   "gui_path": "$PREFIX/bin/netshield-gui",
+  "dns_servers": [],
   "log_level": "info",
   "socket_path": "$SOCKET_PATH",
   "rules_path": "/etc/netshield/rules.db"

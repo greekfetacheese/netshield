@@ -34,7 +34,7 @@ merge_file() {
    fi
 
    if ! command -v python3 >/dev/null 2>&1; then
-      fail "python3 is required to merge $config safely; add these keys by hand instead: table, unattributable_closed_flow, unmatched_transport, icmp_echo, gui_path=$prefix/bin/netshield-gui"
+      fail "python3 is required to merge $config safely; add these keys by hand instead: table, unattributable_closed_flow, unmatched_transport, icmp_echo, gui_path=$prefix/bin/netshield-gui, dns_servers=[]"
    fi
 
    python3 - "$config" "$prefix" "$dry_run" <<'PY'
@@ -71,6 +71,7 @@ wanted = [
     ("unmatched_transport", "deny"),
     ("icmp_echo", "deny"),
     ("gui_path", f"{prefix}/bin/netshield-gui"),
+    ("dns_servers", []),
 ]
 missing = [(key, value) for key, value in wanted if key not in existing]
 
@@ -167,6 +168,7 @@ expected = {
     "unmatched_transport",
     "icmp_echo",
     "gui_path",
+    "dns_servers",
 }
 if set(config) != original | expected:
     sys.exit(f"keys after merge: {sorted(config)}")
@@ -174,7 +176,7 @@ if config["gui_path"] != f"{prefix}/bin/netshield-gui":
     sys.exit(f"gui_path is {config['gui_path']!r}")
 PY
    then
-      selftest_fail 1 "legacy config did not gain exactly the five keys"
+      selftest_fail 1 "legacy config did not gain exactly the six keys"
    fi
    selftest_pass 1
 
@@ -226,7 +228,7 @@ PY
    if ! cmp -s "$dry_copy" "$before"; then
       selftest_fail 4 "--dry-run changed the file"
    fi
-   if [ "$(printf '%s\n' "$dry_output" | grep -c '^added ')" -ne 5 ]; then
+   if [ "$(printf '%s\n' "$dry_output" | grep -c '^added ')" -ne 6 ]; then
       selftest_fail 4 "--dry-run did not print one added line per key"
    fi
    selftest_pass 4
