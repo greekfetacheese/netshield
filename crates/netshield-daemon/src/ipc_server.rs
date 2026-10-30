@@ -14,6 +14,10 @@
 //! Every frame is bounded by [`MAX_FRAME_LEN`]: the reader accumulates at most that many
 //! bytes and closes the connection rather than letting a client grow the buffer without
 //! limit.
+//!
+//! Outbound frames never go to a socket from the thread that produces them. Each client
+//! owns a writer thread and a bounded queue; the daemon loop and the reader threads only
+//! enqueue, so a peer that stops reading cannot block packet processing.
 
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
@@ -42,6 +46,13 @@ const FRAME_LIMIT: usize = MAX_FRAME_LEN;
 
 /// Bytes taken from the socket per call, so an oversized frame is noticed early.
 const READ_CHUNK: usize = 4096;
+
+/// Frames buffered per control client before the daemon sheds that client.
+///
+/// The bound buys a busy GUI about a second of lag without ever stalling the firewall,
+/// and caps what a peer that stops reading can make the daemon hold in memory. A client
+/// that cannot drain a queue this deep is not reading at all, so the packet path wins.
+const CLIENT_QUEUE_FRAMES: usize = 1024;
 
 /// Why the control socket could not be created.
 #[derive(Debug)]
@@ -253,9 +264,50 @@ struct State {
    status: Option<StatusInfo>,
 }
 
-/// One connected client's write half.
+/// One connected client's outbound path: a bounded queue its writer thread drains.
+///
+/// The registry holds only this handle, never the socket, so no thread that produces a
+/// frame can end up blocked in the kernel behind a peer that stopped reading.
 struct Client {
-   writer: Mutex<UnixStream>,
+   queue: mpsc::SyncSender<Vec<u8>>,
+   /// Frames this client could not accept, quoted in the line that sheds it.
+   dropped: AtomicU64,
+}
+
+/// How handing a frame to a client's writer thread ended.
+enum Enqueue {
+   /// The frame is queued; the writer thread will send it in order.
+   Queued,
+   /// The queue is full, so the client is not draining its socket.
+   Stalled,
+   /// The writer thread is gone, so the registry entry is stale.
+   Gone,
+}
+
+/// Hands one encoded frame to a client's writer thread without ever blocking.
+fn enqueue(client: &Client, bytes: &[u8]) -> Enqueue {
+   match client.queue.try_send(bytes.to_vec()) {
+      Ok(()) => Enqueue::Queued,
+      Err(mpsc::TrySendError::Full(_)) => {
+         client.dropped.fetch_add(1, Ordering::Relaxed);
+         Enqueue::Stalled
+      }
+      Err(mpsc::TrySendError::Disconnected(_)) => Enqueue::Gone,
+   }
+}
+
+/// Drains one client's frame queue onto its socket.
+///
+/// The thread owns the write half, so frames leave in the order they were enqueued. It
+/// exits when the client is unregistered (the last sender is dropped) or a write fails;
+/// either way the failure stays on this thread instead of the packet path.
+fn write_frames(mut writer: UnixStream, receiver: mpsc::Receiver<Vec<u8>>) {
+   for bytes in receiver {
+      if let Err(err) = writer.write_all(&bytes) {
+         debug!("control client writer stopped: {err}");
+         break;
+      }
+   }
 }
 
 /// State shared by the acceptor, the reader threads and the daemon loop.
@@ -271,10 +323,16 @@ impl Shared {
    fn register(&self, stream: &UnixStream) -> io::Result<u64> {
       let writer = stream.try_clone()?;
       let id = self.next_client.fetch_add(1, Ordering::Relaxed);
+      let (queue, receiver) = mpsc::sync_channel(CLIENT_QUEUE_FRAMES);
+      let name = format!("netshield-ipc-writer-{id}");
+      thread::Builder::new()
+         .name(name)
+         .spawn(move || write_frames(writer, receiver))?;
       self.clients.lock().expect("client registry").insert(
          id,
          Client {
-            writer: Mutex::new(writer),
+            queue,
+            dropped: AtomicU64::new(0),
          },
       );
       Ok(id)
@@ -299,13 +357,20 @@ impl Shared {
             return;
          }
       };
-      let clients = self.clients.lock().expect("client registry");
-      let Some(client) = clients.get(&id) else {
-         return;
+      let outcome = {
+         let clients = self.clients.lock().expect("client registry");
+         clients.get(&id).map(|client| enqueue(client, &bytes))
       };
-      let mut writer = client.writer.lock().expect("client writer");
-      if let Err(err) = writer.write_all(&bytes) {
-         debug!("control client {id}: write failed: {err}");
+      match outcome {
+         None | Some(Enqueue::Queued) => {}
+         Some(Enqueue::Stalled) => self.shed(id, message),
+         Some(Enqueue::Gone) => {
+            debug!(
+               "control client {id} is gone; its {} frame was dropped",
+               kind(message)
+            );
+            self.unregister(id);
+         }
       }
    }
 
@@ -322,23 +387,48 @@ impl Shared {
          }
       };
 
+      let mut stalled = Vec::new();
       let mut gone = Vec::new();
       {
          let clients = self.clients.lock().expect("client registry");
          for (id, client) in clients.iter() {
-            let mut writer = client.writer.lock().expect("client writer");
-            if writer.write_all(&bytes).is_err() {
-               gone.push(*id);
+            match enqueue(client, &bytes) {
+               Enqueue::Queued => {}
+               Enqueue::Stalled => stalled.push(*id),
+               Enqueue::Gone => gone.push(*id),
             }
          }
       }
-      if gone.is_empty() {
-         return;
-      }
-      let mut clients = self.clients.lock().expect("client registry");
       for id in gone {
-         clients.remove(&id);
+         debug!("control client {id} is gone; unregistering it");
+         self.unregister(id);
       }
+      for id in stalled {
+         self.shed(id, message);
+      }
+   }
+
+   /// Unregisters a client that cannot keep up and warns about it once.
+   ///
+   /// The client is removed on the first full queue, so the warning needs no timer of its
+   /// own: there is exactly one per client. Dropping the queue sender ends its writer
+   /// thread and discards the backlog, which is the whole point — a peer that does not
+   /// read its socket is either dead or hostile, and the packet path must not wait for it.
+   fn shed(&self, id: u64, message: &Response) {
+      let dropped = self
+         .clients
+         .lock()
+         .expect("client registry")
+         .remove(&id)
+         .map(|client| client.dropped.load(Ordering::Relaxed));
+      let Some(dropped) = dropped else {
+         return;
+      };
+      warn!(
+         "control client {id} cannot keep up; closing it or the firewall stalls \
+          ({dropped} {} frame(s) could not be queued; its backlog is discarded)",
+         kind(message)
+      );
    }
 }
 
@@ -828,6 +918,7 @@ mod tests {
    use netshield_core::rule::{Action, AppMatcher, DestMatcher, Duration, RuleId};
    use std::io::Cursor;
    use std::time::Duration as StdDuration;
+   use std::time::Instant;
 
    fn shared() -> Arc<Shared> {
       let (sender, receiver) = mpsc::channel();
@@ -1032,6 +1123,91 @@ mod tests {
       ));
       assert!(regular.exists(), "the file must still be there");
       let _ = fs::remove_file(&regular);
+   }
+
+   #[test]
+   fn a_client_that_never_reads_cannot_stall_the_loop() {
+      let shared = shared();
+      let (server, _client) = pair();
+
+      // Make "never reads" deterministic before the writer thread exists: fill this
+      // direction's socket buffer with non-blocking writes from the server end, so the
+      // writer has no room to absorb a frame and blocks on its first write. Otherwise the
+      // writer could swallow a few hundred frames into the socket buffer before the queue
+      // filled, leaving the outcome dependent on the kernel's buffer size.
+      {
+         let mut filler = server.try_clone().expect("fill the socket buffer");
+         filler.set_nonblocking(true).expect("non-blocking");
+         let chunk = [b'x'; READ_CHUNK];
+         while filler.write(&chunk).is_ok() {}
+         filler.set_nonblocking(false).expect("blocking again");
+      }
+      // The peer end is never read from here on.
+
+      shared.register(&server).expect("register the silent client");
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      assert_eq!(handle.clients(), 1);
+
+      let status = status(Mode::Alert, 0);
+      let started = Instant::now();
+      for _ in 0..CLIENT_QUEUE_FRAMES + 50 {
+         shared.broadcast(&Response::Status(status.clone()));
+      }
+      let elapsed = started.elapsed();
+      assert!(
+         elapsed < StdDuration::from_secs(2),
+         "a silent client blocked the loop for {elapsed:?}"
+      );
+      assert_eq!(
+         handle.clients(),
+         0,
+         "a client that cannot keep up must be unregistered"
+      );
+   }
+
+   #[test]
+   fn a_reading_client_receives_frames_in_order() {
+      let shared = shared();
+      let (server, mut client) = pair();
+      shared.register(&server).expect("register the reading client");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+
+      let reader = thread::spawn(move || {
+         let mut buffered = Vec::new();
+         let mut frames = Vec::new();
+         for _ in 0..2 {
+            frames.push(read_response(&mut client, &mut buffered));
+         }
+         frames
+      });
+
+      shared.broadcast(&Response::Error {
+         message: "one".to_owned(),
+      });
+      shared.broadcast(&Response::Error {
+         message: "two".to_owned(),
+      });
+
+      let frames = reader.join().expect("reader thread");
+      assert_eq!(
+         frames,
+         vec![
+            Response::Error {
+               message: "one".to_owned()
+            },
+            Response::Error {
+               message: "two".to_owned()
+            },
+         ],
+         "frames must arrive complete and in the order they were broadcast"
+      );
+      assert_eq!(
+         shared.clients(),
+         1,
+         "a client that keeps reading stays registered"
+      );
    }
 
    #[test]
