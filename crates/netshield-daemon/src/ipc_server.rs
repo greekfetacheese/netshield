@@ -72,6 +72,14 @@ const WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// thread and socket leak into a refusal, while leaving ample room for the real clients.
 const MAX_CLIENTS: usize = 64;
 
+/// How long a connecting peer has to finish the handshake before it is closed.
+///
+/// A peer that connects and says nothing is not a client: it holds a registry slot, a
+/// writer thread and a socket while it never becomes one. The timeout bounds exactly the
+/// un-handshaked state, so it cannot disturb a GUI that has already introduced itself and
+/// then sits idle for hours.
+const HANDSHAKE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
 /// Why the control socket could not be created.
 #[derive(Debug)]
 pub enum IpcError {
@@ -687,7 +695,17 @@ fn remove_stale_socket(path: &Path) -> Result<(), IpcError> {
 }
 
 /// Serves one client: authenticate, handshake, then dispatch until it disconnects.
-fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+fn serve(stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+   serve_with_timeout(stream, shared, policy, HANDSHAKE_TIMEOUT)
+}
+
+/// [`serve`] with an explicit handshake bound, so a test need not wait [`HANDSHAKE_TIMEOUT`].
+fn serve_with_timeout(
+   mut stream: UnixStream,
+   shared: Arc<Shared>,
+   policy: GuiPolicy,
+   handshake_timeout: StdDuration,
+) {
    let cred = match peer_creds(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
       Ok(cred) => cred,
       Err(err) => {
@@ -720,9 +738,19 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
    );
 
    let mut buffered = Vec::new();
+   // The bound covers the un-handshaked state only: a peer that never speaks must not hold
+   // a slot for ever, while a real GUI sits silent for hours once it has said Hello.
+   if let Err(err) = stream.set_read_timeout(Some(handshake_timeout)) {
+      warn!("could not bound a control client's handshake timeout: {err}");
+   }
    if !handshake(&mut stream, &shared, id, &mut buffered) {
       shared.unregister(id);
       return;
+   }
+   // Clear the bound now: idleness after the handshake is healthy, and the loop below treats
+   // a timed-out read as a dead peer, which would close a GUI that simply has nothing to say.
+   if let Err(err) = stream.set_read_timeout(None) {
+      warn!("could not clear a control client's handshake timeout: {err}");
    }
 
    loop {
@@ -1266,6 +1294,39 @@ mod tests {
          handle.clients(),
          0,
          "a client that cannot keep up must be unregistered"
+      );
+   }
+
+   #[test]
+   fn a_client_that_never_speaks_is_closed_after_the_handshake_timeout() {
+      let _serial = serial();
+      let shared = shared();
+      let (server, mut peer) = pair();
+
+      let serviced = Arc::clone(&shared);
+      thread::spawn(move || {
+         serve_with_timeout(
+            server,
+            serviced,
+            policy(Some(1000)),
+            StdDuration::from_millis(50),
+         );
+      });
+
+      // The peer never writes, so the server sends nothing either: EOF here is the server
+      // dropping the socket, which proves the connection was closed instead of polled for
+      // a registration that a 50 ms window may already have erased.
+      peer.set_read_timeout(Some(StdDuration::from_secs(2))).expect("read timeout");
+      let mut byte = [0u8; 1];
+      assert!(
+         matches!(peer.read(&mut byte), Ok(0)),
+         "an un-handshaked client must be closed"
+      );
+      assert!(
+         wait_until(Instant::now() + StdDuration::from_secs(2), || {
+            shared.clients() == 0
+         }),
+         "an un-handshaked client must be closed"
       );
    }
 
