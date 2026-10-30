@@ -316,8 +316,20 @@ pub struct Attributor {
    batch_arrived: Option<Instant>,
    /// Scratch buffer for one table read, so a 194 KB table is not reallocated per snapshot.
    table_buf: Vec<u8>,
+   /// The newest-first pid list for the batch, with the time it was built.
+   ///
+   /// Rebuilt at most once per batch, for the same reason the socket table is: `readdir("/proc")` plus a
+   /// stat per pid the process cache does not know costs ~2 ms here, and a burst asks the same question
+   /// once per flow. A process exists before any socket it opens, so a list taken at or after the batch's
+   /// arrival time names every pid that could own a socket behind one of its packets.
+   pid_order: Option<(Instant, Vec<u32>)>,
    /// When [`Attributor::perf_summary`] last emitted a line, so it can be rate-limited.
    last_perf_summary: Option<Instant>,
+   /// The counters as they were when the last summary line was emitted.
+   ///
+   /// The counters themselves are never reset: the shutdown line reports them as session totals, so a
+   /// summary that zeroed them would leave that line claiming the last interval was the whole session.
+   last_summary_stats: AttributeStats,
 }
 
 /// A cached inode→pid answer, with the owner recorded for the UID cross-check.
@@ -423,7 +435,9 @@ impl Attributor {
          tables: HashMap::new(),
          batch_arrived: None,
          table_buf: Vec::new(),
+         pid_order: None,
          last_perf_summary: None,
+         last_summary_stats: AttributeStats::default(),
       }
    }
 
@@ -920,7 +934,26 @@ impl Attributor {
       {
          return None;
       }
-      let lookups = self.stats.hits.saturating_add(self.stats.misses);
+      let current = self.stats;
+      let delta = |now: u64, before: u64| now.saturating_sub(before);
+      let hits = delta(current.hits, self.last_summary_stats.hits);
+      let misses = delta(current.misses, self.last_summary_stats.misses);
+      let table_reads = delta(
+         current.table_reads,
+         self.last_summary_stats.table_reads,
+      );
+      let fd_scans = delta(current.fd_scans, self.last_summary_stats.fd_scans);
+      let snapshot_hits = delta(
+         current.snapshot_hits,
+         self.last_summary_stats.snapshot_hits,
+      );
+      let attribute_ns = delta(
+         current.attribute_ns,
+         self.last_summary_stats.attribute_ns,
+      );
+      let table_ns = delta(current.table_ns, self.last_summary_stats.table_ns);
+      let fd_ns = delta(current.fd_ns, self.last_summary_stats.fd_ns);
+      let lookups = hits.saturating_add(misses);
       if lookups == 0 {
          // Still stamp the interval so a daemon that only ever sees idle ticks does not scan the
          // counters every iteration.
@@ -931,22 +964,15 @@ impl Attributor {
       let line = format!(
          "attribution: {lookups} lookups in 30s, {}% snapshot hits, {:.2}ms/lookup (table \
           {:.2}ms, fd {:.2}ms, {} fd scans, {} table reads)",
-         self.stats.snapshot_hits.saturating_mul(100) / lookups,
-         per_lookup_ms(self.stats.attribute_ns),
-         per_lookup_ms(self.stats.table_ns),
-         per_lookup_ms(self.stats.fd_ns),
-         self.stats.fd_scans,
-         self.stats.table_reads,
+         snapshot_hits.saturating_mul(100) / lookups,
+         per_lookup_ms(attribute_ns),
+         per_lookup_ms(table_ns),
+         per_lookup_ms(fd_ns),
+         fd_scans,
+         table_reads,
       );
       self.last_perf_summary = Some(now);
-      self.stats.hits = 0;
-      self.stats.misses = 0;
-      self.stats.table_reads = 0;
-      self.stats.fd_scans = 0;
-      self.stats.snapshot_hits = 0;
-      self.stats.attribute_ns = 0;
-      self.stats.table_ns = 0;
-      self.stats.fd_ns = 0;
+      self.last_summary_stats = current;
       Some(line)
    }
 
@@ -1221,9 +1247,19 @@ impl Attributor {
       uid: Option<u32>,
    ) -> Option<(u32, u32, Option<SystemTime>)> {
       let started = Instant::now();
-      let starts = self.process_starts();
-      let owner = numeric_pids_sorted_by(&starts)
-         .and_then(|pids| self.scan_pids_for_inode(pids, inode, uid, socket_inodes));
+      let fresh = self.pid_order.as_ref().is_some_and(|(taken_at, _)| {
+         self.batch_arrived.is_some_and(|arrived| *taken_at >= arrived)
+      });
+      if !fresh {
+         let starts = self.process_starts();
+         let pids = numeric_pids_sorted_by(&starts)?;
+         self.pid_order = Some((Instant::now(), pids));
+      }
+      // One `Vec<u32>` copy per miss (~1.7 KB here) against the 2.19 ms the rebuild costs: taking the
+      // list out of the field to avoid the copy is not worth the borrow plumbing, and `scan_pids_for_inode`
+      // keeps its owned-`Vec` signature so its existing tests are untouched.
+      let pids = self.pid_order.as_ref().map(|(_, pids)| pids.clone()).unwrap_or_default();
+      let owner = self.scan_pids_for_inode(pids, inode, uid, socket_inodes);
       self.stats.fd_ns = self.stats.fd_ns.saturating_add(elapsed_ns(started));
       owner
    }
@@ -4477,5 +4513,66 @@ mod tests {
       attributor.begin_batch(Instant::now());
       let _ = attributor.live_candidates(Family::V4, L4Proto::Tcp, local, remote);
       assert_eq!(attributor.stats.table_reads, 2);
+   }
+
+   #[test]
+   fn a_batch_builds_the_pid_list_once() {
+      // A uid no process has, so the scan reads no descriptor directory at all: the only work left to
+      // observe is the pid list, which is what this test is about.
+      let nobody = Some(u32::MAX);
+      let mut attributor = Attributor::new();
+      attributor.begin_batch(Instant::now());
+      let first = attributor.scan_for_inode(4242, nobody);
+      let stamped = attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at);
+      assert!(
+         stamped.is_some(),
+         "the first lookup builds the list"
+      );
+      let second = attributor.scan_for_inode(4242, nobody);
+      assert_eq!(
+         first, second,
+         "the same question answers the same way"
+      );
+      assert_eq!(
+         attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at),
+         stamped,
+         "a second lookup in the same batch does not rebuild the list"
+      );
+      // A new batch is a new arrival time, so its list is built again.
+      attributor.begin_batch(Instant::now());
+      let _ = attributor.scan_for_inode(4242, nobody);
+      assert_ne!(
+         attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at),
+         stamped,
+         "a new batch rebuilds the list"
+      );
+   }
+
+   #[test]
+   fn the_summary_reports_an_interval_without_resetting_the_counters() {
+      let mut attributor = Attributor::new();
+      attributor.stats.hits = 3;
+      attributor.stats.misses = 1;
+      let start = Instant::now();
+      let line = attributor.perf_summary(start).expect("the first summary is due");
+      assert!(
+         line.contains("4 lookups in 30s"),
+         "line was: {line}"
+      );
+      assert_eq!(
+         attributor.stats.hits, 3,
+         "a summary must not reset the session counters"
+      );
+      assert_eq!(attributor.stats.misses, 1);
+      // Nothing happened in the next interval, so it says nothing at all.
+      assert!(attributor.perf_summary(start + PERF_SUMMARY_INTERVAL).is_none());
+      attributor.stats.hits = 10;
+      let line = attributor
+         .perf_summary(start + PERF_SUMMARY_INTERVAL * 2)
+         .expect("the third summary is due");
+      assert!(
+         line.contains("7 lookups in 30s"),
+         "the line reports the interval, not the session: {line}"
+      );
    }
 }
