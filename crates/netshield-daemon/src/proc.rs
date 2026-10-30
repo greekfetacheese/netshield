@@ -1397,33 +1397,53 @@ fn candidate_owner(
 
 /// Opens `/proc/<pid>/fd` and collects the socket inodes it holds.
 ///
-/// Descriptors are ordered newest-first before any link is read, mirroring OpenSnitch's
-/// `sortFdsByTime`: a firewall looks for a socket created moments ago, so the newest
-/// [`MAX_FDS`] entries are the ones worth spending the budget on. A directory holding more
-/// than that is still trimmed, but its freshest entries are read; the caller is told with
-/// [`ScanError::Budget`] and receives those inodes rather than an empty list.
+/// A directory holding more than [`MAX_FDS`] entries is trimmed to the newest ones,
+/// mirroring OpenSnitch's `sortFdsByTime`: a firewall looks for a socket created moments
+/// ago, so the freshest entries are the ones worth spending the budget on. The caller is
+/// told with [`ScanError::Budget`] and receives those inodes rather than an empty list.
+/// Below the budget nothing is cut, so the descriptors are read in readdir order.
 fn socket_inodes(pid: u32) -> Result<Vec<u32>, ScanError> {
    read_fd_dir(Path::new(PROC).join(pid.to_string()).join("fd"))
 }
 
-/// Scans one descriptor directory, newest entry first, trimming the list to [`MAX_FDS`].
+/// Scans one descriptor directory, trimming it to the newest [`MAX_FDS`] entries only
+/// when it holds more than that.
 ///
-/// Split from [`socket_inodes`] so the ordering and the budget can be exercised on a
-/// directory the test controls instead of a live `/proc`.
+/// The order exists solely so a *trimmed* scan keeps the newest sockets. An untrimmed
+/// scan is order-independent because [`scan_pids_for_inode`] examines every pid of the
+/// packet's uid before it may answer `None`, so no descriptor's age is read unless the
+/// cut actually applies. Split from [`socket_inodes`] so the ordering and the budget can
+/// be exercised on a directory the test controls instead of a live `/proc`.
 fn read_fd_dir(path: PathBuf) -> Result<Vec<u32>, ScanError> {
    let directory = fs::read_dir(&path).map_err(|_| ScanError::Unreadable)?;
-   let mut entries = Vec::new();
-   let mut seen = 0usize;
+   let mut names = Vec::new();
    for entry in directory {
       let Ok(entry) = entry else {
          continue;
       };
-      seen += 1;
-      entries.push((entry.file_name(), entry_mtime(&entry)));
+      names.push(entry.file_name());
    }
-   let over_budget = seen > MAX_FDS;
+   let over_budget = names.len() > MAX_FDS;
+   let names = if over_budget {
+      // The order matters only to the cut, so re-read the directory once to collect the
+      // ages it sorts on rather than statting every descriptor of every scan.
+      match fs::read_dir(&path) {
+         Ok(directory) => {
+            let entries = directory
+               .flatten()
+               .map(|entry| (entry.file_name(), entry_mtime(&entry)))
+               .collect();
+            sort_fds_newest_first(entries, MAX_FDS)
+         }
+         // The directory went away between the two reads; the names already collected are
+         // still worth a link read, bounded exactly as the cut would have bounded them.
+         Err(_) => names.into_iter().take(MAX_FDS).collect(),
+      }
+   } else {
+      names
+   };
    let mut inodes = Vec::new();
-   for name in sort_fds_newest_first(entries, MAX_FDS) {
+   for name in names {
       let target = match fs::read_link(path.join(name)) {
          Ok(target) => target,
          // A descriptor closed between readdir and readlink.
@@ -1484,12 +1504,15 @@ fn read_pid_uid_at(dir: &Path) -> Option<u32> {
    fs::metadata(dir).ok().map(|meta| meta.uid())
 }
 
-/// Lists the numeric entries of `/proc`, newest process first.
+/// Lists the numeric entries of `/proc`, newest process first only when the list exceeds
+/// [`MAX_PIDS`].
 ///
-/// The scan order matters: the socket being attributed was created moments ago, so the
-/// process that started last is the likeliest owner. A pid whose directory time cannot be
-/// read is still scanned, only last, so a racing exit or an unreadable entry never hides a
-/// younger process.
+/// The order exists solely so a *trimmed* scan keeps the newest processes. An untrimmed
+/// scan is order-independent because [`scan_pids_for_inode`] examines every pid of the
+/// packet's uid before it may answer `None`, so a process directory's age is read only
+/// when the budget cut applies. A pid whose directory time cannot be read is still
+/// scanned, only last, so a racing exit or an unreadable entry never hides a younger
+/// process.
 fn numeric_pids() -> Option<Vec<u32>> {
    let entries = fs::read_dir(PROC).ok()?;
    let mut pids = Vec::new();
@@ -1500,10 +1523,29 @@ fn numeric_pids() -> Option<Vec<u32>> {
       let Ok(pid) = name.parse::<u32>() else {
          continue;
       };
-      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
-      pids.push((pid, mtime));
+      pids.push(pid);
    }
-   Some(sort_pids_newest_first(pids))
+   if pids.len() <= MAX_PIDS {
+      return Some(pids);
+   }
+   // The order matters only to the cut, so re-read `/proc` once to collect the ages it
+   // sorts on. If it cannot be re-read, the list is still over budget and the caller
+   // rejects it either way.
+   let Some(entries) = fs::read_dir(PROC).ok() else {
+      return Some(pids);
+   };
+   let mut aged = Vec::new();
+   for entry in entries.flatten() {
+      let Ok(name) = entry.file_name().into_string() else {
+         continue;
+      };
+      let Ok(pid) = name.parse::<u32>() else {
+         continue;
+      };
+      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
+      aged.push((pid, mtime));
+   }
+   Some(sort_pids_newest_first(aged))
 }
 
 /// Sorts `(pid, mtime)` pairs newest-first; entries without a time go last, ties keep input
@@ -1637,6 +1679,7 @@ fn endpoint_label((addr, port): (IpAddr, u16)) -> String {
 mod tests {
    use super::*;
    use std::net::UdpSocket;
+   use std::process::{Child, Command, Stdio};
    use std::sync::atomic::{AtomicUsize, Ordering};
 
    /// Only a row a reject rule could match becomes a flow.
@@ -2932,6 +2975,99 @@ mod tests {
       );
 
       let _ = fs::remove_dir_all(&dir);
+   }
+
+   /// A descriptor directory below the budget must be scanned whole: the cut never applies,
+   /// so no entry may be dropped and every socket link must be returned.
+   #[test]
+   fn an_untrimmed_descriptor_directory_is_scanned_without_a_sort() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let dir = std::env::temp_dir().join(format!("netshield-fd-untrimmed-{nanos}"));
+      fs::create_dir_all(&dir).expect("create the descriptor directory");
+
+      let inodes = [111_111u32, 222_222, 333_333];
+      let target = inodes[1];
+      for (index, inode) in inodes.iter().enumerate() {
+         std::os::unix::fs::symlink(
+            format!("socket:[{inode}]"),
+            dir.join(format!("fd-{index}")),
+         )
+         .expect("create the socket link");
+      }
+
+      let Ok(mut scanned) = read_fd_dir(dir.clone()) else {
+         panic!("an untrimmed directory is not over budget");
+      };
+      // Readdir order is the filesystem's, not creation order; the point is that no entry
+      // is dropped and no age is consulted to pick the survivors.
+      scanned.sort_unstable();
+      assert_eq!(
+         scanned, inodes,
+         "an untrimmed scan returns every socket inode"
+      );
+      assert!(
+         scanned.contains(&target),
+         "the target inode must be among the scanned descriptors"
+      );
+
+      let _ = fs::remove_dir_all(&dir);
+   }
+
+   /// Three children of the test process, so `/proc/<pid>` is readable and behaves as
+   /// processes of our own uid without depending on the machine's pid table.
+   fn sleepers() -> Vec<Child> {
+      let spawn = |program: &str| {
+         Command::new(program)
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+      };
+      (0..3)
+         .map(|_| spawn("sleep").or_else(|_| spawn("/bin/sleep")).expect("spawn a sleep process"))
+         .collect()
+   }
+
+   /// Kills the fixture processes even when an assertion fails, so a red test never
+   /// leaves `sleep` running on the machine.
+   struct Sleepers(Vec<Child>);
+
+   impl Drop for Sleepers {
+      fn drop(&mut self) {
+         for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+         }
+      }
+   }
+
+   /// Nothing is trimmed below the pid budget, so the owning pid may sit at the end of the
+   /// list: every pid of the packet's uid is examined before the scan answers.
+   #[test]
+   fn a_pid_list_is_scanned_in_any_order() {
+      let sleepers = Sleepers(sleepers());
+      let pid = std::process::id();
+      let uid = own_uid();
+      let inode = 987_654u32;
+      // Readable processes of our own uid take time to rule out; the owner stays last.
+      // The readers are injected, so these scans never touch a socket in this process.
+      let mut pids: Vec<u32> = sleepers.0.iter().map(Child::id).collect();
+      pids.push(pid);
+      let mut attributor = Attributor::new();
+      let owner = attributor.scan_pids_for_inode(pids, inode, Some(uid), |scanned| {
+         if scanned == pid {
+            Ok(vec![123, inode])
+         } else {
+            Ok(vec![123])
+         }
+      });
+      assert_eq!(
+         owner,
+         Some((pid, uid)),
+         "the scan must find an owner that is last in an untrimmed pid list"
+      );
    }
 
    /// A `/proc/<pid>` fixture holding the four files `ProcessCache::record` reads.
