@@ -300,12 +300,26 @@ pub fn rule_from_scope(id: RuleId, app: AppMatcher, scope: &ScopeRequest, now: u
 /// still hold such a rule when the owner edits it in deliberately.
 pub fn socket_rule_refusal(rule: &Rule) -> Option<&'static str> {
    let every_app = matches!(rule.app, AppMatcher::Any | AppMatcher::Unknown);
-   match (every_app, &rule.dest) {
-      (true, DestMatcher::Any) => Some(
+   if every_app && covers_every_destination(&rule.dest) {
+      Some(
          "a rule for every application and every destination is not accepted over the control \
           socket; add it to the rules store deliberately",
-      ),
-      _ => None,
+      )
+   } else {
+      None
+   }
+}
+
+/// Whether `dest` matches every address — `Any` written another way.
+///
+/// `DestMatcher::Ip` with prefix `0` is a whole address space, so a rule for "any application" over it is
+/// the same silent allow-all the socket refuses in its `Any` form; a `Set` answers for its members.
+fn covers_every_destination(dest: &DestMatcher) -> bool {
+   match dest {
+      DestMatcher::Any => true,
+      DestMatcher::Ip(net) => net.prefix == 0,
+      DestMatcher::Set(entries) => entries.iter().any(covers_every_destination),
+      DestMatcher::Domain { .. } | DestMatcher::Port(_) => false,
    }
 }
 
@@ -836,6 +850,49 @@ mod tests {
             "{app:?} over any destination must be refused"
          );
       }
+   }
+
+   #[test]
+   fn a_zero_prefix_destination_is_refused_for_every_app() {
+      let global = |app: AppMatcher, dest: DestMatcher| {
+         rule_from_scope(
+            RuleId::new_unique(),
+            app,
+            &ScopeRequest {
+               action: Action::Allow,
+               duration: Duration::Forever,
+               dest,
+            },
+            0,
+         )
+      };
+
+      for dest in [
+         DestMatcher::Ip("0.0.0.0/0".parse().expect("a global v4 net")),
+         DestMatcher::Ip("::/0".parse().expect("a global v6 net")),
+         DestMatcher::Set(vec![
+            DestMatcher::Ip("0.0.0.0/0".parse().expect("a global v4 net")),
+            DestMatcher::Ip("192.0.2.1/32".parse().expect("a lit net")),
+         ]),
+      ] {
+         for app in [AppMatcher::Any, AppMatcher::Unknown] {
+            assert!(
+               socket_rule_refusal(&global(app.clone(), dest.clone())).is_some(),
+               "{app:?} over {dest:?} covers every address and must be refused"
+            );
+         }
+      }
+
+      // One application over every address is a prompt's own scope, and stays accepted.
+      let exe = AppMatcher::Exe(PathBuf::from("/usr/bin/firefox"));
+      assert_eq!(
+         socket_rule_refusal(&global(
+            exe,
+            DestMatcher::Ip("0.0.0.0/0".parse().expect("a global v4 net")),
+         )),
+         None,
+         "an application-wide rule over every address is expressible"
+      );
    }
 
    #[test]

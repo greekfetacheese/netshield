@@ -2069,7 +2069,10 @@ fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rul
    // `DestMatcher::Any` would allow every unattributed flow on the machine. The alert does not
    // offer that row, but this request is the only thing between a bug (or a hostile client) and
    // that rule, so the daemon narrows it too.
-   let decide = narrow_unattributed_scope(record, decide);
+   let decide = narrow_unattributed_scope(
+      record,
+      &narrow_unknown_domain_scope(record, decide),
+   );
    match &decide.scope {
       ScopeChoice::TheseDestinations => record
          .dests
@@ -2095,20 +2098,29 @@ fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rul
    }
 }
 
-/// Narrows an app-wide answer on an unattributed prompt to the one address it reached.
+/// Whether a flow has no executable to key an app-wide rule on.
 ///
-/// The alert never offers the app-wide row for an unattributed flow, because with
-/// `AppMatcher::Unknown` that rule would allow every unattributed flow rather than this
-/// application. A request that asks for it anyway is honoured at the narrowest scope instead of
-/// refused: the user's action still applies to the flow they were looking at.
+/// `Attribution::Unknown` is the obvious case; a process whose `/proc/<pid>/exe` could not be read has the
+/// same problem, and `AppMatcher::Any` would widen an answer for it to every application on the machine.
+fn app_is_unknown(connection: &Connection) -> bool {
+   match &connection.process {
+      Attribution::Unknown => true,
+      Attribution::Process(process) => process.exe.is_none(),
+   }
+}
+
+/// Narrows an app-wide answer on a prompt with no executable to the one address it reached.
+///
+/// The alert never offers the app-wide row for such a flow, because with `AppMatcher::Unknown` or
+/// `AppMatcher::Any` that rule would cover every unknown flow rather than this application. A request that
+/// asks for it anyway is honoured at the narrowest scope instead of refused: the user's action still applies
+/// to the flow they were looking at.
 fn narrow_unattributed_scope(record: &PromptRecord, decide: &DecideRequest) -> DecideRequest {
-   let unattributed = record
-      .first()
-      .is_some_and(|dest| matches!(dest.connection.process, Attribution::Unknown));
+   let unattributed = record.first().is_some_and(|dest| app_is_unknown(&dest.connection));
    if unattributed && decide.scope == ScopeChoice::AnyConnection {
       warn!(
-         "prompt {} is unattributed, so an app-wide answer would cover every unknown flow; \
-          scoping the rule to the address it reached",
+         "prompt {} has no executable to key an app-wide rule on, so that rule would cover every \
+          unknown flow; scoping it to the address it reached",
          record.id
       );
       return DecideRequest {
@@ -2117,6 +2129,38 @@ fn narrow_unattributed_scope(record: &PromptRecord, decide: &DecideRequest) -> D
       };
    }
    decide.clone()
+}
+
+/// Narrows a domain scope naming a host this prompt never carried to the address the flow reached.
+///
+/// `ScopeChoice::Domain` arrives from the control socket, so `host` is the client's claim, not a fact about
+/// the flow: without this check a request could mint an allow rule for any domain in the world from a prompt
+/// about something else. The names the flow actually carried are `domain` (the one shown) and `also_domains`
+/// (every other live name for the address).
+fn narrow_unknown_domain_scope(record: &PromptRecord, decide: &DecideRequest) -> DecideRequest {
+   let ScopeChoice::Domain { host, .. } = &decide.scope else {
+      return decide.clone();
+   };
+   let carried = record.dests.iter().any(|dest| {
+      dest
+         .connection
+         .domain
+         .iter()
+         .chain(dest.connection.also_domains.iter())
+         .any(|name| name.eq_ignore_ascii_case(host))
+   });
+   if carried {
+      return decide.clone();
+   }
+   warn!(
+      "prompt {}: domain {host} is not a name this flow carried; scoping the rule to the address it \
+       reached",
+      record.id
+   );
+   DecideRequest {
+      scope: ScopeChoice::Address,
+      ..decide.clone()
+   }
 }
 
 /// The scope one destination of a `TheseDestinations` answer uses: its learned domain when
@@ -2136,7 +2180,9 @@ fn rule_for(connection: &Connection, decide: &DecideRequest, now: u64) -> Rule {
    let app = match &connection.process {
       Attribution::Process(process) => match process.exe.clone() {
          Some(path) => AppMatcher::Exe(path),
-         None => AppMatcher::Any,
+         // No readable image is no identity: `Any` would match every process on the machine, so the
+         // narrowing below scope this answer to the address like any other unattributed flow.
+         None => AppMatcher::Unknown,
       },
       Attribution::Unknown => AppMatcher::Unknown,
    };
@@ -3959,13 +4005,15 @@ mod tests {
 
       for (scope, expected) in [
          (ScopeChoice::AnyConnection, DestMatcher::Any),
+         // The flow carries `api.github.com`: a domain scope may only name a name the flow carried,
+         // so this case uses it and keeps testing the `subdomains` flag.
          (
             ScopeChoice::Domain {
-               host: "example.com".to_owned(),
+               host: "api.github.com".to_owned(),
                subdomains: true,
             },
             DestMatcher::Domain {
-               host: "example.com".to_owned(),
+               host: "api.github.com".to_owned(),
                subdomains: true,
             },
          ),
@@ -4135,6 +4183,76 @@ mod tests {
       assert!(
          gate.due(start + Duration::from_secs(5)),
          "the gap is closed after five seconds"
+      );
+   }
+
+   #[test]
+   fn a_domain_scope_the_prompt_never_carried_is_narrowed_to_the_address() {
+      let start = Instant::now();
+      let mut pending = PendingPrompts::new();
+      let mut connection = app_conn("/usr/bin/firefox", "198.51.100.24", 443);
+      connection.domain = Some("example.com".to_owned());
+      let id = pending.open(connection, 10, Duration::from_secs(30), start).id();
+      let record = pending.get(id).expect("open");
+
+      let rules = rules_for(
+         record,
+         &DecideRequest {
+            prompt_id: id,
+            action: Action::Allow,
+            duration: RuleDuration::Session,
+            scope: ScopeChoice::Domain {
+               host: "accounts.google.com".to_owned(),
+               subdomains: false,
+            },
+         },
+         0,
+      );
+
+      assert_eq!(rules.len(), 1);
+      assert!(
+         matches!(&rules[0].dest, DestMatcher::Ip(net) if net.prefix == 32),
+         "a host the flow never carried must not become a domain rule: {:?}",
+         rules[0].dest
+      );
+   }
+
+   #[test]
+   fn an_app_wide_answer_for_a_process_without_an_exe_is_narrowed() {
+      let start = Instant::now();
+      let mut pending = PendingPrompts::new();
+      let mut connection = app_conn("/usr/bin/ghost", "198.51.100.24", 443);
+      connection.process = Attribution::Process(ProcessInfo {
+         pid: 4242,
+         uid: 1000,
+         exe: None,
+         comm: Some("ghost".to_owned()),
+         cmdline: None,
+      });
+      let id = pending.open(connection, 10, Duration::from_secs(30), start).id();
+      let record = pending.get(id).expect("open");
+
+      let rules = rules_for(
+         record,
+         &DecideRequest {
+            prompt_id: id,
+            action: Action::Allow,
+            duration: RuleDuration::Session,
+            scope: ScopeChoice::AnyConnection,
+         },
+         0,
+      );
+
+      assert_eq!(rules.len(), 1);
+      assert_eq!(
+         rules[0].app,
+         AppMatcher::Unknown,
+         "a process with no image must never produce a rule for every application"
+      );
+      assert!(
+         matches!(&rules[0].dest, DestMatcher::Ip(net) if net.prefix == 32),
+         "and it is scoped to the address it reached: {:?}",
+         rules[0].dest
       );
    }
 }
