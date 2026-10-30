@@ -407,7 +407,7 @@ impl Daemon {
             },
          ),
       };
-      let domain = self.domain_for(remote.addr);
+      let (domain, also_domains) = self.domain_names(remote.addr);
       Connection {
          family: match live.flow {
             Flow::V4(..) => Family::V4,
@@ -424,6 +424,7 @@ impl Daemon {
             cmdline: None,
          }),
          domain,
+         also_domains,
       }
    }
 }
@@ -1544,33 +1545,47 @@ impl Daemon {
       );
       let missing = attributed.missing;
 
+      let (domain, also_domains) = self.domain_names(remote.addr);
       let connection = Connection {
          family: parsed.family,
          proto,
          local,
          remote,
          process: attributed.attribution,
-         domain: self.domain_for(remote.addr),
+         domain,
+         also_domains,
       };
       Some((connection, missing))
    }
 
-   /// The name the DNS cache learned for `addr`, if one is still live.
+   /// Splits the live names for `addr` into the primary — the one a prompt shows — and every
+   /// alternate live name, in the cache's order.
    ///
    /// A miss is logged at most once per [`DNS_MISS_LOG_GAP`] per address: a busy machine
    /// looks up a lot of uncached addresses, and each line would otherwise flood the
    /// journal. Hits are never logged.
-   fn domain_for(&mut self, addr: IpAddr) -> Option<String> {
-      let name = self
+   fn domain_names(&mut self, addr: IpAddr) -> (Option<String>, Vec<String>) {
+      let mut names = self.live_domains(addr);
+      let domain = (!names.is_empty()).then(|| names.remove(0));
+      if domain.is_none() && self.dns_misses.record(addr, Instant::now()) {
+         debug!("dns: no name for {addr}");
+      }
+      (domain, names)
+   }
+
+   /// Every live name the DNS cache holds for `addr`, most recently learned first.
+   ///
+   /// The first is what a prompt displays; the rest are names a domain rule must also match,
+   /// because several names can share one address.
+   fn live_domains(&self, addr: IpAddr) -> Vec<String> {
+      self
          .dns_cache
          .lock()
          .expect("dns cache")
-         .primary(addr, now_secs())
-         .map(str::to_owned);
-      if name.is_none() && self.dns_misses.record(addr, Instant::now()) {
-         debug!("dns: no name for {addr}");
-      }
-      name
+         .names_for(addr, now_secs())
+         .into_iter()
+         .map(str::to_owned)
+         .collect()
    }
 
    /// A display snapshot of one connection.
@@ -1580,12 +1595,7 @@ impl Daemon {
    }
 
    fn domain_candidates(&self, connection: &Connection) -> Vec<String> {
-      let cache = self.dns_cache.lock().expect("dns cache");
-      cache
-         .names_for(connection.remote.addr, now_secs())
-         .into_iter()
-         .map(str::to_owned)
-         .collect()
+      self.live_domains(connection.remote.addr)
    }
 
    fn broadcast_connection(
@@ -2386,6 +2396,7 @@ mod tests {
             },
             process: Attribution::Unknown,
             domain: None,
+            also_domains: Vec::new(),
          };
          let decide = DecideRequest {
             prompt_id: 7,
@@ -2428,6 +2439,7 @@ mod tests {
          remote: Endpoint { addr: remote, port },
          process: Attribution::Unknown,
          domain: None,
+         also_domains: Vec::new(),
       }
    }
 
@@ -3034,6 +3046,7 @@ mod tests {
             cmdline: None,
          }),
          domain: None,
+         also_domains: Vec::new(),
       }
    }
 

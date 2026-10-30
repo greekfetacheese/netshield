@@ -533,6 +533,7 @@ mod tests {
             cmdline: None,
          }),
          domain: Some("ignored.example".to_owned()),
+         also_domains: Vec::new(),
       };
       let candidates = vec!["api.github.com".to_owned(), "github.com".to_owned()];
       let view = ConnectionView::from_connection(&conn, &candidates);
@@ -568,6 +569,7 @@ mod tests {
          },
          process: Attribution::Unknown,
          domain: None,
+         also_domains: Vec::new(),
       };
       let view = ConnectionView::from_connection(&conn, &[]);
       assert_eq!(view.app_name, "unknown");

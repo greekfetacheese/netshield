@@ -312,8 +312,13 @@ Consequences worth stating plainly:
 - A resolver using DoH/DoT to a local stub (systemd-resolved with `DNSOverTLS=yes`) hides
   the answer from us, so the prompt can only show an IP. The domain option is then
   disabled rather than guessed.
-- When several names map to one address, the most recently learned one is shown and the
-  rest are available in the prompt's details.
+- When several names map to one address, the prompt shows the most recently learned one, but
+  **matching** considers every live name for that address: a domain rule matches if any of
+  them does, and the best match sets its rank. Otherwise a `deny evil.com` would be silently
+  shadowed the moment another name on the same shared address (a CDN edge, typically) was
+  learned, and an `allow bank.com` would only hold while it happened to be the newest name.
+- Per-application name ownership is a v2 item: the app's own query goes over loopback, which
+  this design does not filter, so the cache cannot attribute a name to the process that asked.
 - Entries expire with their record TTL (capped at 1 h) so a reassigned address does not
   inherit a stale name.
 

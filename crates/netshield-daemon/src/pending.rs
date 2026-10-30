@@ -401,6 +401,7 @@ mod tests {
          },
          process,
          domain: Some("api.github.com".to_owned()),
+         also_domains: Vec::new(),
       }
    }
 
