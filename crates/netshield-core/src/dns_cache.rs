@@ -10,6 +10,13 @@ use std::net::IpAddr;
 /// name for longer than a browser session.
 pub const MAX_TTL_SECS: u32 = 3600;
 
+/// Most live names one address may carry.
+///
+/// An address with more names than this is not a CDN edge, it is a flood: the queue accepts answers
+/// from any sender, so this is the only bound on a cache an unprivileged process can write to. The
+/// oldest name is dropped, which is the one `names_for` would have ranked last anyway.
+pub const MAX_NAMES_PER_ADDR: usize = 16;
+
 /// One name learned for one address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -54,6 +61,7 @@ impl DnsCache {
             expires_at,
          },
       );
+      names.truncate(MAX_NAMES_PER_ADDR);
    }
 
    /// All live names for `ip` at `now`, most recently inserted first.
@@ -193,6 +201,30 @@ mod tests {
       );
       assert!(cache.names_for(v4(2, 2, 2, 2), 10).is_empty());
       assert_eq!(cache.expire(10), 0);
+   }
+
+   #[test]
+   fn a_flood_of_names_for_one_address_is_capped() {
+      let ip: IpAddr = "203.0.113.7".parse().expect("literal");
+      let mut cache = DnsCache::new();
+      for index in 0..(MAX_NAMES_PER_ADDR + 8) {
+         cache.insert(ip, &format!("n{index}.example"), 60, 0);
+      }
+      let names = cache.names_for(ip, 1);
+      assert_eq!(
+         names.len(),
+         MAX_NAMES_PER_ADDR,
+         "the cache bounds one address's names"
+      );
+      assert_eq!(
+         names[0],
+         format!("n{}.example", MAX_NAMES_PER_ADDR + 7),
+         "the newest survives at the front"
+      );
+      assert!(
+         !names.contains(&"n0.example"),
+         "the oldest name is the one dropped"
+      );
    }
 
    #[test]
