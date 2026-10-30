@@ -353,8 +353,9 @@ fn wall_from_monotonic(event_ns: u64, now_mono_ns: u64, now_wall: SystemTime) ->
 /// CLOCK_MONOTONIC in nanoseconds, the clock the connector stamps its events with.
 ///
 /// This is the one place in the crate that reads a clock through `libc`, and it stays here because
-/// `unsafe` is only allowed under `netlink/`.
-fn monotonic_ns() -> Option<u64> {
+/// `unsafe` is only allowed under `netlink/`. `proc.rs` uses it for `image_started_at`, because
+/// `/proc/uptime` is CLOCK_BOOTTIME while `starttime` counts CLOCK_MONOTONIC ticks.
+pub(crate) fn monotonic_ns() -> Option<u64> {
    let mut now = libc::timespec {
       tv_sec: 0,
       tv_nsec: 0,

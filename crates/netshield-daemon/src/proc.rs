@@ -1862,37 +1862,29 @@ fn identity_at(pid: u32, root: &Path) -> Option<CachedIdentity> {
 /// Linux architecture, independent of the kernel's own `CONFIG_HZ`.
 const USER_HZ: u64 = 100;
 
-/// The instant an image that began `starttime` ticks after boot started running.
+/// Wall-clock time a process image started, from `/proc/<pid>/stat`'s start time.
 ///
-/// The conversion goes through `/proc/uptime`, not `btime`: `btime` has one-second
-/// granularity, which alone would swamp [`SLACK`]. The result is only as good as the two
-/// readings it is built from, so `None` (unreadable uptime) stays unknown rather than
-/// becoming a guessed start that could accuse a process.
+/// `starttime` counts CLOCK_MONOTONIC ticks, so the age has to come from the same clock.
+/// `/proc/uptime` is CLOCK_BOOTTIME on current kernels — it includes suspend — and subtracting one
+/// from the other put every seeded image the accumulated suspend time into the past (measured:
+/// ~29 h on this machine), which silenced the exec-after-connect comparison for any process whose
+/// exec event never arrived. The clock read stays in `netlink/`, the crate's only `unsafe` home.
 fn image_started_at(starttime: u64) -> Option<SystemTime> {
-   let uptime = read_uptime()?;
-   // A start time ahead of uptime is a torn read; treat it as unknown.
-   let age = uptime.checked_sub(StdDuration::from_millis(
-      starttime.saturating_mul(1_000) / USER_HZ,
-   ))?;
-   SystemTime::now().checked_sub(age)
+   let now_mono_ns = crate::netlink::proc_connector::monotonic_ns()?;
+   image_started_from(starttime, now_mono_ns, SystemTime::now())
 }
 
-/// Reads the kernel's uptime, the clock `/proc/<pid>/stat` counts against.
-fn read_uptime() -> Option<StdDuration> {
-   let text = fs::read_to_string(Path::new(PROC).join("uptime")).ok()?;
-   parse_uptime(text.split_whitespace().next()?)
-}
-
-/// Parses the first field of `/proc/uptime`, `seconds.hundredths`, without a float.
-fn parse_uptime(text: &str) -> Option<StdDuration> {
-   let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-   let seconds = whole.parse::<u64>().ok()?;
-   let hundredths = match fraction.len() {
-      0 => 0,
-      1 => fraction.parse::<u64>().ok()? * 10,
-      _ => fraction.get(..2)?.parse::<u64>().ok()?,
-   };
-   Some(StdDuration::from_secs(seconds) + StdDuration::from_millis(hundredths * 10))
+/// The pure half of [`image_started_at`], so the arithmetic is testable without a clock.
+fn image_started_from(
+   starttime: u64,
+   now_mono_ns: u64,
+   now_wall: SystemTime,
+) -> Option<SystemTime> {
+   let started_ms = starttime.saturating_mul(1_000) / USER_HZ;
+   let now_ms = now_mono_ns / 1_000_000;
+   // A start time ahead of the clock is a torn read; treat it as unknown.
+   let age = StdDuration::from_millis(now_ms.checked_sub(started_ms)?);
+   now_wall.checked_sub(age)
 }
 
 /// Reads a process directory's `comm`, trimmed, when it is non-empty.
