@@ -31,6 +31,7 @@ pub fn show(ui: &mut Ui, current: Mode, prefs: &mut Prefs) -> bool {
 
    egui::ScrollArea::vertical()
       .auto_shrink([false, false])
+      .content_margin(10)
       .show(ui, |ui| {
          let mut changed = false;
 
