@@ -22,69 +22,85 @@ const AMBER_BG: Color32 = Color32::from_rgb(0x3A, 0x2E, 0x14);
 ///
 /// The mode switch is in the top bar, so this reports the current mode and the Silent-mode
 /// consequence instead of offering a control the shell already owns.
+///
+/// The page scrolls: it outgrew a short window, and the heading stays pinned above the
+/// scroll area as it does on the Connections page.
 pub fn show(ui: &mut Ui, current: Mode, prefs: &mut Prefs) -> bool {
    ui.heading("Settings");
    ui.add_space(4.0);
 
-   section(ui, "Operation mode");
-   ui.label(RichText::new("\"Ask before connecting\" — toggled in the top bar.").weak());
-   let state = match current {
-      Mode::Alert => "currently: alert",
-      Mode::Silent => "currently: silent",
-   };
-   ui.label(RichText::new(state).weak());
+   egui::ScrollArea::vertical()
+      .auto_shrink([false, false])
+      .show(ui, |ui| {
+         let mut changed = false;
 
-   if current == Mode::Silent {
-      ui.add_space(6.0);
-      egui::Frame::NONE
-         .fill(AMBER_BG)
-         .inner_margin(egui::Margin::symmetric(10, 8))
-         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(
-               RichText::new(
-                  "New connections are allowed without a decision. Rules still apply, \
-                   so Silent is not \"monitoring only\".",
-               )
-               .color(AMBER),
-            );
-         });
-   }
+         section(ui, "Operation mode");
+         ui.label(RichText::new("\"Ask before connecting\" — toggled in the top bar.").weak());
+         let state = match current {
+            Mode::Alert => "currently: alert",
+            Mode::Silent => "currently: silent",
+         };
+         ui.label(RichText::new(state).weak());
 
-   section(ui, "Connection log");
-   ui.label(
-      RichText::new(
-         "How much history the Connections page keeps in memory. A change takes effect at \
-          once: the oldest rows past a lower cap are dropped and counted as dropped.",
-      )
-      .weak(),
-   );
-   let mut changed = ui
-      .add(Slider::new(&mut prefs.rows_per_app, prefs::ROWS_PER_APP).label("Rows per application"))
-      .changed();
-   changed |= ui
-      .add(Slider::new(&mut prefs.max_apps, prefs::MAX_APPS).label("Applications tracked at once"))
-      .changed();
+         if current == Mode::Silent {
+            ui.add_space(6.0);
+            egui::Frame::NONE
+               .fill(AMBER_BG)
+               .inner_margin(egui::Margin::symmetric(10, 8))
+               .show(ui, |ui| {
+                  ui.set_width(ui.available_width());
+                  ui.label(
+                     RichText::new(
+                        "New connections are allowed without a decision. Rules still apply, \
+                         so Silent is not \"monitoring only\".",
+                     )
+                     .color(AMBER),
+                  );
+               });
+         }
 
-   section(ui, "Prompt timeout");
-   let config = Config::default();
-   ui.label(format!(
-      "{} seconds (daemon default)",
-      config.prompt_timeout_secs
-   ));
-   ui.label(
-      RichText::new(
-         "Configured in the daemon's config file as `prompt_timeout_secs`; a prompt left \
-          unanswered is denied.",
-      )
-      .weak(),
-   );
+         section(ui, "Connection log");
+         ui.label(
+            RichText::new(
+               "How much history the Connections page keeps in memory. A change takes effect at \
+                once: the oldest rows past a lower cap are dropped and counted as dropped.",
+            )
+            .weak(),
+         );
+         changed |= ui
+            .add(
+               Slider::new(&mut prefs.rows_per_app, prefs::ROWS_PER_APP)
+                  .label("Rows per application"),
+            )
+            .changed();
+         changed |= ui
+            .add(
+               Slider::new(&mut prefs.max_apps, prefs::MAX_APPS)
+                  .label("Applications tracked at once"),
+            )
+            .changed();
 
-   section(ui, "Control socket");
-   ui.label(RichText::new(config.socket_path.display().to_string()).monospace());
-   ui.label(RichText::new("The GUI connects to this socket as an unprivileged user.").weak());
+         section(ui, "Prompt timeout");
+         let config = Config::default();
+         ui.label(format!(
+            "{} seconds (daemon default)",
+            config.prompt_timeout_secs
+         ));
+         ui.label(
+            RichText::new(
+               "Configured in the daemon's config file as `prompt_timeout_secs`; a prompt left \
+                unanswered is denied.",
+            )
+            .weak(),
+         );
 
-   changed
+         section(ui, "Control socket");
+         ui.label(RichText::new(config.socket_path.display().to_string()).monospace());
+         ui.label(RichText::new("The GUI connects to this socket as an unprivileged user.").weak());
+
+         changed
+      })
+      .inner
 }
 
 /// A separated section heading; every section after the first gets a rule above it.
