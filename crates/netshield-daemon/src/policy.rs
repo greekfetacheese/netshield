@@ -11,9 +11,10 @@
 //! so expiry is unit-tested without sleeping.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use netshield_core::DefaultAction;
-use netshield_core::connection::{Connection, FlowKey};
+use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
 use netshield_core::rule::{Action, Rule, RuleId};
 use netshield_core::ruleset::{Outcome, RuleSet};
 
@@ -42,6 +43,41 @@ struct Grant {
    expires_at: u64,
 }
 
+/// What a one-off answer is remembered against.
+///
+/// A grant used to be keyed by `FlowKey`, which carries the pid as an `Option` and nothing else: `None`
+/// collapsed every unattributed flow into one key, and a recycled pid inherited the previous process's
+/// grant. The executable is the identity the rule engine already matches on, so it is what an answer is
+/// remembered against.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GrantKey {
+   pid: u32,
+   uid: u32,
+   exe: PathBuf,
+   remote: Endpoint,
+   proto: L4Proto,
+}
+
+/// The key a flow's one-off answer would be remembered against, or `None` when it has no attributed
+/// executable.
+///
+/// `None` is deliberate: an unattributed flow must neither store nor inherit a grant, because there is
+/// nothing to tie the answer to. Its packet is still answered directly; only a later flow to the same
+/// destination has to ask again.
+pub fn grant_key(conn: &Connection) -> Option<GrantKey> {
+   let process = match &conn.process {
+      Attribution::Process(process) => process,
+      Attribution::Unknown => return None,
+   };
+   Some(GrantKey {
+      pid: process.pid,
+      uid: process.uid,
+      exe: process.exe.clone()?,
+      remote: conn.remote,
+      proto: conn.proto,
+   })
+}
+
 /// How an inserted rule related to the rules already present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -58,7 +94,7 @@ pub struct Policy {
    default_action: DefaultAction,
    /// Keyed by flow so a reconnect from the same app to the same service reuses the
    /// answer even though the source port changed.
-   grants: HashMap<FlowKey, Grant>,
+   grants: HashMap<GrantKey, Grant>,
 }
 
 impl Policy {
@@ -78,7 +114,8 @@ impl Policy {
    /// [`Decision::Prompt`] only when the configuration actually asks, and never a silent
    /// allow.
    pub fn decide(&mut self, conn: &Connection, now: u64) -> Decision {
-      if let Some(grant) = self.grants.get(&conn.flow_key())
+      if let Some(key) = grant_key(conn)
+         && let Some(grant) = self.grants.get(&key)
          && grant.expires_at > now
       {
          return match grant.action {
@@ -103,7 +140,7 @@ impl Policy {
    /// The caller may pass a shorter deadline than [`GRANT_TTL_SECS`] (a prompt's scope can
    /// be narrower than the TTL); a longer one is clamped, so a bug cannot turn a one-off
    /// answer into a permanent rule that never reaches disk.
-   pub fn grant(&mut self, key: FlowKey, action: Action, expires_at: u64) {
+   pub fn grant(&mut self, key: GrantKey, action: Action, expires_at: u64) {
       let deadline = expires_at.min(now_secs().saturating_add(GRANT_TTL_SECS));
       self.grants.insert(
          key,
@@ -254,7 +291,11 @@ mod tests {
          }
       );
 
-      policy.grant(conn().flow_key(), Action::Allow, 200);
+      policy.grant(
+         grant_key(&conn()).expect("an attributed flow has a key"),
+         Action::Allow,
+         200,
+      );
       assert_eq!(
          policy.decide(&conn(), 100),
          Decision::Allow { rule: None },
@@ -268,7 +309,11 @@ mod tests {
       let mut set = RuleSet::new();
       set.upsert(deny.clone());
       let mut policy = Policy::new(set, DefaultAction::Prompt);
-      policy.grant(conn().flow_key(), Action::Allow, 150);
+      policy.grant(
+         grant_key(&conn()).expect("an attributed flow has a key"),
+         Action::Allow,
+         150,
+      );
 
       assert_eq!(
          policy.decide(&conn(), 149),
@@ -285,10 +330,18 @@ mod tests {
       assert_eq!(policy.expire_grants(150), 1);
 
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
-      policy.grant(conn().flow_key(), Action::Allow, 100);
+      policy.grant(
+         grant_key(&conn()).expect("an attributed flow has a key"),
+         Action::Allow,
+         100,
+      );
       let mut other = conn();
       other.remote.port = 8443;
-      policy.grant(other.flow_key(), Action::Allow, 500);
+      policy.grant(
+         grant_key(&other).expect("an attributed flow has a key"),
+         Action::Allow,
+         500,
+      );
 
       assert_eq!(policy.expire_grants(99), 0);
       assert_eq!(policy.expire_grants(100), 1);
@@ -355,7 +408,11 @@ mod tests {
       let mut set = RuleSet::new();
       set.upsert(rule.clone());
       let mut policy = Policy::new(set, DefaultAction::Prompt);
-      policy.grant(conn().flow_key(), Action::Allow, 200);
+      policy.grant(
+         grant_key(&conn()).expect("an attributed flow has a key"),
+         Action::Allow,
+         200,
+      );
 
       assert!(policy.remove_rule(&rule.id));
       assert!(!policy.remove_rule(&rule.id));
@@ -369,7 +426,7 @@ mod tests {
 
    #[test]
    fn grant_ttl_is_clamped_to_two_minutes() {
-      let key = conn().flow_key();
+      let key = grant_key(&conn()).expect("an attributed flow has a key");
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
       let now = now_secs();
 
@@ -377,10 +434,75 @@ mod tests {
       assert_eq!(policy.expire_grants(now + GRANT_TTL_SECS - 1), 0);
       assert_eq!(policy.expire_grants(now + GRANT_TTL_SECS), 1);
 
-      let key = conn().flow_key();
+      let key = grant_key(&conn()).expect("an attributed flow has a key");
       let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
       policy.grant(key, Action::Allow, now + 5);
       assert_eq!(policy.expire_grants(now + 4), 0);
       assert_eq!(policy.expire_grants(now + 5), 1);
+   }
+
+   #[test]
+   fn a_grant_is_not_reused_by_another_executable() {
+      // A rule for every application and every destination, so the fallback is a real `Deny`: if the
+      // grant were still consulted the answer would be `Allow`, and this test would fail on the action.
+      let deny = rule_from_scope(
+         RuleId::new_unique(),
+         AppMatcher::Any,
+         &netshield_core::ScopeRequest {
+            action: Action::Deny,
+            duration: Duration::Forever,
+            dest: DestMatcher::Any,
+         },
+         10,
+      );
+      let mut set = RuleSet::new();
+      set.upsert(deny.clone());
+      let mut policy = Policy::new(set, DefaultAction::Prompt);
+      policy.grant(
+         grant_key(&conn()).expect("firefox has a key"),
+         Action::Allow,
+         200,
+      );
+
+      // Same pid, same destination, same protocol — a different binary: a recycled pid must not
+      // inherit the previous process's answer.
+      let mut recycled = conn();
+      recycled.process = Attribution::Process(ProcessInfo {
+         pid: 4242,
+         uid: 1000,
+         exe: Some(PathBuf::from("/usr/bin/curl")),
+         comm: Some("curl".to_owned()),
+         cmdline: None,
+      });
+      assert_eq!(
+         policy.decide(&recycled, 100),
+         Decision::Deny {
+            rule: Some(deny.id.clone())
+         },
+         "a flow whose executable the grant was not made for falls back to the rule set"
+      );
+   }
+
+   #[test]
+   fn a_flow_without_an_executable_has_no_grant_key() {
+      let mut unattributed = conn();
+      unattributed.process = Attribution::Unknown;
+      assert!(
+         grant_key(&unattributed).is_none(),
+         "an unattributed flow has nothing to key a grant on"
+      );
+
+      let mut no_exe = conn();
+      no_exe.process = Attribution::Process(ProcessInfo {
+         pid: 4242,
+         uid: 1000,
+         exe: None,
+         comm: Some("renamed".to_owned()),
+         cmdline: None,
+      });
+      assert!(
+         grant_key(&no_exe).is_none(),
+         "a process with no readable image has nothing to key a grant on either"
+      );
    }
 }
