@@ -282,6 +282,7 @@ struct Daemon {
    mode: Mode,
    started_at: u64,
    queue_drops: u64,
+   queue_warn: WarnGate,
    silent_warned: bool,
    table_verified: bool,
    verify_schedule: VerifySchedule,
@@ -323,6 +324,7 @@ impl Daemon {
          mode: Mode::Alert,
          started_at,
          queue_drops: 0,
+         queue_warn: WarnGate::new(QUEUE_WARN_GAP),
          silent_warned: false,
          table_verified,
          verify_schedule: VerifySchedule::new(Instant::now(), TABLE_VERIFY_INTERVAL),
@@ -762,11 +764,14 @@ impl Daemon {
             }
             Err(NfqError::Io(err)) if would_block(&err) => {}
             Err(err) => {
-               warn!(
-                  "NFQUEUE {} receive failed: {err}",
-                  self.config.queue_num
-               );
                self.queue_drops = self.queue_drops.saturating_add(1);
+               if self.queue_warn.due(Instant::now()) {
+                  warn!(
+                     "NFQUEUE {} receive failed: {err} ({} failed receive(s) so far; a full queue drops \
+                      packets, see queue_drops)",
+                     self.config.queue_num, self.queue_drops
+                  );
+               }
             }
          }
 
@@ -1905,6 +1910,34 @@ impl<K: Eq + Hash> KeyLimiter<K> {
          }
       }
       self.last.insert(key, now);
+      true
+   }
+}
+
+/// How often a queue receive failure may reach the journal.
+const QUEUE_WARN_GAP: Duration = Duration::from_secs(5);
+
+/// A one-line-per-gap log gate for an event that has no useful key.
+///
+/// A queue overflow arrives in bursts, one failed receive per burst, so keying it would buy nothing:
+/// the first line names the cause and every later one is noise at exactly the moment the journal is
+/// most needed. The count still rises, and `StatusInfo::queue_drops` publishes it.
+struct WarnGate {
+   last: Option<Instant>,
+   gap: Duration,
+}
+
+impl WarnGate {
+   fn new(gap: Duration) -> Self {
+      Self { last: None, gap }
+   }
+
+   /// Whether an event at `now` should be logged.
+   fn due(&mut self, now: Instant) -> bool {
+      if self.last.is_some_and(|last| now.duration_since(last) < self.gap) {
+         return false;
+      }
+      self.last = Some(now);
       true
    }
 }
@@ -4014,6 +4047,24 @@ mod tests {
          Revoke::Exe(std::path::PathBuf::from(
             "/usr/lib/firefox/firefox"
          ))
+      );
+   }
+
+   #[test]
+   fn a_queue_warning_is_logged_once_per_gap() {
+      let mut gate = WarnGate::new(Duration::from_secs(5));
+      let start = Instant::now();
+      assert!(
+         gate.due(start),
+         "the first failure is always named"
+      );
+      assert!(
+         !gate.due(start + Duration::from_millis(4_999)),
+         "a second failure inside the gap stays in the count, not in the journal"
+      );
+      assert!(
+         gate.due(start + Duration::from_secs(5)),
+         "the gap is closed after five seconds"
       );
    }
 }
