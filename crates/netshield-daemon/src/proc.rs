@@ -3979,4 +3979,75 @@ mod tests {
          "an image younger than the socket must not answer from the flow cache"
       );
    }
+
+   #[test]
+   fn a_cached_flow_the_table_no_longer_names_is_not_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_003),
+         v4([192, 0, 2, 9], 443),
+      );
+      let now = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 4242,
+            at: now,
+         },
+      );
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now, &[7777]),
+         None,
+         "a tuple whose socket the kernel no longer reports must not answer from the flow cache"
+      );
+      assert!(attributor.flow_owners.is_empty());
+   }
+
+   #[test]
+   fn a_cached_flow_the_table_still_names_is_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_004),
+         v4([192, 0, 2, 9], 443),
+      );
+      let now = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 4242,
+            at: now,
+         },
+      );
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now, &[11, 4242]),
+         Some((1234, 1000)),
+         "a candidate list that still names the inode answers"
+      );
+   }
 }
