@@ -871,7 +871,20 @@ impl Attributor {
       // evidence: it is only ever written from a real /proc scan, and a disagreement with the
       // packet's uid already drops it.
       match self.cached_owner(entry.inode, uid) {
-         Some((pid, owner_uid, _)) if pid == entry.pid && owner_uid == entry.uid => {
+         Some((pid, owner_uid, created)) if pid == entry.pid && owner_uid == entry.uid => {
+            // The same comparison `attribute_scanned` makes, and it belongs here too: every later
+            // packet of this tuple answers from this cache, so leaving it out confined the
+            // exec-after-connect refusal to a flow's first packet. A miss here falls through to a
+            // real lookup, which re-runs the check and turns it into `Unknown`.
+            if let Some(identity) = self.cached_identity(entry.pid)
+               && identity.uid == entry.uid
+               && let (Some(created), Some(image_started)) = (created, identity.image_started)
+               && image_started > created + SLACK
+            {
+               self.warn_exec_after_connect(entry.pid, &identity.exe, now);
+               self.flow_owners.remove(&flow);
+               return None;
+            }
             Some((entry.pid, entry.uid))
          }
          _ => {
@@ -3841,6 +3854,53 @@ mod tests {
       assert!(
          attributor.cached_identity(pid).is_none(),
          "the stale entry is forgotten, so the next attribution reads /proc fresh"
+      );
+   }
+
+   #[test]
+   fn a_cached_flow_whose_image_postdates_the_socket_is_not_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_002),
+         v4([192, 0, 2, 9], 443),
+      );
+      let start = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 5555,
+            at: start,
+         },
+      );
+      // The pid still holds the inode, but its image started after the socket existed: the flow
+      // was opened by a previous image and must not inherit this one's rules.
+      attributor.inode_to_pid.insert(
+         5555,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: Some(SystemTime::now() - StdDuration::from_secs(60)),
+            at: start,
+         },
+      );
+      attributor.process_cache.lock().expect("process cache").insert(
+         1234,
+         CachedIdentity {
+            exe: Some(PathBuf::from("/usr/bin/allowed")),
+            comm: "allowed".to_owned(),
+            uid: 1000,
+            starttime: 1,
+            image_started: Some(SystemTime::now()),
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), start),
+         None,
+         "an image younger than the socket must not answer from the flow cache"
       );
    }
 }
