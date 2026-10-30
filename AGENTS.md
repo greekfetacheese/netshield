@@ -29,8 +29,10 @@ which phase is current.
    invariant, and the module keeps its inputs bounds-checked before it is reached.
 5. **Never `cargo fmt` workspace-wide.** Format touched files only:
    `rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true <file>`
-6. **Never `--profile prod`.** Debug for `cargo check`/`cargo test`, `--release` when
-   asked.
+6. **`--profile prod` is for a user's source install, not for agents.** It is what the
+   README installs from (`cargo build --profile prod`, fat LTO + `codegen-units = 1`,
+   ~5 min cold). Agents build for testing with `--release`; debug for
+   `cargo check`/`cargo test`. Never `--profile prod` in an agent round.
 7. **Test scope:** the crate you touched (`cargo test -p netshield-core`), never
    `--workspace`, unless the brief says otherwise.
 8. **Parsers must be panic-free on hostile input.** Every byte offset in `packet.rs`,
