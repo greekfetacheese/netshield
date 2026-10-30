@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use log::debug;
+use log::{debug, info};
 
 /// Size of `struct nlmsghdr`, included in `nlmsg_len`.
 pub(crate) const NLMSG_HDRLEN: usize = 16;
@@ -26,6 +26,13 @@ pub(crate) const NLMSG_HDRLEN: usize = 16;
 /// Receive buffer size: 128 KiB, comfortably above a 64 KiB datagram plus its metadata,
 /// so a queued packet that arrives mid-handshake is not truncated and lost.
 pub(crate) const RECV_BUF_LEN: usize = 128 * 1024;
+
+/// Receive buffer requested for a queue's netlink socket.
+///
+/// The kernel caps this at `net.core.rmem_max` (4 MiB on a stock box) and `getsockopt` reports the
+/// value it was given, not the double it actually allocates. A queued packet costs ~768 bytes of socket
+/// memory, so the kernel's 208 KiB default is a few hundred packets of headroom.
+pub(crate) const RECV_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 
 /// The kernel reports success and failure of a request through this message type.
 pub(crate) const NLMSG_ERROR: u16 = 2;
@@ -88,6 +95,18 @@ impl NetlinkSocket {
       };
       if bound < 0 {
          return Err(io::Error::last_os_error());
+      }
+      // A packet that will not fit in the socket's receive buffer is dropped and reported as
+      // `ENOBUFS` on the next receive — that is the "No buffer space available" line a torrent client's
+      // peer burst produces. The kernel's default buffer holds a few hundred packets; ask for what the
+      // machine allows and log what was actually granted, because a kernel capped below the request is
+      // the case where this silently does nothing. Not fatal: an unsized buffer is the behaviour this
+      // replaces, and refusing to start a firewall over a socket-tuning hint would be worse.
+      match set_receive_buffer(fd.as_raw_fd()) {
+         Ok(effective) => info!(
+            "netlink receive buffer: asked for {RECV_BUFFER_BYTES} bytes, kernel granted {effective}"
+         ),
+         Err(err) => debug!("could not size the netlink receive buffer: {err}"),
       }
       Ok(Self {
          fd,
@@ -298,6 +317,45 @@ pub fn peer_creds(fd: std::os::fd::RawFd) -> io::Result<PeerCred> {
 /// need the pid.
 pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
    Ok(peer_creds(fd)?.uid)
+}
+
+/// Asks for the largest receive buffer the kernel will grant, returning the effective size.
+///
+/// Split from [`NetlinkSocket::open`] and given a raw descriptor so a test can prove the option took
+/// effect on a socket of its own, without a privileged queue.
+fn set_receive_buffer(raw: libc::c_int) -> io::Result<i32> {
+   let size = RECV_BUFFER_BYTES;
+   // SAFETY: `raw` is a descriptor the caller owns and keeps open for the call; the option value is a
+   // live `c_int` whose address is valid for the call, and the kernel only reads it.
+   let set = unsafe {
+      libc::setsockopt(
+         raw,
+         libc::SOL_SOCKET,
+         libc::SO_RCVBUF,
+         (&size as *const libc::c_int).cast(),
+         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+      )
+   };
+   if set < 0 {
+      return Err(io::Error::last_os_error());
+   }
+   let mut effective: libc::c_int = 0;
+   let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+   // SAFETY: `raw` is the same live descriptor, and `effective`/`len` are a `c_int` and its size that
+   // the kernel writes into; both outlive the call.
+   let got = unsafe {
+      libc::getsockopt(
+         raw,
+         libc::SOL_SOCKET,
+         libc::SO_RCVBUF,
+         (&mut effective as *mut libc::c_int).cast(),
+         &mut len,
+      )
+   };
+   if got < 0 {
+      return Err(io::Error::last_os_error());
+   }
+   Ok(effective)
 }
 
 /// Builds one netlink datagram: header, then the caller's payload.
@@ -534,5 +592,49 @@ mod tests {
          0
       );
       assert_eq!(&datagram[16..], &[1, 2, 3]);
+   }
+
+   /// The receive buffer a queue's socket ends up with must be the one the box can grant, not the
+   /// kernel default — the default holds a few hundred queued packets and a peer burst overflows it.
+   #[test]
+   fn the_netlink_receive_buffer_is_raised_above_the_default() {
+      // A bare netlink socket: `setsockopt` needs no privilege and this never joins a queue.
+      // SAFETY: constant arguments; the descriptor is the only resource created and is checked.
+      let raw = unsafe {
+         libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_NETFILTER,
+         )
+      };
+      assert!(
+         raw >= 0,
+         "a netlink socket must open unprivileged"
+      );
+      // SAFETY: `raw` is the live descriptor above; the kernel only writes the two out-parameters.
+      let mut default_size: libc::c_int = 0;
+      let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+      let read = unsafe {
+         libc::getsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&mut default_size as *mut libc::c_int).cast(),
+            &mut len,
+         )
+      };
+      assert_eq!(
+         read, 0,
+         "reading the default receive buffer must succeed"
+      );
+
+      let effective = set_receive_buffer(raw).expect("the option must be applied");
+      assert!(
+         effective > default_size,
+         "asked for {RECV_BUFFER_BYTES}, the default was {default_size}, got {effective}"
+      );
+
+      // SAFETY: `raw` is still owned here and closed exactly once.
+      unsafe { libc::close(raw) };
    }
 }
