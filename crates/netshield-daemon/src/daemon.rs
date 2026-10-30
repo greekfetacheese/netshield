@@ -1567,8 +1567,9 @@ impl Daemon {
       }
       self.multicast_logged.insert(app.clone());
       info!(
-         "allowing multicast traffic from {app} without a prompt: {} cannot be attributed \
-          (the local port is shared with other uids), and it cannot leave the link",
+         "allowing link-local multicast from {app} without a prompt: {} cannot be attributed \
+          (the local port is shared with other uids) and a link-local group is not routed \
+          off this link",
          connection.remote.addr
       );
    }
@@ -1791,6 +1792,24 @@ enum Unmatched {
    AllowMulticast,
 }
 
+/// Which multicast groups cannot be routed off this link.
+///
+/// `IpAddr::is_multicast` covers every group, and some of those are routable: `239.0.0.0/8` is
+/// administratively scoped, and IPv6 `ff05::/16` (site) and `ff0e::/16` (global) are scoped wider than
+/// the link by definition. Allowing those without a prompt hands every application a rule-free egress
+/// path, so only the link-local ranges do — `224.0.0.0/24` (mDNS, SSDP, LLMNR) and IPv6 scope 1 and 2,
+/// `ff01::/16` and `ff02::/16`. Anything else is an ordinary destination and goes through a prompt.
+fn is_link_local_multicast(addr: IpAddr) -> bool {
+   match addr {
+      IpAddr::V4(addr) => {
+         let octets = addr.octets();
+         octets[0] == 224 && octets[1] == 0 && octets[2] == 0
+      }
+      // `ff0s::/16`: the low nibble of the second byte is the scope field.
+      IpAddr::V6(addr) => addr.is_multicast() && matches!(addr.segments()[0] & 0x000f, 1 | 2),
+   }
+}
+
 /// Decides an unmatched flow from what attribution learned and the owner's settings.
 fn unmatched(
    connection: &Connection,
@@ -1802,7 +1821,7 @@ fn unmatched(
    if mode == Mode::Silent {
       return Unmatched::Prompt;
    }
-   if connection.remote.addr.is_multicast() {
+   if is_link_local_multicast(connection.remote.addr) {
       return Unmatched::AllowMulticast;
    }
    match (missing, config.unattributable_closed_flow) {
@@ -2817,8 +2836,8 @@ mod tests {
             Mode::Alert,
             Unmatched::Prompt,
          ),
-         // Even with the socket gone and the fail-closed default: a multicast destination is
-         // unattributable in principle and cannot leave the link.
+         // Even with the socket gone and the fail-closed default: a link-local multicast
+         // destination is unattributable in principle and is not routed off this link.
          (
             "224.0.0.251",
             5353,
@@ -2834,6 +2853,23 @@ mod tests {
             Config::default(),
             Mode::Alert,
             Unmatched::AllowMulticast,
+         ),
+         // A group scoped wider than the link is an ordinary destination: a live flow asks.
+         (
+            "239.255.255.250",
+            1900,
+            None,
+            Config::default(),
+            Mode::Alert,
+            Unmatched::Prompt,
+         ),
+         (
+            "ff05::1",
+            1900,
+            None,
+            Config::default(),
+            Mode::Alert,
+            Unmatched::Prompt,
          ),
          // `Prompt` is what auto-allows in silent mode, so the closed-flow default must not
          // bypass silent mode's contract.
@@ -2855,6 +2891,27 @@ mod tests {
             ),
             expected,
             "{remote}:{port} with {missing:?} in {mode:?} must be {expected:?}"
+         );
+      }
+   }
+
+   #[test]
+   fn only_link_local_groups_are_allowed_without_a_question() {
+      for (addr, link_local) in [
+         ("224.0.0.1", true),        // all-hosts
+         ("224.0.0.251", true),      // mDNS
+         ("ff01::1", true),          // interface-local
+         ("ff02::fb", true),         // mDNSv6
+         ("239.255.255.250", false), // SSDP, administratively scoped and routable
+         ("ff05::1", false),         // site scope
+         ("ff0e::1", false),         // global scope
+         ("203.0.113.5", false),     // not multicast at all
+      ] {
+         let addr: IpAddr = addr.parse().expect("an address");
+         assert_eq!(
+            is_link_local_multicast(addr),
+            link_local,
+            "{addr}"
          );
       }
    }
