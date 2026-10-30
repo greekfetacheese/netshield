@@ -293,6 +293,7 @@ pub struct Attributor {
    pid_fds: HashMap<u32, FdCacheEntry>,
    flow_owners: HashMap<FlowKey, FlowCacheEntry>,
    flow_misses: HashMap<FlowKey, MissMarker>,
+   last_owner: HashMap<u32, u32>,
    miss_streaks: HashMap<MissKey, MissStreak>,
    stats: AttributeStats,
    /// Whether the last scan could not see every descriptor it needed to.
@@ -437,6 +438,7 @@ impl Attributor {
          pid_fds: HashMap::new(),
          flow_owners: HashMap::new(),
          flow_misses: HashMap::new(),
+         last_owner: HashMap::new(),
          miss_streaks: HashMap::new(),
          stats: AttributeStats::default(),
          scan_incomplete: false,
@@ -1266,11 +1268,20 @@ impl Attributor {
    /// reader so the cache/refresh behaviour can be exercised without a live `/proc`.
    fn scan_pids_for_inode(
       &mut self,
-      pids: Vec<u32>,
+      mut pids: Vec<u32>,
       inode: u32,
       uid: Option<u32>,
       mut read_inodes: impl FnMut(u32) -> Result<Vec<SocketInode>, ScanError>,
    ) -> Option<(u32, u32, Option<SystemTime>)> {
+      // The process that owned this uid's last flow is the likeliest owner of the next one — a torrent
+      // client or a browser opens every new socket from the same pid — and it is not near the newest end
+      // of the newest-first order. Order is a heuristic here: a positive is still a real descriptor at
+      // that pid, and a negative is still whatever the batch snapshot says it is.
+      if let Some(last) = uid.and_then(|uid| self.last_owner.get(&uid).copied())
+         && let Some(position) = pids.iter().position(|pid| *pid == last)
+      {
+         pids.swap(0, position);
+      }
       if pids.len() > MAX_PIDS {
          self.budget_exhausted(&format!(
             "pid scan would examine {} processes (budget {MAX_PIDS})",
@@ -1339,6 +1350,9 @@ impl Attributor {
             },
          );
          if let Some((fd, created)) = hit {
+            if let Some(uid) = uid {
+               self.last_owner.insert(uid, pid);
+            }
             // Deferred by `read_fd_dir`: one statx for the descriptor that matched, and none for the
             // descriptors that did not.
             return Some((
@@ -3963,6 +3977,66 @@ mod tests {
          owner.map(|(pid, uid, _)| (pid, uid)),
          Some((pid, uid)),
          "the scan must find an owner that is last in an untrimmed pid list"
+      );
+   }
+
+   #[test]
+   fn the_pid_that_owned_the_last_flow_is_scanned_first() {
+      const FIRST_INODE: u32 = 987_654;
+      const SECOND_INODE: u32 = 987_655;
+      let sleepers = Sleepers(sleepers());
+      let uid = own_uid();
+      let owner_pid = std::process::id();
+      let mut pids: Vec<u32> = sleepers.0.iter().map(Child::id).collect();
+      pids.push(owner_pid);
+      assert!(
+         pids.len() >= 2,
+         "the test needs a pid before the owner for the order to be observable"
+      );
+      let mut attributor = Attributor::new();
+
+      // The first flow teaches the attributor which pid owns this uid's sockets.
+      let owner = attributor.scan_pids_for_inode(pids.clone(), FIRST_INODE, Some(uid), |scanned| {
+         if scanned == owner_pid {
+            Ok(vec![SocketInode {
+               inode: FIRST_INODE,
+               fd: 1,
+               created: Some(at(0)),
+            }])
+         } else {
+            Ok(Vec::new())
+         }
+      });
+      assert_eq!(
+         owner.map(|(pid, _, _)| pid),
+         Some(owner_pid),
+         "the first flow is found at the owning pid"
+      );
+
+      // The next flow is a different socket from the same process, so the descriptor snapshot cannot
+      // answer it and the pid order is what decides how many directories this scan reads.
+      let mut second = Vec::new();
+      let owner = attributor.scan_pids_for_inode(pids, SECOND_INODE, Some(uid), |scanned| {
+         second.push(scanned);
+         if scanned == owner_pid {
+            Ok(vec![SocketInode {
+               inode: SECOND_INODE,
+               fd: 2,
+               created: Some(at(1)),
+            }])
+         } else {
+            Ok(Vec::new())
+         }
+      });
+      assert_eq!(
+         owner.map(|(pid, _, created)| (pid, created)),
+         Some((owner_pid, Some(at(1)))),
+         "the new socket is found where the last flow was found"
+      );
+      assert_eq!(
+         second,
+         vec![owner_pid],
+         "the pid that owned the last flow is examined before any other"
       );
    }
 
