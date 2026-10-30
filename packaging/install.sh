@@ -99,7 +99,12 @@ install_config() {
    fi
 
    if [ -e "$CONFIG_FILE" ]; then
-      note "keeping existing $CONFIG_FILE"
+      note "updating $CONFIG_FILE: adding any key this version needs"
+      if [ "$DRY_RUN" -eq 1 ]; then
+         "$SCRIPT_DIR/merge-config.sh" --dry-run "$CONFIG_FILE" "$PREFIX"
+      else
+         "$SCRIPT_DIR/merge-config.sh" "$CONFIG_FILE" "$PREFIX"
+      fi
       return
    fi
 

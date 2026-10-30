@@ -352,6 +352,7 @@ impl Daemon {
          queue_num: self.config.queue_num,
          queue_drops: self.queue_drops,
          table_verified: self.table_verified,
+         mutation_gated: self.config.gui_path.is_some(),
          started_at: self.started_at,
       }
    }
@@ -729,8 +730,8 @@ impl Daemon {
             info!("shutdown signal received; stopping");
             let stats = self.attributor.stats();
             info!(
-               "attribution: {} flows came from the send registry ({} misses, {} refused), \
-                {} scans still found nothing",
+               "attribution: the send registry named a sender for {} flows without changing the \
+                verdict ({} misses, {} refused), {} scans still found nothing",
                stats.registry_hits, stats.registry_misses, stats.registry_refusals, stats.misses
             );
             return;
@@ -799,7 +800,37 @@ impl Daemon {
                );
                self.publish_status();
             }
+            // Nothing else puts the table back: a flush, a foreign `nft` edit, or a failed
+            // install at startup leaves the machine unfiltered until the daemon restarts, and a
+            // restart is a 2 s window with no queue bound — which the kernel accepts. So the
+            // check that notices the table is gone is also the one that repairs it.
+            self.reinstall_table();
          }
+      }
+   }
+
+   /// Puts the table back after a failed verify.
+   ///
+   /// `force` is the right flag here and the only difference from a first install: a table that
+   /// exists but does not verify is exactly the case this handles, and [`firewall::install`]
+   /// deletes it before writing, so a rewritten table is replaced rather than reported as a
+   /// second instance. The attempt is bounded by [`TABLE_VERIFY_INTERVAL`] because only
+   /// [`Self::verify_table`] calls this, so a broken `nft` costs one fork per interval, never one
+   /// per packet. A failed attempt stays at `debug!`: the transition already logged the
+   /// operator-facing error, and repeating it every 30 s would bury it.
+   fn reinstall_table(&mut self) {
+      let table = self.config.table_name().to_owned();
+      let queue = self.config.queue_num;
+      let dns_queue = self.config.dns_queue_num;
+      let result = firewall::install(&table, queue, dns_queue, false, true)
+         .and_then(|()| firewall::verify(&table, queue, dns_queue));
+      match result {
+         Ok(()) => {
+            self.table_verified = true;
+            info!("table inet {table} was reinstalled after a failed verify; enforcement resumed");
+            self.publish_status();
+         }
+         Err(err) => debug!("could not reinstall table inet {table}: {err}"),
       }
    }
 
@@ -1961,6 +1992,11 @@ fn would_block(err: &std::io::Error) -> bool {
 /// per-destination answer, and only an explicit `AnyConnection` may produce
 /// `DestMatcher::Any`.
 fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rule> {
+   // An unattributed prompt must never become an app-wide rule: `AppMatcher::Unknown` over
+   // `DestMatcher::Any` would allow every unattributed flow on the machine. The alert does not
+   // offer that row, but this request is the only thing between a bug (or a hostile client) and
+   // that rule, so the daemon narrows it too.
+   let decide = narrow_unattributed_scope(record, decide);
    match &decide.scope {
       ScopeChoice::TheseDestinations => record
          .dests
@@ -1980,10 +2016,34 @@ fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rul
       // A group that sends `Domain` or `Address` is honoured as one rule: the client asked
       // for it explicitly, and a single-destination prompt must keep its old shape.
       _ => match record.first() {
-         Some(dest) => vec![rule_for(&dest.connection, decide, now)],
+         Some(dest) => vec![rule_for(&dest.connection, &decide, now)],
          None => Vec::new(),
       },
    }
+}
+
+/// Narrows an app-wide answer on an unattributed prompt to the one address it reached.
+///
+/// The alert never offers the app-wide row for an unattributed flow, because with
+/// `AppMatcher::Unknown` that rule would allow every unattributed flow rather than this
+/// application. A request that asks for it anyway is honoured at the narrowest scope instead of
+/// refused: the user's action still applies to the flow they were looking at.
+fn narrow_unattributed_scope(record: &PromptRecord, decide: &DecideRequest) -> DecideRequest {
+   let unattributed = record
+      .first()
+      .is_some_and(|dest| matches!(dest.connection.process, Attribution::Unknown));
+   if unattributed && decide.scope == ScopeChoice::AnyConnection {
+      warn!(
+         "prompt {} is unattributed, so an app-wide answer would cover every unknown flow; \
+          scoping the rule to the address it reached",
+         record.id
+      );
+      return DecideRequest {
+         scope: ScopeChoice::Address,
+         ..decide.clone()
+      };
+   }
+   decide.clone()
 }
 
 /// The scope one destination of a `TheseDestinations` answer uses: its learned domain when
@@ -2596,6 +2656,47 @@ mod tests {
             "{net:?} must not cover the neighbouring address {neighbour}"
          );
       }
+   }
+
+   #[test]
+   fn an_unattributed_prompt_is_never_answered_app_wide() {
+      let start = Instant::now();
+      let mut pending = PendingPrompts::new();
+      let id = pending
+         .open(
+            unmatched_connection("198.51.100.20", 443),
+            10,
+            Duration::from_secs(30),
+            start,
+         )
+         .id();
+      let record = pending.resolve(id).expect("open").record;
+      assert!(
+         matches!(
+            record.first().expect("a destination").connection.process,
+            Attribution::Unknown
+         ),
+         "the fixture must be an unattributed prompt"
+      );
+      let decide = DecideRequest {
+         prompt_id: 1,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope: ScopeChoice::AnyConnection,
+      };
+
+      let rules = rules_for(&record, &decide, 0);
+
+      assert_eq!(rules.len(), 1);
+      assert!(
+         matches!(rules[0].app, AppMatcher::Unknown),
+         "the app scope is unchanged"
+      );
+      assert!(
+         matches!(rules[0].dest, DestMatcher::Ip(_)),
+         "an unattributed answer must be address-scoped, got {:?}",
+         rules[0].dest
+      );
    }
 
    /// A connection to `remote:port`, for the unmatched-flow decision tests.

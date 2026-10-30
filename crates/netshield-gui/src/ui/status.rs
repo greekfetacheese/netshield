@@ -50,6 +50,11 @@ pub fn unfiltered_warning(status: &StatusInfo) -> bool {
    !status.table_verified
 }
 
+/// Whether the page must say that rule changes are not restricted to the GUI.
+pub fn ungated_mutations(status: &StatusInfo) -> bool {
+   !status.mutation_gated
+}
+
 /// Draws the warning bar, the daemon details grid and the privilege note.
 pub fn show(ui: &mut Ui, status: Option<&StatusInfo>, now: u64) {
    ui.heading("Status");
@@ -87,6 +92,21 @@ pub fn show(ui: &mut Ui, status: Option<&StatusInfo>, now: u64) {
          None,
       );
       field(ui, "Mode", mode_label(status.mode), None);
+      if ungated_mutations(status) {
+         field(
+            ui,
+            "Rule changes",
+            "Any process of your user",
+            Some(ALERT_RED),
+         );
+      } else {
+         field(
+            ui,
+            "Rule changes",
+            "Only the configured GUI",
+            None,
+         );
+      }
       field(ui, "Rules", &status.rule_count.to_string(), None);
       field(
          ui,
@@ -155,6 +175,7 @@ mod tests {
          queue_num: 0,
          queue_drops: 0,
          table_verified: false,
+         mutation_gated: true,
          started_at: 100,
       };
       assert!(unfiltered_warning(&status));
@@ -162,5 +183,26 @@ mod tests {
          table_verified: true,
          ..status
       }));
+   }
+
+   #[test]
+   fn the_rule_change_row_follows_the_mutation_gate() {
+      let mut status = StatusInfo {
+         daemon_pid: 99,
+         mode: Mode::Alert,
+         rule_count: 4,
+         pending_prompts: 1,
+         queue_num: 0,
+         queue_drops: 0,
+         table_verified: true,
+         mutation_gated: true,
+         started_at: 100,
+      };
+      assert!(!ungated_mutations(&status));
+      status.mutation_gated = false;
+      assert!(
+         ungated_mutations(&status),
+         "an ungated control socket must be visible"
+      );
    }
 }

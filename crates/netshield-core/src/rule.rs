@@ -291,6 +291,24 @@ pub fn rule_from_scope(id: RuleId, app: AppMatcher, scope: &ScopeRequest, now: u
    }
 }
 
+/// Why a rule from the control socket is refused, or `None` when it may be accepted.
+///
+/// The socket may express everything a prompt's answer can produce and nothing more. A rule that
+/// governs every application *and* every destination is not a scope any prompt offers — the alert
+/// drops the app-wide row for an unattributed flow for exactly this reason — and accepting one would
+/// turn a single request into a silent allow-all that also survives a restart. The rules store can
+/// still hold such a rule when the owner edits it in deliberately.
+pub fn socket_rule_refusal(rule: &Rule) -> Option<&'static str> {
+   let every_app = matches!(rule.app, AppMatcher::Any | AppMatcher::Unknown);
+   match (every_app, &rule.dest) {
+      (true, DestMatcher::Any) => Some(
+         "a rule for every application and every destination is not accepted over the control \
+          socket; add it to the rules store deliberately",
+      ),
+      _ => None,
+   }
+}
+
 /// Why a raw hostname could not be normalized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleError {
@@ -797,6 +815,61 @@ mod tests {
             ..conn()
          }),
          "an entry that matches alone cannot make the set match"
+      );
+   }
+
+   #[test]
+   fn a_rule_for_every_app_and_destination_is_refused() {
+      for app in [AppMatcher::Any, AppMatcher::Unknown] {
+         let rule = rule_from_scope(
+            RuleId::new_unique(),
+            app.clone(),
+            &ScopeRequest {
+               action: Action::Allow,
+               duration: Duration::Forever,
+               dest: DestMatcher::Any,
+            },
+            0,
+         );
+         assert!(
+            socket_rule_refusal(&rule).is_some(),
+            "{app:?} over any destination must be refused"
+         );
+      }
+   }
+
+   #[test]
+   fn a_narrow_rule_is_accepted_from_the_socket() {
+      let exe = AppMatcher::Exe(PathBuf::from("/usr/bin/firefox"));
+      let any_dest = rule_from_scope(
+         RuleId::new_unique(),
+         exe.clone(),
+         &ScopeRequest {
+            action: Action::Allow,
+            duration: Duration::Forever,
+            dest: DestMatcher::Any,
+         },
+         0,
+      );
+      assert_eq!(
+         socket_rule_refusal(&any_dest),
+         None,
+         "one application over every destination is a prompt's own scope"
+      );
+      let any_app = rule_from_scope(
+         RuleId::new_unique(),
+         AppMatcher::Any,
+         &ScopeRequest {
+            action: Action::Deny,
+            duration: Duration::Session,
+            dest: DestMatcher::Ip("192.0.2.0/24".parse().expect("literal")),
+         },
+         0,
+      );
+      assert_eq!(
+         socket_rule_refusal(&any_app),
+         None,
+         "any application over one network is also offered"
       );
    }
 
