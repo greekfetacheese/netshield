@@ -307,6 +307,9 @@ pub struct Attributor {
    last_exec_warn: Option<Instant>,
    /// The kernel's record of recent senders, when the probe could be attached.
    senders: Option<Box<dyn SenderLookup>>,
+   /// Reads one socket descriptor's creation time. A field rather than a direct call, so the scan's
+   /// tests can supply a fake and stay offline.
+   created_of: fn(u32, u32) -> Option<SystemTime>,
    /// Socket tables read for the batch being decided, keyed by protocol and family.
    tables: HashMap<(L4Proto, Family), SocketTable>,
    /// The arrival time of the batch being decided. A snapshot taken at or after it is evidence for
@@ -353,8 +356,18 @@ struct FdCacheEntry {
    at: Instant,
 }
 
-/// One socket descriptor: the inode and, when the platform reports it, when it was created.
-type SocketInode = (u32, Option<SystemTime>);
+/// One socket descriptor found in a pid's descriptor directory.
+///
+/// `created` is `None` when the reader did not take it: one `symlink_metadata` per socket descriptor
+/// is 40 % of a 1500-descriptor directory read on this machine, and only the descriptor a flow
+/// actually matches ever needs the time. A caller that already knows it (the scan's own cache, or a
+/// test) fills it in, so a cache hit costs no syscall.
+#[derive(Clone, Copy, Debug)]
+struct SocketInode {
+   inode: u32,
+   fd: u32,
+   created: Option<SystemTime>,
+}
 
 /// A cached flow→owner answer.
 ///
@@ -430,6 +443,7 @@ impl Attributor {
          last_budget_warn: None,
          last_exec_warn: None,
          senders: None,
+         created_of: socket_created_at,
          tables: HashMap::new(),
          batch_arrived: None,
          table_buf: Vec::new(),
@@ -1269,6 +1283,7 @@ impl Attributor {
       // process of the packet's uid proved nothing about that uid, so it is not complete
       // even though it examined everything it was willing to look at.
       let mut examined = false;
+      let created_of = self.created_of;
       for pid in pids {
          if let Some((found, owner, created)) = self.cached_fd_lookup(pid, inode, uid) {
             if found {
@@ -1309,7 +1324,10 @@ impl Attributor {
                "descriptor scan of pid {pid} exceeded {MAX_FDS} entries"
             ));
          }
-         let hit = sockets.iter().find(|(held, _)| *held == inode).map(|(_, created)| *created);
+         let hit = sockets
+            .iter()
+            .find(|socket| socket.inode == inode)
+            .map(|socket| (socket.fd, socket.created));
          // A trimmed snapshot is cached too: a positive is a real descriptor at that pid,
          // and a negative stays only a hint that the next lookup refreshes.
          self.pid_fds.insert(
@@ -1320,8 +1338,14 @@ impl Attributor {
                at: Instant::now(),
             },
          );
-         if let Some(created) = hit {
-            return Some((pid, owner_uid, created));
+         if let Some((fd, created)) = hit {
+            // Deferred by `read_fd_dir`: one statx for the descriptor that matched, and none for the
+            // descriptors that did not.
+            return Some((
+               pid,
+               owner_uid,
+               created.or_else(|| created_of(pid, fd)),
+            ));
          }
          if over_budget {
             // The cut-off dropped descriptors this pid holds, so no other process can be
@@ -1351,6 +1375,7 @@ impl Attributor {
       inode: u32,
       packet_uid: Option<u32>,
    ) -> Option<(bool, u32, Option<SystemTime>)> {
+      let created_of = self.created_of;
       let entry = self.pid_fds.get(&pid)?;
       if entry.at.elapsed() >= CACHE_TTL {
          self.pid_fds.remove(&pid);
@@ -1359,17 +1384,20 @@ impl Attributor {
       if packet_uid.is_some_and(|wanted| entry.uid != wanted) {
          return None;
       }
-      let created = entry
-         .sockets
-         .iter()
-         .find(|(held, _)| *held == inode)
-         .map(|(_, created)| *created);
-      if created.is_none() && !self.batch_arrived.is_some_and(|arrived| entry.at >= arrived) {
-         // Taken before this packet arrived (or not in a batch at all): the socket may have been
-         // opened since, so this snapshot cannot rule it out. Refresh instead.
+      let Some(hit) = entry.sockets.iter().find(|socket| socket.inode == inode) else {
+         if self.batch_arrived.is_some_and(|arrived| entry.at >= arrived) {
+            // The snapshot was taken at or after this packet arrived, so the missing descriptor is
+            // proof: this pid does not hold the inode.
+            return Some((false, entry.uid, None));
+         }
+         // A snapshot this packet cannot use: the socket may have been opened since.
          return None;
-      }
-      Some((created.is_some(), entry.uid, created.flatten()))
+      };
+      // A positive answer carries the descriptor's creation time on this path too: the
+      // exec-after-connect check reads it wherever an owner is produced, so a snapshot that was read
+      // for another inode pays one statx here instead of losing the evidence.
+      let created = hit.created.or_else(|| created_of(pid, hit.fd));
+      Some((true, entry.uid, created))
    }
 
    /// Counts and rate-limits a budget-exhaustion warning.
@@ -1736,7 +1764,8 @@ pub fn live_flows(owner: FlowOwner<'_>) -> Vec<LiveFlow> {
          Err(ScanError::Budget(held)) => held,
          Err(ScanError::Unreadable) => continue,
       };
-      for (inode, _) in held {
+      for socket in held {
+         let inode = socket.inode;
          let Some((local, remote, proto)) = rows.get(&inode) else {
             continue;
          };
@@ -1969,11 +1998,12 @@ fn socket_inodes(pid: u32) -> Result<Vec<SocketInode>, ScanError> {
 /// cut actually applies. Split from [`socket_inodes`] so the ordering and the budget can
 /// be exercised on a directory the test controls instead of a live `/proc`.
 ///
-/// Each inode travels with the descriptor's creation time, read with `lstat` on exactly
-/// one link. On this kernel (`statx` reports no `STATX_BTIME` on a procfs descriptor link,
-/// and `lstat` returns the descriptor's `st_mtim` at creation) the link's `mtime` *is* the
-/// socket's creation time; when `created()` is unsupported the `modified()` fallback is
-/// the socket's birth, not the file's, so it is the same observation.
+/// Each inode travels with its descriptor number, and the creation time is left `None`: it is
+/// read with `lstat` by [`socket_created_at`], for the one descriptor a scan matches. On this
+/// kernel (`statx` reports no `STATX_BTIME` on a procfs descriptor link, and `lstat` returns the
+/// descriptor's `st_mtim` at creation) the link's `mtime` *is* the socket's creation time; when
+/// `created()` is unsupported the `modified()` fallback is the socket's birth, not the file's, so
+/// it is the same observation.
 fn read_fd_dir(path: PathBuf) -> Result<Vec<SocketInode>, ScanError> {
    let directory = fs::read_dir(&path).map_err(|_| ScanError::Unreadable)?;
    let mut names = Vec::new();
@@ -2004,16 +2034,24 @@ fn read_fd_dir(path: PathBuf) -> Result<Vec<SocketInode>, ScanError> {
    };
    let mut sockets = Vec::new();
    for name in names {
+      // A `/proc/<pid>/fd` entry is named by its descriptor number; a name that does not parse is
+      // not a descriptor link, so it costs no `readlink`. The budget above still counted every entry.
+      let Some(fd) = name.to_str().and_then(|name| name.parse::<u32>().ok()) else {
+         continue;
+      };
       let link = path.join(&name);
       let target = match fs::read_link(&link) {
          Ok(target) => target,
          // A descriptor closed between readdir and readlink.
          Err(_) => continue,
       };
-      if let Some(target) = target.to_str()
-         && let Some(inode) = socket_link_inode(target)
-      {
-         sockets.push((inode, socket_created(&link)));
+      if let Some(inode) = target.to_str().and_then(socket_link_inode) {
+         // The creation time is read by the scan, for the matching descriptor only.
+         sockets.push(SocketInode {
+            inode,
+            fd,
+            created: None,
+         });
       }
    }
    if over_budget {
@@ -2032,6 +2070,14 @@ fn read_fd_dir(path: PathBuf) -> Result<Vec<SocketInode>, ScanError> {
 fn socket_created(link: &Path) -> Option<SystemTime> {
    let meta = fs::symlink_metadata(link).ok()?;
    meta.created().or_else(|_| meta.modified()).ok()
+}
+
+/// Reads when one socket descriptor was created, for the descriptor a scan actually matched.
+///
+/// Split from [`read_fd_dir`] so a whole directory read stops paying a `statx` per socket
+/// descriptor: this is called with an inode and a descriptor number the scan has already matched.
+fn socket_created_at(pid: u32, fd: u32) -> Option<SystemTime> {
+   socket_created(&Path::new(PROC).join(pid.to_string()).join("fd").join(fd.to_string()))
 }
 
 /// Returns a directory entry's own modification time, without following a symlink.
@@ -3374,7 +3420,11 @@ mod tests {
       attributor.pid_fds.insert(
          pid,
          FdCacheEntry {
-            sockets: vec![(123, None)],
+            sockets: vec![SocketInode {
+               inode: 123,
+               fd: 1,
+               created: None,
+            }],
             uid,
             at: Instant::now(),
          },
@@ -3387,7 +3437,18 @@ mod tests {
             "the injected read is for our own pid"
          );
          reads += 1;
-         Ok(vec![(123, None), (inode, Some(at(0)))])
+         Ok(vec![
+            SocketInode {
+               inode: 123,
+               fd: 1,
+               created: None,
+            },
+            SocketInode {
+               inode,
+               fd: 1,
+               created: Some(at(0)),
+            },
+         ])
       });
       assert_eq!(
          owner,
@@ -3401,7 +3462,11 @@ mod tests {
       let cached = attributor.scan_pids_for_inode(vec![pid], inode, Some(uid), |scanned| {
          assert_eq!(scanned, pid);
          reads += 1;
-         Ok(vec![(inode, Some(at(0)))])
+         Ok(vec![SocketInode {
+            inode,
+            fd: 1,
+            created: Some(at(0)),
+         }])
       });
       assert_eq!(cached, Some((pid, uid, Some(at(0)))));
       assert_eq!(
@@ -3417,7 +3482,11 @@ mod tests {
       let owner = attributor.scan_pids_for_inode(vec![pid], 4242, Some(uid), |scanned| {
          assert_eq!(scanned, pid);
          reads += 1;
-         Ok(vec![(123, None)])
+         Ok(vec![SocketInode {
+            inode: 123,
+            fd: 1,
+            created: None,
+         }])
       });
       assert_eq!(owner, None);
       assert_eq!(
@@ -3662,11 +3731,11 @@ mod tests {
       }
       // A `/proc/<pid>/fd` socket link is a symlink to `socket:[<inode>]`; the ordering
       // reads the link's own time, so the target need not exist.
-      std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("fd-socket"))
+      std::os::unix::fs::symlink(format!("socket:[{inode}]"), dir.join("9"))
          .expect("create the socket link");
       // Timestamps are taken from the filesystem, so make the gap unambiguous rather than
       // relying on two writes landing in the same clock tick.
-      let socket_link = dir.join("fd-socket");
+      let socket_link = dir.join("9");
       let newest = fs::symlink_metadata(&socket_link)
          .expect("read the socket link")
          .modified()
@@ -3716,7 +3785,7 @@ mod tests {
       for (index, inode) in inodes.iter().enumerate() {
          std::os::unix::fs::symlink(
             format!("socket:[{inode}]"),
-            dir.join(format!("fd-{index}")),
+            dir.join(index.to_string()),
          )
          .expect("create the socket link");
       }
@@ -3726,7 +3795,7 @@ mod tests {
       };
       // Readdir order is the filesystem's, not creation order; the point is that no entry
       // is dropped and no age is consulted to pick the survivors.
-      let mut scanned: Vec<u32> = scanned.into_iter().map(|(inode, _)| inode).collect();
+      let mut scanned: Vec<u32> = scanned.into_iter().map(|socket| socket.inode).collect();
       scanned.sort_unstable();
       assert_eq!(
          scanned, inodes,
@@ -3738,6 +3807,55 @@ mod tests {
       );
 
       let _ = fs::remove_dir_all(&dir);
+   }
+
+   #[test]
+   fn only_the_matching_descriptor_pays_for_its_creation_time() {
+      const INODE: u32 = 4242;
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      // A fake that answers per descriptor number, so the value proves *which* descriptor was read.
+      attributor.created_of = |_, fd| (fd == 7).then(|| at(7));
+      let owner = attributor.scan_pids_for_inode(vec![pid], INODE, Some(uid), |_| {
+         Ok(vec![
+            SocketInode {
+               inode: 111,
+               fd: 3,
+               created: None,
+            },
+            SocketInode {
+               inode: INODE,
+               fd: 7,
+               created: None,
+            },
+         ])
+      });
+      assert_eq!(
+         owner,
+         Some((pid, uid, Some(at(7)))),
+         "the matched descriptor's own creation time is read, and it is the only one read"
+      );
+   }
+
+   #[test]
+   fn a_scan_that_finds_nothing_reads_no_creation_time() {
+      fn never(_: u32, _: u32) -> Option<SystemTime> {
+         panic!("a descriptor that did not match must not pay for a creation time");
+      }
+
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      attributor.created_of = never;
+      let owner = attributor.scan_pids_for_inode(vec![pid], 987_654, Some(uid), |_| {
+         Ok(vec![SocketInode {
+            inode: 4242,
+            fd: 3,
+            created: Some(at(0)),
+         }])
+      });
+      assert_eq!(owner, None, "no descriptor holds the inode");
    }
 
    /// Three children of the test process, so `/proc/<pid>` is readable and behaves as
@@ -3821,9 +3939,24 @@ mod tests {
       let mut attributor = Attributor::new();
       let owner = attributor.scan_pids_for_inode(pids, inode, Some(uid), |scanned| {
          if scanned == pid {
-            Ok(vec![(123, None), (inode, Some(at(0)))])
+            Ok(vec![
+               SocketInode {
+                  inode: 123,
+                  fd: 1,
+                  created: None,
+               },
+               SocketInode {
+                  inode,
+                  fd: 1,
+                  created: Some(at(0)),
+               },
+            ])
          } else {
-            Ok(vec![(123, None)])
+            Ok(vec![SocketInode {
+               inode: 123,
+               fd: 1,
+               created: None,
+            }])
          }
       });
       assert_eq!(
@@ -3923,7 +4056,11 @@ mod tests {
       seed_live_identity(&attributor, pid, Some(SystemTime::now()));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
-            Ok(vec![(inode, Some(socket_created))])
+            Ok(vec![SocketInode {
+               inode,
+               fd: 1,
+               created: Some(socket_created),
+            }])
          })
          .expect("the fake reader holds the inode");
       let (owner_pid, owner_uid, created) = owner;
@@ -3954,7 +4091,11 @@ mod tests {
       let exe = seed_live_identity(&attributor, pid, Some(image_started));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
-            Ok(vec![(inode, Some(socket_created))])
+            Ok(vec![SocketInode {
+               inode,
+               fd: 1,
+               created: Some(socket_created),
+            }])
          })
          .expect("the fake reader holds the inode");
       let (owner_pid, owner_uid, created) = owner;
@@ -3988,10 +4129,15 @@ mod tests {
       let inode = 987_654u32;
       let mut attributor = Attributor::new();
       // A missing observation must never become an accusation, even when the image is new.
+      attributor.created_of = |_, _| None;
       seed_live_identity(&attributor, pid, Some(SystemTime::now()));
       let owner = attributor
          .scan_pids_for_inode(vec![pid], inode, Some(uid), |_| {
-            Ok(vec![(inode, None)])
+            Ok(vec![SocketInode {
+               inode,
+               fd: 1,
+               created: None,
+            }])
          })
          .expect("the fake reader holds the inode");
       let (owner_pid, owner_uid, created) = owner;
@@ -4454,7 +4600,11 @@ mod tests {
       attributor.pid_fds.insert(
          pid,
          FdCacheEntry {
-            sockets: vec![(123, None)],
+            sockets: vec![SocketInode {
+               inode: 123,
+               fd: 1,
+               created: None,
+            }],
             uid,
             at: snapshot,
          },
@@ -4464,7 +4614,11 @@ mod tests {
       let mut reads = 0u32;
       let owner = attributor.scan_pids_for_inode(vec![pid], 987_654, Some(uid), |_| {
          reads += 1;
-         Ok(vec![(123, None)])
+         Ok(vec![SocketInode {
+            inode: 123,
+            fd: 1,
+            created: None,
+         }])
       });
       assert_eq!(owner, None);
       assert_eq!(
@@ -4478,11 +4632,18 @@ mod tests {
       let pid = std::process::id();
       let uid = own_uid();
       let mut attributor = Attributor::new();
+      // The deferred read fills a creation time from `/proc` when the snapshot carries none; this test
+      // is about the refresh, not the timestamp, so it must stay offline.
+      attributor.created_of = |_, _| None;
       let snapshot = Instant::now();
       attributor.pid_fds.insert(
          pid,
          FdCacheEntry {
-            sockets: vec![(123, None)],
+            sockets: vec![SocketInode {
+               inode: 123,
+               fd: 1,
+               created: None,
+            }],
             uid,
             at: snapshot,
          },
@@ -4492,7 +4653,11 @@ mod tests {
       let mut reads = 0u32;
       let owner = attributor.scan_pids_for_inode(vec![pid], 987_654, Some(uid), |_| {
          reads += 1;
-         Ok(vec![(987_654, None)])
+         Ok(vec![SocketInode {
+            inode: 987_654,
+            fd: 1,
+            created: None,
+         }])
       });
       assert_eq!(owner, Some((pid, uid, None)));
       assert_eq!(
