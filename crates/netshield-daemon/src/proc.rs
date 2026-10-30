@@ -341,6 +341,19 @@ struct MissStreak {
    warned_at: Option<Instant>,
 }
 
+/// What a descriptor-scan hit found: the socket, the process holding it, and when it was made.
+///
+/// The four travel together because they describe one observation, and the exec-after-connect
+/// check needs all of them at once; passing them separately is what pushed the scan's own
+/// helper past the argument budget.
+#[derive(Clone, Copy, Debug)]
+struct ScanHit {
+   inode: u32,
+   pid: u32,
+   uid: u32,
+   created: Option<SystemTime>,
+}
+
 /// What a failure line must name so one cause is distinguishable from another.
 struct FailureContext<'a> {
    local: (IpAddr, u16),
@@ -577,10 +590,12 @@ impl Attributor {
       self.attribute_scanned(
          flow,
          &context,
-         inode,
-         pid,
-         process_uid,
-         socket_created,
+         ScanHit {
+            inode,
+            pid,
+            uid: process_uid,
+            created: socket_created,
+         },
          now,
       )
    }
@@ -593,10 +608,7 @@ impl Attributor {
       &mut self,
       flow: FlowKey,
       context: &FailureContext<'_>,
-      inode: u32,
-      pid: u32,
-      process_uid: u32,
-      socket_created: Option<SystemTime>,
+      hit: ScanHit,
       now: Instant,
    ) -> Attributed {
       // An exec between the socket's creation and this scan replaces the image that opened
@@ -604,14 +616,14 @@ impl Attributor {
       // Only a positive observation on both sides may refuse; a missing time is ignorance,
       // not evidence, and keeps today's attribution. A uid disagreement is left to
       // `process_identity`, which drops the stale record and re-reads `/proc`.
-      if let Some(identity) = self.cached_identity(pid)
-         && identity.uid == process_uid
-         && let (Some(created), Some(image_started)) = (socket_created, identity.image_started)
+      if let Some(identity) = self.cached_identity(hit.pid)
+         && identity.uid == hit.uid
+         && let (Some(created), Some(image_started)) = (hit.created, identity.image_started)
          && image_started > created + SLACK
       {
          // The socket is alive, so this is not `SocketGone`: the normal prompt path must
          // run instead of reporting the flow as already closed.
-         self.warn_exec_after_connect(pid, &identity.exe, now);
+         self.warn_exec_after_connect(hit.pid, &identity.exe, now);
          return self.unknown(
             context,
             None,
@@ -619,28 +631,31 @@ impl Attributor {
             now,
          );
       }
-      let Some(process) = self.process_identity(pid, process_uid) else {
+      let Some(process) = self.process_identity(hit.pid, hit.uid) else {
          return self.unknown(
             context,
             Some(Missing::NotOurs),
-            &format!("cannot read /proc/{pid} identity for inode {inode}"),
+            &format!(
+               "cannot read /proc/{} identity for inode {}",
+               hit.pid, hit.inode
+            ),
             now,
          );
       };
       self.inode_to_pid.insert(
-         inode,
+         hit.inode,
          InodeCacheEntry {
-            pid,
-            uid: process_uid,
-            created: socket_created,
+            pid: hit.pid,
+            uid: hit.uid,
+            created: hit.created,
             at: now,
          },
       );
       self.remember_success(
          flow,
          FlowCacheEntry {
-            pid,
-            uid: process_uid,
+            pid: hit.pid,
+            uid: hit.uid,
             at: now,
          },
          (context.uid, context.proto, context.remote.1),
@@ -3237,7 +3252,7 @@ mod tests {
          .expect("create the socket link");
       }
 
-      let Ok(mut scanned) = read_fd_dir(dir.clone()) else {
+      let Ok(scanned) = read_fd_dir(dir.clone()) else {
          panic!("an untrimmed directory is not over budget");
       };
       // Readdir order is the filesystem's, not creation order; the point is that no entry
@@ -3391,10 +3406,12 @@ mod tests {
       attributor.attribute_scanned(
          (L4Proto::Udp, local, remote),
          &context,
-         inode,
-         pid,
-         uid,
-         created,
+         ScanHit {
+            inode,
+            pid,
+            uid,
+            created,
+         },
          Instant::now(),
       )
    }
