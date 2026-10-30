@@ -627,6 +627,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       dns_queue,
       Arc::clone(&cache),
       config.dns_queue_num,
+      config.dns_servers.clone(),
    ) {
       remove_table_quietly(config.table_name());
       if let Err(remove_err) = ipc_server::remove_socket_file(&config.socket_path) {
@@ -660,6 +661,16 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       },
       "the daemon started",
    );
+   if daemon.config.dns_servers.is_empty() {
+      info!(
+         "dns names are learned from any source; set dns_servers to restrict them to your resolvers"
+      );
+   } else {
+      info!(
+         "dns names are only accepted from {:?}",
+         daemon.config.dns_servers
+      );
+   }
    info!(
       "netshieldd running: queue {} for flows, queue {} for DNS, control {}",
       daemon.config.queue_num,
@@ -2155,7 +2166,9 @@ fn spawn_proc_connector(cache: Arc<Mutex<ProcessCache>>) {
                if let Ok(mut cache) = cache.lock() {
                   for event in events.drain(..) {
                      match event {
-                        ProcEvent::Exec { pid } => cache.record_exec(pid),
+                        ProcEvent::Exec { pid, image_started } => {
+                           cache.record_exec(pid, image_started)
+                        }
                         ProcEvent::Exit { pid } => cache.forget(pid),
                      }
                   }
@@ -2181,11 +2194,21 @@ fn spawn_proc_connector(cache: Arc<Mutex<ProcessCache>>) {
    });
 }
 
+/// Whether an answer from `source` may teach the cache a name.
+///
+/// An empty list keeps the historical behaviour — any sender — because the resolver's upstream
+/// addresses are not knowable from here. A non-empty list is the operator's answer to "my answers
+/// only ever come from these", and it is enforced per packet, before the parser sees the bytes.
+fn accepts_dns_source(configured: &[IpAddr], source: IpAddr) -> bool {
+   configured.is_empty() || configured.contains(&source)
+}
+
 /// Spawns the DNS reader: parse every answer into the cache, always accept.
 fn spawn_dns_reader(
    mut queue: NfQueue,
    cache: Arc<Mutex<DnsCache>>,
    queue_num: u16,
+   allowed_sources: Vec<IpAddr>,
 ) -> Result<(), DaemonError> {
    thread::Builder::new()
       .name("netshield-dns".to_owned())
@@ -2213,16 +2236,22 @@ fn spawn_dns_reader(
             for packet in packets.drain(..) {
                // The one line that distinguishes "the queue delivered nothing" from the
                // parser or the cache dropping the answer further down this path.
-               let from = parse(&packet.payload)
-                  .map(|parsed| parsed.src.to_string())
-                  .unwrap_or_else(|_| "?".to_owned());
+               let source = parse(&packet.payload).map(|parsed| parsed.src).ok();
                debug!(
-                  "dns queue: id={} family={} len={} from={from}",
+                  "dns queue: id={} family={} len={} from={}",
                   packet.id,
                   packet.family,
-                  packet.payload.len()
+                  packet.payload.len(),
+                  source.map_or_else(|| "?".to_owned(), |addr| addr.to_string()),
                );
-               cache_answer(&cache, &packet.payload);
+               // A name from a sender the operator did not name is not evidence about anything; the
+               // answer is still accepted, because the DNS path must never drop one.
+               match source {
+                  Some(addr) if !accepts_dns_source(&allowed_sources, addr) => {
+                     debug!("dns: ignoring an answer from {addr}: not a configured resolver");
+                  }
+                  _ => cache_answer(&cache, &packet.payload),
+               }
                // Nothing on the DNS path may ever drop an answer: a parse failure is
                // logged at debug and the packet is still accepted.
                if let Err(err) = queue.verdict(packet.id, Verdict::Accept) {
@@ -2492,6 +2521,21 @@ mod tests {
    use netshield_core::rule::Duration as RuleDuration;
 
    use super::*;
+
+   #[test]
+   fn only_a_configured_resolver_may_teach_the_cache() {
+      let trusted: IpAddr = "192.0.2.53".parse().expect("literal");
+      let other: IpAddr = "198.51.100.9".parse().expect("literal");
+      assert!(
+         accepts_dns_source(&[], other),
+         "an empty list keeps the historical behaviour"
+      );
+      assert!(accepts_dns_source(&[trusted], trusted));
+      assert!(
+         !accepts_dns_source(&[trusted], other),
+         "a configured list excludes everything else"
+      );
+   }
 
    #[test]
    fn would_block_covers_a_receive_timeout() {

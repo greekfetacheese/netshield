@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,15 @@ pub struct Config {
    /// compatibility behavior instead of failing the daemon's fatal parse.
    #[serde(default)]
    pub gui_path: Option<PathBuf>,
+   /// Source addresses whose DNS answers may be cached; empty accepts any sender.
+   ///
+   /// The DNS queue sees every inbound packet whose source port is 53 — including the answer to a
+   /// query this machine made to a server an unprivileged process picked, whose records that
+   /// process wrote. The cache is only a naming hint (the alert always shows the address), but an
+   /// operator who knows their resolvers can close the injection path by naming them here. Empty
+   /// is the historical behaviour and is reported at startup, never silently assumed.
+   #[serde(default)]
+   pub dns_servers: Vec<IpAddr>,
    pub log_level: LogLevel,
    /// Unix socket the GUI connects to.
    pub socket_path: PathBuf,
@@ -154,6 +164,7 @@ impl Default for Config {
          icmp_echo: IcmpAction::Deny,
          allowed_uid: None,
          gui_path: None,
+         dns_servers: Vec::new(),
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
          rules_path: PathBuf::from("/etc/netshield/rules.db"),
@@ -515,6 +526,22 @@ mod tests {
                      \"rules_path\": \"/etc/x\"}";
       let config: Config = serde_json::from_str(without).expect("an old config must load");
       assert_eq!(config.gui_path, None);
+   }
+
+   #[test]
+   fn the_dns_server_list_defaults_empty_and_survives_a_round_trip() {
+      let mut config = Config::default();
+      assert!(
+         config.dns_servers.is_empty(),
+         "an older config accepts any sender"
+      );
+      let mut listed = config.clone();
+      listed.dns_servers = vec!["192.0.2.53".parse().expect("literal")];
+      let text = serde_json::to_string(&listed).expect("serialize");
+      assert!(text.contains("\"dns_servers\""));
+      let back: Config = serde_json::from_str(&text).expect("parse");
+      assert_eq!(back.dns_servers, listed.dns_servers);
+      config.dns_servers = Vec::new();
    }
 
    #[test]

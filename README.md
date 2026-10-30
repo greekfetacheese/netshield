@@ -48,6 +48,9 @@ and delete the `inet netshield` nftables table.
 - `Reject` (TCP RST) is deferred; a denied flow is dropped.
 - Domain learning depends on plaintext DNS, so clients using DoH/DoT show an address
   rather than a name.
+- The control socket's executable check is a convenience boundary, not a security boundary: a process
+  running as your user can run any code under the GUI's own path (`LD_PRELOAD` is enough) and be accepted
+  as the GUI. Closing it properly needs the GUI to have its own identity, which is not implemented yet.
 
 ## Debugging
 

@@ -66,8 +66,12 @@ The daemon does not trust the table it installed for ever. Every 30 s it reads t
 back with `nft list table` and re-runs the same check as startup: both chains, both queue
 numbers. A table removed or rewritten by anything else would otherwise leave the daemon
 logging decisions while nothing enforces them. The read-back is one process per interval
-and never per packet; a failure is logged once per transition and published through
-`StatusInfo::table_verified`, which returns to true — with one `info!` — on the next
+and never per packet. A failure is logged once per transition, published through
+`StatusInfo::table_verified`, and **repaired**: the daemon reinstalls the same table it installs at
+startup (`force`, so a rewritten table is replaced rather than reported as a second instance) and
+re-verifies it, because nothing else puts the table back and a restart is a window with no queue
+bound — which the kernel accepts. A failed reinstall stays at `debug!`, so the transition error is
+not buried; the flag returns to true — with one `info!` — on the next
 successful check. A stalled loop catches up one interval per check rather than running
 the missed probes back to back.
 
@@ -81,6 +85,13 @@ Known and documented gaps (honest limits of a userspace firewall):
   `dev_queue_xmit` and skips the output hook entirely. Root can also flush our table or
   load modules. NetShield defends against unprivileged processes and accidental leaks; it
   is not a defence against an attacker who already has root.
+- **The control socket raises the cost of a hostile local process; it does not exclude one.**
+  `gui_path` is compared against `/proc/<pid>/exe`, which names a *file*: a process running as the
+  same uid can execute the GUI binary with a preloaded library (`LD_PRELOAD`) and keep that path, so
+  it is accepted as the GUI and can flip the mode or write a rule. Closing this needs the GUI to have
+  an identity of its own plus an authenticated writer (polkit) — a design change, not a patch. Read
+  the gate as "the daemon obeys the GUI shape it was configured with", never as "policy cannot be
+  changed without a click".
 - Loopback is not filtered (it would put every X11/D-Bus/IPC byte through a userspace
   round trip for no security value).
 - Traffic the daemon itself generates is excluded by PID, and the GUI makes no network
@@ -131,6 +142,9 @@ Known and documented gaps (honest limits of a userspace firewall):
   `Error` and closes the connection. When `gui_path` is absent the historical uid-only rule
   stands and the daemon warns at startup that any process of that uid can change state; every
   state-changing request is logged at `info` with the client id, pid, executable and request.
+  That comparison identifies a file, not the code running in it: the same uid can execute the GUI
+  binary with `LD_PRELOAD` and keep `/proc/<pid>/exe` at the configured path, so the gate raises the
+  cost of a hostile local process rather than excluding one (see the matching gap in §1).
 
 ## 4. The verdict path
 
@@ -218,11 +232,15 @@ allowed. ICMP error types are always accepted so path-MTU discovery keeps workin
 On the same machine the daemon also loads a small BPF program on the `sys_enter_sendto` and
 `sys_enter_connect` tracepoints. It records `(uid, destination) -> (thread group id, timestamp)`
 into a hash map at syscall time — which is before the socket can be closed — so a flow whose socket is already
-gone can still be attributed. It is a fallback and never an override: it is consulted only after the
-`/proc` scan fails, its answer is refused unless `/proc` agrees that the pid exists and is owned by
-the packet's UID, and the whole probe is optional. No tracefs, no `CAP_BPF`, or a tracepoint whose
-format no longer names its `sockaddr` argument means the daemon runs on `/proc` alone, which is what
-it did before. Batching syscalls (`sendmmsg`) and `send` on an already-connected socket are not
+gone still has a *name* for the log. **It is not an attribution source.** Its key carries no local
+port, no inode and no pid, so two processes of one uid sending to the same destination are
+indistinguishable in it, and a uid cross-check could never reject the confusion it looked like it
+prevented — the packet's uid *is* the key's uid. Letting it answer after a failed scan therefore
+handed one application's allow rule to another; a hit is now logged ("the send registry suggests pid
+N") and the verdict stays whatever `unattributable_closed_flow` says. The probe is optional: no
+tracefs, no `CAP_BPF`, or a tracepoint whose format no longer names its `sockaddr` argument means the
+daemon runs on `/proc` alone, which is what it did before. Batching syscalls (`sendmmsg`) and `send`
+on an already-connected socket are not
 recorded yet; those flows keep the `/proc` behaviour.
 
 This attribution path has a hard limit that no amount of `/proc` polling removes: it can
@@ -236,6 +254,22 @@ fallback yields a candidate inode that no process owns. Such flows are logged as
 is socket-creation tracking (eBPF on `connect()`), which is deliberately out of v1 scope.
 The one-second negative flow cache only makes the resulting miss cheap; it does not make a
 uid-less flow attributable.
+
+The *positive* side of that cache has to prove it is still about this flow. It is keyed by the
+5-tuple, and a 5-tuple is reproducible: `/proc/net/{tcp,udp}` is world-readable, so a process can
+watch an allowed application's flow disappear, bind that exact local port to the same remote and be
+mistaken for it. A hit therefore also requires the socket's inode to be one the same pid still holds
+— evidence only a real `/proc` scan records, and one the kernel does not recycle under a live socket.
+Anything else falls through to a fresh lookup.
+
+An attributed pid is not automatically the image that opened the socket. A process can `connect()`
+and then `execve()` an allowed binary; the socket survives the exec, so `/proc` still names that pid
+while the code that sends is the new image. The daemon therefore compares the socket's creation time
+(the `/proc/<pid>/fd` link's `mtime`) with the moment the running image started, taken from the proc
+connector's `exec` event — stamped by the kernel inside the event, not by the thread that handles it,
+so the check is not paying for scheduling lag. A flow is refused only when the exec demonstrably
+followed the socket; 1 ms of slack covers reading the two clocks as a pair. A refused flow is
+`Unknown`, never the allowed binary's rules.
 
 Root-owned sockets are excluded when the PID resolves to the daemon itself.
 
@@ -330,6 +364,14 @@ Consequences worth stating plainly:
   this design does not filter, so the cache cannot attribute a name to the process that asked.
 - Entries expire with their record TTL (capped at 1 h) so a reassigned address does not
   inherit a stale name.
+- The cache accepts an answer from **any** sender: the queue matches source port 53 on the input hook,
+  so a process can query a server it picked and have that server's records cached under any name it
+  likes. A name is therefore a hint, never a guarantee — which is why the alert always prints the
+  address beneath it. One address carries at most 16 names, and `dns_servers` restricts which source
+  addresses may teach the cache at all; in both cases the answer is still delivered, only the naming is
+  affected.
+- Because matching considers every live name for an address, a poisoned name can only ever *widen* what
+  a domain rule matches; it cannot stop a deny from matching the real answer's name.
 
 ## 8. Prompt lifecycle
 
@@ -373,6 +415,8 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
   `allowed_uid` stays read-only. `gui_path: null` means any process of `allowed_uid` may
   change state, and the daemon warns prominently about it at startup. A path that does not
   exist is not a config error: it is a runtime refusal of every write.
+  `dns_servers` (empty by default) lists the source addresses whose answers may teach the name cache;
+  empty keeps the historical acceptance of any sender and is reported at startup, never silently assumed.
 - `$XDG_CONFIG_HOME/netshield/gui.json` (`~/.config/netshield/gui.json`) — the GUI's own
   preferences: the Connections log's caps, `rows_per_app` (default 100, range 10–1000) and
   `max_apps` (default 32, range 1–128). Written atomically by the unprivileged GUI and never
