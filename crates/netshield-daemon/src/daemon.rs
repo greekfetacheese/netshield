@@ -1031,11 +1031,21 @@ impl Daemon {
       let (mechanism, created, updated) = match decide.duration {
          RuleDuration::Once => {
             for dest in &record.dests {
-               self.policy.grant(
-                  dest.connection.flow_key(),
-                  decide.action,
-                  now.saturating_add(crate::policy::GRANT_TTL_SECS),
-               );
+               // Only a flow the daemon can tie to a process is worth remembering: an unattributed
+               // answer has no key, so the next unattributed flow to this destination asks again
+               // instead of inheriting it.
+               match crate::policy::grant_key(&dest.connection) {
+                  Some(key) => self.policy.grant(
+                     key,
+                     decide.action,
+                     now.saturating_add(crate::policy::GRANT_TTL_SECS),
+                  ),
+                  None => debug!(
+                     "prompt {}: no grant for an unattributed flow to {}",
+                     record.id,
+                     dest_label(&dest.connection)
+                  ),
+               }
             }
             (
                format!("created a once flow grant for {app}"),
@@ -3626,7 +3636,8 @@ mod tests {
       let mut pending = PendingPrompts::new();
       let (head, other) = queue_two_apps(&mut pending, start);
       let mut policy = prompting_policy();
-      let covered = pending.get(head).expect("open").dests[1].connection.flow_key();
+      let covered = crate::policy::grant_key(&pending.get(head).expect("open").dests[1].connection)
+         .expect("an attributed flow has a grant key");
       policy.grant(
          covered,
          Action::Allow,
@@ -3699,7 +3710,9 @@ mod tests {
       let mut pending = PendingPrompts::new();
       let (first, second, third) = queue_three_apps(&mut pending, start);
       let mut policy = prompting_policy();
-      let second_flow = pending.get(second).expect("open").dests[0].connection.flow_key();
+      let second_flow =
+         crate::policy::grant_key(&pending.get(second).expect("open").dests[0].connection)
+            .expect("an attributed flow has a grant key");
       policy.grant(
          second_flow,
          Action::Allow,
