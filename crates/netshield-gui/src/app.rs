@@ -979,7 +979,7 @@ impl eframe::App for App {
 
       egui::Panel::left("nav").exact_size(NAV_WIDTH).show(ui, |ui| {
          ui.add_space(6.0);
-         ui.spacing_mut().item_spacing.y = 2.0;
+         ui.spacing_mut().item_spacing.y = 4.0;
          ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
          for page in Page::ALL {
             let selected = self.page == page;
