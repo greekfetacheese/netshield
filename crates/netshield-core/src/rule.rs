@@ -175,22 +175,20 @@ impl DestMatcher {
    /// exactly as the separate rules it stands for would, not as its most specific entry on every
    /// flow. The ordering is deliberately independent of the application dimension so application
    /// scope can be the outer key.
+   ///
+   /// A `Domain` matcher ranks the connection's primary name and every alternate live name for
+   /// the same address, answering with the best of them: the name a prompt displays is not the
+   /// only name that address carries, and a rule must not depend on which one was learned last.
    pub fn matched_rank(&self, conn: &Connection) -> Option<u8> {
       match self {
          Self::Any => Some(0),
-         Self::Domain { host, subdomains } => {
-            let domain = conn.domain.as_deref()?;
-            if domain.eq_ignore_ascii_case(host) {
-               return Some(40);
-            }
-            if !subdomains {
-               return None;
-            }
-            let domain = domain.to_ascii_lowercase();
-            (domain.len() > host.len() + 1
-               && domain.ends_with(&format!(".{}", host.to_ascii_lowercase())))
-            .then_some(30)
-         }
+         Self::Domain { host, subdomains } => conn
+            .domain
+            .iter()
+            .map(String::as_str)
+            .chain(conn.also_domains.iter().map(String::as_str))
+            .filter_map(|domain| domain_rank(domain, host, *subdomains))
+            .max(),
          Self::Ip(net) => net.contains(conn.remote.addr).then_some(20),
          Self::Port(port) => (conn.remote.port == *port).then_some(10),
          Self::Set(entries) => entries.iter().filter_map(|entry| entry.matched_rank(conn)).max(),
@@ -229,6 +227,23 @@ impl DestMatcher {
          _ => Some(Self::Set(unique)),
       }
    }
+}
+
+/// How specifically `domain` matches the rule host: 40 for an exact name, 30 for a subdomain
+/// when the rule allows subdomains, `None` otherwise.
+///
+/// This is the single per-name rule shared by the primary and the alternate names, so the two
+/// paths cannot drift apart.
+fn domain_rank(domain: &str, host: &str, subdomains: bool) -> Option<u8> {
+   if domain.eq_ignore_ascii_case(host) {
+      return Some(40);
+   }
+   if !subdomains {
+      return None;
+   }
+   let domain = domain.to_ascii_lowercase();
+   (domain.len() > host.len() + 1 && domain.ends_with(&format!(".{}", host.to_ascii_lowercase())))
+      .then_some(30)
 }
 
 /// A persisted policy rule.
@@ -342,6 +357,7 @@ pub fn normalize_host(raw: &str) -> Result<String, RuleError> {
 mod tests {
    use super::*;
    use crate::connection::{Endpoint, Family, L4Proto, ProcessInfo};
+   use crate::ruleset::{Outcome, RuleSet};
    use std::collections::HashSet;
    use std::net::{IpAddr, Ipv4Addr};
    use std::path::Path;
@@ -370,6 +386,7 @@ mod tests {
          },
          process: process(Some("/usr/lib/firefox/firefox")),
          domain: Some("api.github.com".to_owned()),
+         also_domains: Vec::new(),
       }
    }
 
@@ -481,6 +498,100 @@ mod tests {
       assert!(DestMatcher::Port(443).matches(&conn()));
       assert!(!DestMatcher::Port(80).matches(&conn()));
       assert!(DestMatcher::Any.matches(&conn()));
+   }
+
+   #[test]
+   fn a_domain_rule_matches_every_live_name_for_the_address() {
+      let shadowed = Connection {
+         domain: Some("cdn.example".to_owned()),
+         also_domains: vec!["evil.com".to_owned(), "a.evil.com".to_owned()],
+         ..conn()
+      };
+
+      let exact_alt = DestMatcher::Domain {
+         host: "evil.com".to_owned(),
+         subdomains: false,
+      };
+      assert_eq!(
+         exact_alt.matched_rank(&shadowed),
+         Some(40),
+         "an exact rule on an alternate live name must match"
+      );
+      assert_eq!(
+         DestMatcher::Domain {
+            host: "cdn.example".to_owned(),
+            subdomains: false,
+         }
+         .matched_rank(&shadowed),
+         Some(40),
+         "an exact rule on the primary name still matches"
+      );
+      assert_eq!(
+         DestMatcher::Domain {
+            host: "unrelated.example".to_owned(),
+            subdomains: false,
+         }
+         .matched_rank(&shadowed),
+         None,
+         "a name that is neither primary nor alternate does not match"
+      );
+      assert_eq!(
+         DestMatcher::Domain {
+            host: "evil.com".to_owned(),
+            subdomains: true,
+         }
+         .matched_rank(&shadowed),
+         Some(40),
+         "the exact alternate outranks its subdomain entry"
+      );
+
+      let subdomain_alt = DestMatcher::Domain {
+         host: "evil.com".to_owned(),
+         subdomains: true,
+      };
+      let only_nested = Connection {
+         domain: Some("cdn.example".to_owned()),
+         also_domains: vec!["a.evil.com".to_owned()],
+         ..conn()
+      };
+      assert_eq!(
+         subdomain_alt.matched_rank(&only_nested),
+         Some(30),
+         "the subdomain form matches a nested alternate live name"
+      );
+   }
+
+   #[test]
+   fn a_deny_on_a_shadowed_name_still_wins() {
+      let mut set = RuleSet::new();
+      for (host, action, updated_at) in [
+         ("cdn.example", Action::Allow, 0),
+         ("evil.com", Action::Deny, 0),
+      ] {
+         set.upsert(rule_from_scope(
+            RuleId::new_unique(),
+            AppMatcher::Any,
+            &ScopeRequest {
+               action,
+               duration: Duration::Forever,
+               dest: DestMatcher::Domain {
+                  host: host.to_owned(),
+                  subdomains: false,
+               },
+            },
+            updated_at,
+         ));
+      }
+
+      let connection = Connection {
+         domain: Some("cdn.example".to_owned()),
+         also_domains: vec!["evil.com".to_owned()],
+         ..conn()
+      };
+      assert!(
+         matches!(set.evaluate(&connection), Outcome::Deny { .. }),
+         "a deny on an alternate live name must not be shadowed by an allow on the primary"
+      );
    }
 
    #[test]

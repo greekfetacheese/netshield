@@ -190,6 +190,7 @@ mod tests {
             cmdline: None,
          }),
          domain: Some("api.github.com".to_owned()),
+         also_domains: Vec::new(),
       }
    }
 

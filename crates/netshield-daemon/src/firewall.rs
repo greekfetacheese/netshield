@@ -42,7 +42,7 @@ const KILLED6: &str = "killed6";
 pub enum FirewallError {
    /// The caller is not root, so `nft` would fail with `EPERM`; refuse before spawning.
    NotRoot,
-   /// `nft` is not installed or not on `PATH`.
+   /// `nft` is not installed at any of the absolute candidate paths.
    NftMissing,
    /// `nft` ran and failed, or could not be spawned for a reason other than absence.
    Commands(String),
@@ -57,7 +57,7 @@ impl fmt::Display for FirewallError {
             "must run as root (CAP_NET_ADMIN is required to install the nftables ruleset)",
          ),
          Self::NftMissing => {
-            f.write_str("the nft binary was not found on PATH; nftables is required")
+            f.write_str("the nft binary was not found at any absolute path; nftables is required")
          }
          Self::Commands(reason) => write!(f, "nft command failed: {reason}"),
          Self::Verify(reason) => write!(f, "ruleset verification failed: {reason}"),
@@ -325,12 +325,33 @@ fn table_exists(table: &str) -> Result<bool, FirewallError> {
    }
 }
 
+/// Where `nft` may be installed, most specific first.
+///
+/// The daemon runs as root and must never take a binary name from `PATH`: a unit or a
+/// privileged shell can put an attacker-writable directory there, and resolving the firewall
+/// tool through it hands the whole table to that directory. These four are the FHS locations
+/// the nftables package installs into; the first that exists is the one used.
+const NFT_CANDIDATES: [&str; 4] = ["/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft", "/bin/nft"];
+
+/// The absolute path of the installed `nft`, or `None` when none of the candidates exists.
+///
+/// Deliberately no `PATH` fallback: a missing binary is [`FirewallError::NftMissing`], and
+/// the error already says nftables is required.
+fn nft_binary() -> Option<&'static str> {
+   NFT_CANDIDATES
+      .iter()
+      .copied()
+      .find(|candidate| std::path::Path::new(candidate).exists())
+}
+
 /// Runs `nft` with `args`, optionally feeding `stdin`, and returns its stdout.
 ///
 /// No shell is involved, so nothing in a queue number or a table name can be interpreted
-/// as syntax. A missing binary is [`FirewallError::NftMissing`], never a panic.
+/// as syntax. The binary is an absolute candidate path, never a `PATH` lookup. A missing
+/// binary is [`FirewallError::NftMissing`], never a panic.
 fn nft(args: &[&str], stdin: Option<&str>) -> Result<String, FirewallError> {
-   let mut command = Command::new("nft");
+   let binary = nft_binary().ok_or(FirewallError::NftMissing)?;
+   let mut command = Command::new(binary);
    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
    if stdin.is_some() {
       command.stdin(Stdio::piped());
@@ -629,5 +650,27 @@ mod tests {
             "{name}: {listing}"
          );
       }
+   }
+
+   #[test]
+   fn the_nft_binary_is_never_resolved_through_path() {
+      // A root daemon must not take the firewall tool from PATH: every candidate is an
+      // absolute path, and the lookup can only ever yield one of them or nothing.
+      for candidate in NFT_CANDIDATES {
+         assert!(
+            std::path::Path::new(candidate).is_absolute(),
+            "{candidate} must be an absolute path"
+         );
+      }
+      let resolved = nft_binary();
+      assert!(
+         resolved.is_none() || NFT_CANDIDATES.contains(&resolved.expect("checked")),
+         "nft_binary() must return a candidate or None, got {resolved:?}"
+      );
+      assert_eq!(
+         nft_binary(),
+         resolved,
+         "the lookup is fixed for one installed set"
+      );
    }
 }

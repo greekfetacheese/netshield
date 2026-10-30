@@ -241,7 +241,21 @@ impl NetlinkSocket {
    }
 }
 
-/// Reads the peer's UID from a connected Unix socket.
+/// The credentials the kernel recorded for a connected Unix socket's peer.
+///
+/// The pid is what lets the control socket check *which executable* is on the other end
+/// (`/proc/<pid>/exe`), not merely which user: every process of the desktop user shares a
+/// UID, so the uid alone cannot tell the configured GUI from any other program that user
+/// happens to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+   /// The peer's process id when it connected; `0` when the kernel did not report one.
+   pub pid: u32,
+   /// The peer's user id when it connected.
+   pub uid: u32,
+}
+
+/// Reads the peer's credentials from a connected Unix socket.
 ///
 /// This lives beside the netlink transport because it is a raw `getsockopt` call and
 /// `unsafe` is confined to this module tree; `std`'s `UnixStream::peer_cred` is still
@@ -249,7 +263,7 @@ impl NetlinkSocket {
 ///
 /// `SO_PEERCRED` reports the credentials the peer held when it connected, not at the time
 /// of the call, so a later setuid cannot launder an unauthorised connection.
-pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
+pub fn peer_creds(fd: std::os::fd::RawFd) -> io::Result<PeerCred> {
    // SAFETY: `ucred` is a plain C struct with no invalid bit patterns; all-zero bytes are
    // a valid initial value that `getsockopt` overwrites.
    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -274,7 +288,16 @@ pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
          "SO_PEERCRED returned a credential of the wrong size",
       ));
    }
-   Ok(cred.uid)
+   Ok(PeerCred {
+      pid: cred.pid as u32,
+      uid: cred.uid,
+   })
+}
+
+/// Reads only the peer's UID; a thin wrapper over [`peer_creds`] for callers that do not
+/// need the pid.
+pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
+   Ok(peer_creds(fd)?.uid)
 }
 
 /// Builds one netlink datagram: header, then the caller's payload.

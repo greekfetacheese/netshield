@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
-use netshield_core::config::{ClosedFlowAction, Config};
+use netshield_core::config::{ClosedFlowAction, Config, IcmpAction, UnmatchedTransport};
 use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
 use netshield_core::dns::{DnsRecord, RecordKind, Target, parse_response, parse_tcp_response};
 use netshield_core::dns_cache::DnsCache;
@@ -44,16 +45,39 @@ use crate::firewall::{self, FirewallError, Flow};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
-use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
+use crate::pending::{self, DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
 use crate::policy::{Applied, Decision, Policy};
 use crate::proc::{Attributor, FlowOwner, LiveFlow, Missing, ProcessCache, live_flows};
 use crate::store::RuleStore;
+
+/// How often the installed table is read back and re-verified.
+///
+/// A table can disappear or be rewritten by anything else on the machine (an operator, another
+/// firewall manager), and a daemon that never looks again keeps deciding packets while nothing
+/// enforces the verdicts. One `nft list` per 30 s is the price of noticing that; it never runs
+/// per packet.
+const TABLE_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum gap between `prompt limit reached` lines.
+///
+/// One line per packet would turn the very flood the cap exists for into a journal flood; the
+/// packet is still denied, only the line is rate-limited.
+const PROMPT_LIMIT_LOG_GAP: Duration = Duration::from_secs(60);
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Minimum gap between `dns: no name` debug lines for one address.
 const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
+
+/// Minimum gap between denial lines for one unmodelled transport and ICMP type.
+///
+/// A ping flood or an SCTP association would otherwise put one line per packet in the
+/// journal; the packet is still dropped, only the line is rate-limited.
+const TRANSPORT_LOG_GAP: Duration = Duration::from_secs(60);
+
+/// Upper bound on the transport keys the denial limiter remembers.
+const TRANSPORT_LOG_LIMIT: usize = 256;
 
 /// Upper bound on the addresses the DNS miss limiter remembers.
 const DNS_MISS_LIMIT: usize = 1024;
@@ -66,8 +90,9 @@ const MAX_MULTICAST_APPS: usize = 64;
 
 /// How many prompts may be open before a single warning reports the storm.
 ///
-/// Not a cap: nothing silently denies a flow the user was never shown. A pathological burst is
-/// made visible instead, because every one of those prompts now has its own clock.
+/// Only a warning: the set itself is bounded by [`pending::MAX_PROMPTS`], and nothing silently
+/// denies a flow the user was never shown. A pathological burst is made visible instead,
+/// because every one of those prompts now has its own clock.
 const MAX_OPEN_PROMPTS: usize = 6;
 
 /// How long the proc connector receive may block before the shutdown flag is checked.
@@ -259,8 +284,11 @@ struct Daemon {
    queue_drops: u64,
    silent_warned: bool,
    table_verified: bool,
+   verify_schedule: VerifySchedule,
    dns_misses: MissLimiter,
    closed_flows: MissLimiter,
+   prompt_limit: MissLimiter,
+   transport_denials: KeyLimiter<(u8, Option<u8>)>,
    multicast_logged: HashSet<String>,
 }
 
@@ -297,8 +325,11 @@ impl Daemon {
          queue_drops: 0,
          silent_warned: false,
          table_verified,
+         verify_schedule: VerifySchedule::new(Instant::now(), TABLE_VERIFY_INTERVAL),
          dns_misses: MissLimiter::new(),
          closed_flows: MissLimiter::new(),
+         prompt_limit: MissLimiter::with_gap(PROMPT_LIMIT_LOG_GAP),
+         transport_denials: KeyLimiter::new(TRANSPORT_LOG_GAP, TRANSPORT_LOG_LIMIT),
          multicast_logged: HashSet::new(),
       }
    }
@@ -395,7 +426,7 @@ impl Daemon {
             },
          ),
       };
-      let domain = self.domain_for(remote.addr);
+      let (domain, also_domains) = self.domain_names(remote.addr);
       Connection {
          family: match live.flow {
             Flow::V4(..) => Family::V4,
@@ -412,6 +443,7 @@ impl Daemon {
             cmdline: None,
          }),
          domain,
+         also_domains,
       }
    }
 }
@@ -656,7 +688,11 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
 
 /// Binds the control socket and opens both queues with the loop's receive timeout.
 fn start_runtime(config: &Config) -> Result<(IpcHandle, NfQueue, NfQueue), DaemonError> {
-   let server = IpcServer::bind(&config.socket_path, config.allowed_uid)?;
+   let server = IpcServer::bind(
+      &config.socket_path,
+      config.allowed_uid,
+      config.gui_path.clone(),
+   )?;
    let ipc = server.spawn();
 
    let queue = open_queue(config.queue_num)?;
@@ -722,7 +758,48 @@ impl Daemon {
             }
          }
 
-         self.sweep(Instant::now());
+         let now = Instant::now();
+         self.sweep(now);
+         self.verify_table(now);
+      }
+   }
+
+   /// Reads the installed table back on the schedule and publishes whether it still verifies.
+   ///
+   /// A table removed or rewritten by anything else would otherwise leave the daemon logging
+   /// decisions while nothing enforces them. The failure is logged once per transition, never
+   /// once per interval, and `StatusInfo::table_verified` carries the current state; the next
+   /// success restores it and says so once.
+   fn verify_table(&mut self, now: Instant) {
+      if !self.verify_schedule.due(now) {
+         return;
+      }
+      match firewall::verify(
+         self.config.table_name(),
+         self.config.queue_num,
+         self.config.dns_queue_num,
+      ) {
+         Ok(()) => {
+            if !self.table_verified {
+               self.table_verified = true;
+               info!(
+                  "table inet {} verifies again; enforcement resumed",
+                  self.config.table_name()
+               );
+               self.publish_status();
+            }
+         }
+         Err(err) => {
+            if self.table_verified {
+               self.table_verified = false;
+               error!(
+                  "table inet {} no longer verifies, so nothing is enforced until it does: \
+                   {err}",
+                  self.config.table_name()
+               );
+               self.publish_status();
+            }
+         }
       }
    }
 
@@ -1209,9 +1286,7 @@ impl Daemon {
       };
 
       let Some((connection, missing)) = self.connection_for(&parsed, &packet) else {
-         // Not a flow the policy governs (ICMP, an unknown transport, a family mismatch);
-         // accept rather than invent a decision for a packet the model cannot express.
-         self.accept(packet.id);
+         self.handle_unmodelled(&parsed, &packet);
          return;
       };
 
@@ -1242,6 +1317,72 @@ impl Daemon {
             Unmatched::AllowClosed => self.closed_flow_allowed(&connection, packet.id),
             Unmatched::AllowMulticast => self.multicast_allowed(&connection, packet.id),
          },
+      }
+   }
+
+   /// Decides a queued packet the policy model cannot express a flow for.
+   ///
+   /// [`connection_for`](Self::connection_for) returns `None` for three unrelated reasons and
+   /// they must not share a verdict: an established TCP packet is not a policy question, a
+   /// transport without ports (and an ICMP echo) has no rule that could govern it, and a
+   /// family mismatch is a packet the model reads but cannot place. Only the middle case is
+   /// an accept the owner asked to close; the other two keep the historical accept.
+   fn handle_unmodelled(&mut self, parsed: &ParsedPacket, packet: &Packet) {
+      // The protocol number the kernel put on the wire. `L4Payload` carries no protocol
+      // field, so it is read from the IP header the parser already validated.
+      let protocol = packet_protocol(&packet.payload);
+      match transport_verdict(&parsed.l4, &self.config) {
+         TransportAction::Ignore => {
+            // Not a flow the policy governs (an established TCP segment, a family
+            // mismatch, or a packet whose header no longer carries a protocol). Accept
+            // rather than invent a decision for a packet the model cannot express.
+            self.accept(packet.id);
+         }
+         TransportAction::Drop => {
+            self.drop_packet(packet.id);
+            self.queue_drops = self.queue_drops.saturating_add(1);
+            self.log_transport_denial(parsed, protocol, packet.uid);
+         }
+         TransportAction::Allow => self.accept(packet.id),
+      }
+   }
+
+   /// Logs a transport denial once per (protocol, ICMP type) per [`TRANSPORT_LOG_GAP`].
+   fn log_transport_denial(
+      &mut self,
+      parsed: &ParsedPacket,
+      protocol: Option<u8>,
+      uid: Option<u32>,
+   ) {
+      let key = (
+         protocol.unwrap_or(0),
+         match parsed.l4 {
+            L4Payload::Icmp { icmp_type, .. } => Some(icmp_type),
+            _ => None,
+         },
+      );
+      if !self.transport_denials.record(key, Instant::now()) {
+         return;
+      }
+      let family = match parsed.family {
+         Family::V4 => "ipv4",
+         Family::V6 => "ipv6",
+      };
+      let uid = uid.map_or_else(|| "unknown".to_owned(), |uid| uid.to_string());
+      match parsed.l4 {
+         L4Payload::Icmp { icmp_type, .. } => warn!(
+            "denied icmp echo (type {icmp_type}, {family}, protocol {}) from uid {uid}: set \
+             icmp_echo to allow to permit it",
+            protocol.unwrap_or(0)
+         ),
+         _ => warn!(
+            "denied transport {} ({family}, protocol has no policy) from uid {uid}: set \
+             unmatched_transport to allow to permit it",
+            protocol.map_or_else(
+               || "unknown".to_owned(),
+               |protocol| protocol.to_string()
+            )
+         ),
       }
    }
 
@@ -1295,6 +1436,23 @@ impl Daemon {
          Instant::now(),
       );
       match opened {
+         // The set is at `MAX_PROMPTS`: the flood is denied rather than queued, and the line
+         // is rate-limited so the denial itself cannot become the flood. The prompt set is
+         // never grown past the cap and no prompt is opened for this packet.
+         Opened::Full => {
+            self.drop_packet(packet_id);
+            let remote = connection.remote.addr;
+            if self.prompt_limit.record(remote, Instant::now()) {
+               warn!(
+                  "prompt limit ({}) reached; denying {} -> {}:{}; existing prompts must be \
+                   answered first",
+                  pending::MAX_PROMPTS,
+                  connection.app_name(),
+                  connection.remote.addr,
+                  connection.remote.port
+               );
+            }
+         }
          Opened::Attached(id) => {
             // `prompt` already attached the packet above, so this is only reachable if the
             // two lookups ever disagree; the packet is answered with the prompt all the same.
@@ -1464,33 +1622,47 @@ impl Daemon {
       );
       let missing = attributed.missing;
 
+      let (domain, also_domains) = self.domain_names(remote.addr);
       let connection = Connection {
          family: parsed.family,
          proto,
          local,
          remote,
          process: attributed.attribution,
-         domain: self.domain_for(remote.addr),
+         domain,
+         also_domains,
       };
       Some((connection, missing))
    }
 
-   /// The name the DNS cache learned for `addr`, if one is still live.
+   /// Splits the live names for `addr` into the primary — the one a prompt shows — and every
+   /// alternate live name, in the cache's order.
    ///
    /// A miss is logged at most once per [`DNS_MISS_LOG_GAP`] per address: a busy machine
    /// looks up a lot of uncached addresses, and each line would otherwise flood the
    /// journal. Hits are never logged.
-   fn domain_for(&mut self, addr: IpAddr) -> Option<String> {
-      let name = self
+   fn domain_names(&mut self, addr: IpAddr) -> (Option<String>, Vec<String>) {
+      let mut names = self.live_domains(addr);
+      let domain = (!names.is_empty()).then(|| names.remove(0));
+      if domain.is_none() && self.dns_misses.record(addr, Instant::now()) {
+         debug!("dns: no name for {addr}");
+      }
+      (domain, names)
+   }
+
+   /// Every live name the DNS cache holds for `addr`, most recently learned first.
+   ///
+   /// The first is what a prompt displays; the rest are names a domain rule must also match,
+   /// because several names can share one address.
+   fn live_domains(&self, addr: IpAddr) -> Vec<String> {
+      self
          .dns_cache
          .lock()
          .expect("dns cache")
-         .primary(addr, now_secs())
-         .map(str::to_owned);
-      if name.is_none() && self.dns_misses.record(addr, Instant::now()) {
-         debug!("dns: no name for {addr}");
-      }
-      name
+         .names_for(addr, now_secs())
+         .into_iter()
+         .map(str::to_owned)
+         .collect()
    }
 
    /// A display snapshot of one connection.
@@ -1500,12 +1672,7 @@ impl Daemon {
    }
 
    fn domain_candidates(&self, connection: &Connection) -> Vec<String> {
-      let cache = self.dns_cache.lock().expect("dns cache");
-      cache
-         .names_for(connection.remote.addr, now_secs())
-         .into_iter()
-         .map(str::to_owned)
-         .collect()
+      self.live_domains(connection.remote.addr)
    }
 
    fn broadcast_connection(
@@ -1603,35 +1770,176 @@ fn unmatched(
    }
 }
 
+/// The IP next-header byte of a packet the parser already validated.
+///
+/// The parsed payload carries no protocol number, and the denial line must name the real
+/// one, so it is read from the same header the parser used: byte 9 of an IPv4 header, byte 6
+/// of an IPv6 header. `None` only for a buffer too short to be either, which `parse` has
+/// already rejected.
+fn packet_protocol(payload: &[u8]) -> Option<u8> {
+   match payload.first().map(|first| first >> 4) {
+      Some(4) => payload.get(9).copied(),
+      Some(6) => payload.get(6).copied(),
+      _ => None,
+   }
+}
+
+/// What happens to a queued packet no [`Connection`] can be built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportAction {
+   /// Not a transport the policy model declines for a reason of its own: an established
+   /// TCP or UDP packet, or a family mismatch, keeps the historical accept.
+   Ignore,
+   /// An unmodelled transport or an ICMP echo the owner has not allowed.
+   Drop,
+   /// An allowed ICMP echo, an allowed port-less transport, or an ICMP error.
+   Allow,
+}
+
+/// Decides a packet the flow model cannot express, from its transport and the owner's
+/// settings.
+///
+/// This is deliberately a pure function on the parsed payload: the packet never reaches a
+/// [`Connection`], so the decision cannot depend on attribution and can be unit-tested
+/// without a queue. The family needs no parameter because the ambiguous ICMP types are
+/// already distinct on the wire (v4 echo is 8, v6 echo is 128).
+fn transport_verdict(l4: &L4Payload, config: &Config) -> TransportAction {
+   match l4 {
+      // ICMP echo request (v4 type 8) and ICMPv6 echo request (type 128) are the outbound
+      // half of a ping, and an ICMP tunnel rides on them, so the owner's setting decides.
+      L4Payload::Icmp {
+         icmp_type: 8 | 128, ..
+      } => match config.icmp_echo {
+         IcmpAction::Deny => TransportAction::Drop,
+         IcmpAction::Allow => TransportAction::Allow,
+      },
+      // Everything else in ICMP is a diagnostic the kernel or a well-behaved peer emits:
+      // destination unreachable (v4 3, v6 1), packet too big (v6 2), time exceeded (v4 11,
+      // v6 3) and parameter problem (v4 12, v6 4). Dropping those breaks path-MTU discovery
+      // and ordinary TCP, so this is the one deliberate allow.
+      L4Payload::Icmp { .. } => TransportAction::Allow,
+      // SCTP, DCCP, GRE, ESP and IP-in-IP carry no port pair, so no rule can express a
+      // decision: the owner's setting, denying by default, is the only decision available.
+      L4Payload::Other => match config.unmatched_transport {
+         UnmatchedTransport::Deny => TransportAction::Drop,
+         UnmatchedTransport::Allow => TransportAction::Allow,
+      },
+      // Only an opening TCP SYN reaches here as a `None` from `connection_for`; every
+      // other TCP segment, and a family the model cannot place, is not a policy question.
+      L4Payload::Tcp { .. } | L4Payload::Udp { .. } => TransportAction::Ignore,
+   }
+}
+
+/// A per-key one-line-per-gap log limiter.
+///
+/// Same shape and contract as [`MissLimiter`], keyed by the transport a denial names
+/// instead of an address: a ping flood or an SCTP association must not put one line per
+/// packet in the journal, while still recording that the drop happened.
+struct KeyLimiter<K> {
+   last: HashMap<K, Instant>,
+   gap: Duration,
+   limit: usize,
+}
+
+impl<K: Eq + Hash> KeyLimiter<K> {
+   fn new(gap: Duration, limit: usize) -> Self {
+      Self {
+         last: HashMap::new(),
+         gap,
+         limit,
+      }
+   }
+
+   /// Whether an event for `key` at `now` should be logged.
+   fn record(&mut self, key: K, now: Instant) -> bool {
+      if let Some(at) = self.last.get(&key) {
+         if now.duration_since(*at) < self.gap {
+            return false;
+         }
+      } else if self.last.len() >= self.limit {
+         self.last.retain(|_, at| now.duration_since(*at) < self.gap);
+         if self.last.len() >= self.limit {
+            return false;
+         }
+      }
+      self.last.insert(key, now);
+      true
+   }
+}
+
 /// A per-address one-line-per-gap log limiter.
 ///
 /// It keeps a repeated line cheap on a machine that touches many addresses the cache or a
-/// scan never saw, without changing the fact that the condition happened.
+/// scan never saw, without changing the fact that the condition happened. The gap is a
+/// field so the prompt-limit line can reuse the same shape at its own rate.
 struct MissLimiter {
    last: HashMap<IpAddr, Instant>,
+   gap: Duration,
 }
 
 impl MissLimiter {
    fn new() -> Self {
+      Self::with_gap(DNS_MISS_LOG_GAP)
+   }
+
+   /// A limiter that emits at most one line per address per `gap`.
+   fn with_gap(gap: Duration) -> Self {
       Self {
          last: HashMap::new(),
+         gap,
       }
    }
 
    /// Whether a miss for `addr` at `now` should be logged. The entry is added or refreshed
-   /// only when it is, so a repeatedly missing address costs one hash lookup per second.
+   /// only when it is, so a repeatedly missing address costs one hash lookup per gap.
    fn record(&mut self, addr: IpAddr, now: Instant) -> bool {
       if let Some(at) = self.last.get(&addr) {
-         if now.duration_since(*at) < DNS_MISS_LOG_GAP {
+         if now.duration_since(*at) < self.gap {
             return false;
          }
       } else if self.last.len() >= DNS_MISS_LIMIT {
-         self.last.retain(|_, at| now.duration_since(*at) < DNS_MISS_LOG_GAP);
+         self.last.retain(|_, at| now.duration_since(*at) < self.gap);
          if self.last.len() >= DNS_MISS_LIMIT {
             return false;
          }
       }
       self.last.insert(addr, now);
+      true
+   }
+}
+
+/// The clock a periodic table re-verify runs on.
+///
+/// It carries its own `Instant` and advances only when asked, so the decision is unit-testable
+/// without sleeping, without `nft` and without root. The first deadline is one interval after
+/// construction: the table was just verified at startup, so there is nothing to re-check yet.
+struct VerifySchedule {
+   /// The instant the next re-verify is due.
+   next: Instant,
+   /// How far `due` advances the deadline every time it fires.
+   interval: Duration,
+}
+
+impl VerifySchedule {
+   /// Schedules the first re-verify one `interval` after `now`.
+   fn new(now: Instant, interval: Duration) -> Self {
+      Self {
+         next: now.checked_add(interval).unwrap_or(now),
+         interval,
+      }
+   }
+
+   /// Whether a re-verify is due at `now`, advancing the deadline when it is.
+   ///
+   /// A late call advances by exactly one interval, never by zero: leaving the deadline at
+   /// `now` would make every later call fire, while jumping it past `now` would swallow the
+   /// intervals a stalled loop missed. A long stall therefore catches up one interval per
+   /// call, and a call on the same instant keeps advancing instead of spinning in place.
+   fn due(&mut self, now: Instant) -> bool {
+      if now < self.next {
+         return false;
+      }
+      self.next = self.next.checked_add(self.interval).unwrap_or(now);
       true
    }
 }
@@ -1787,7 +2095,7 @@ fn spawn_proc_connector(cache: Arc<Mutex<ProcessCache>>) {
                if let Ok(mut cache) = cache.lock() {
                   for event in events.drain(..) {
                      match event {
-                        ProcEvent::Exec { pid } => cache.record(pid),
+                        ProcEvent::Exec { pid } => cache.record_exec(pid),
                         ProcEvent::Exit { pid } => cache.forget(pid),
                      }
                   }
@@ -2182,6 +2490,60 @@ mod tests {
       );
    }
 
+   #[test]
+   fn the_verify_schedule_fires_once_per_interval() {
+      let interval = Duration::from_secs(30);
+      let start = Instant::now();
+      let mut schedule = VerifySchedule::new(start, interval);
+
+      assert!(
+         !schedule.due(start),
+         "not due before the first deadline"
+      );
+      assert!(
+         !schedule.due(start + interval - Duration::from_millis(1)),
+         "still not due a millisecond early"
+      );
+      assert!(
+         schedule.due(start + interval),
+         "due at the first deadline"
+      );
+      assert!(
+         !schedule.due(start + interval),
+         "not due again on the same instant"
+      );
+      assert!(
+         !schedule.due(start + interval + Duration::from_millis(1)),
+         "not due immediately after"
+      );
+      assert!(
+         schedule.due(start + 2 * interval),
+         "due again a full interval later"
+      );
+
+      // A large jump advances by exactly one interval per call, never by zero: a loop that
+      // stalled for an hour catches up over its next iterations, one interval at a time.
+      let mut schedule = VerifySchedule::new(start, interval);
+      let stalled = start + Duration::from_secs(60 * 60);
+      let mut calls = 0u32;
+      while schedule.due(stalled) {
+         calls += 1;
+         assert_eq!(
+            schedule.next,
+            start + interval * (calls + 1),
+            "each catch-up call advances exactly one interval, never zero"
+         );
+      }
+      assert_eq!(
+         calls, 120,
+         "one call per missed interval, not one for the whole jump"
+      );
+      assert!(
+         !schedule.due(stalled),
+         "once caught up, the same instant is no longer due"
+      );
+   }
+
    /// A rule for `ScopeChoice::Address` covers the flow's exact remote address, on both
    /// families, and never a neighbouring one: this is the narrow scope that replaces the
    /// broad, unattributable one.
@@ -2209,6 +2571,7 @@ mod tests {
             },
             process: Attribution::Unknown,
             domain: None,
+            also_domains: Vec::new(),
          };
          let decide = DecideRequest {
             prompt_id: 7,
@@ -2251,6 +2614,7 @@ mod tests {
          remote: Endpoint { addr: remote, port },
          process: Attribution::Unknown,
          domain: None,
+         also_domains: Vec::new(),
       }
    }
 
@@ -2348,6 +2712,76 @@ mod tests {
             "{remote}:{port} with {missing:?} in {mode:?} must be {expected:?}"
          );
       }
+   }
+
+   /// A queued packet no flow can be built for: an ICMP echo and a port-less transport are
+   /// denied unless the owner allows them, while an ICMP error always passes and an
+   /// established TCP/UDP segment keeps the historical accept.
+   #[test]
+   fn the_transport_verdict_for_unmodelled_flows() {
+      let icmp = |icmp_type: u8| L4Payload::Icmp {
+         icmp_type,
+         icmp_code: 0,
+      };
+      let allow_icmp = Config {
+         icmp_echo: IcmpAction::Allow,
+         ..Config::default()
+      };
+      let allow_transport = Config {
+         unmatched_transport: UnmatchedTransport::Allow,
+         ..Config::default()
+      };
+
+      for (l4, config, expected) in [
+         // An echo request is an outbound attempt: denied by default, allowed on request.
+         (icmp(8), Config::default(), TransportAction::Drop),
+         (
+            icmp(8),
+            allow_icmp.clone(),
+            TransportAction::Allow,
+         ),
+         (
+            icmp(128),
+            Config::default(),
+            TransportAction::Drop,
+         ),
+         (
+            icmp(128),
+            allow_icmp.clone(),
+            TransportAction::Allow,
+         ),
+         // An ICMP error is the kernel's own diagnostic: dropping it breaks path MTU and
+         // ordinary TCP, so it passes whatever the owner set.
+         (icmp(3), Config::default(), TransportAction::Allow),
+         (icmp(3), allow_icmp, TransportAction::Allow),
+         (icmp(2), Config::default(), TransportAction::Allow),
+         // SCTP (132) carries no ports: no rule can express it, so the owner's setting is
+         // the whole decision, and it denies by default.
+         (
+            L4Payload::Other,
+            Config::default(),
+            TransportAction::Drop,
+         ),
+         (
+            L4Payload::Other,
+            allow_transport,
+            TransportAction::Allow,
+         ),
+      ] {
+         assert_eq!(
+            transport_verdict(&l4, &config),
+            expected,
+            "{l4:?} must be {expected:?}"
+         );
+      }
+
+      // A TCP segment that is not an opening SYN never reaches this decision; if it did, the
+      // model has no new flow to judge and keeps the historical accept.
+      let established = parse(&tcp_packet(0x10)).expect("an ACK parses").l4;
+      assert_eq!(
+         transport_verdict(&established, &Config::default()),
+         TransportAction::Ignore
+      );
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
@@ -2787,6 +3221,7 @@ mod tests {
             cmdline: None,
          }),
          domain: None,
+         also_domains: Vec::new(),
       }
    }
 

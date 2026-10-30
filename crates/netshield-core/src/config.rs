@@ -34,6 +34,33 @@ pub enum ClosedFlowAction {
    Prompt,
 }
 
+/// What to do with a queued flow whose L4 protocol has no ports.
+///
+/// `Deny` is the default: SCTP, DCCP, GRE, ESP and IP-in-IP carry no port pair, so no rule
+/// can express a decision about them, and an unfiltered channel is exactly what this
+/// firewall exists to remove. `Allow` is the explicit way to restore the pre-2026
+/// pass-through for those transports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnmatchedTransport {
+   #[default]
+   Deny,
+   Allow,
+}
+
+/// What to do with an ICMP echo request.
+///
+/// `Deny` is the default: an echo request is an outbound connection attempt by any
+/// reasonable reading, and an ICMP tunnel rides on it; allowing it unfiltered would keep a
+/// channel no rule can gate. `Allow` restores the pre-2026 pass-through for ping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IcmpAction {
+   #[default]
+   Deny,
+   Allow,
+}
+
 /// Verbosity of the daemon log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,11 +101,34 @@ pub struct Config {
    /// fatal, and every config written by the current installer lacks this key.
    #[serde(default)]
    pub unattributable_closed_flow: ClosedFlowAction,
+   /// How a queued flow whose L4 protocol has no ports is decided.
+   ///
+   /// `#[serde(default)]` is load-bearing twice: every installed config predates the key,
+   /// and the default is `deny`, so an upgrade must not open the transports this setting
+   /// exists to close.
+   #[serde(default)]
+   pub unmatched_transport: UnmatchedTransport,
+   /// How an ICMP echo request is decided.
+   ///
+   /// `#[serde(default)]` because every installed config predates the key, and the default
+   /// is `deny`: an echo request is an outbound attempt an ICMP tunnel can ride on.
+   #[serde(default)]
+   pub icmp_echo: IcmpAction,
    /// The only non-root UID allowed to use the control socket.
    ///
    /// `None` means root only. It is never a wildcard: a missing value must not widen the
    /// socket permissions to every user.
    pub allowed_uid: Option<u32>,
+   /// The only executable allowed to change firewall state over the control socket.
+   ///
+   /// Every other process of `allowed_uid` keeps read-only access. `None` means any process
+   /// of `allowed_uid` may change state, which the daemon warns about at startup; a path
+   /// that does not exist is a runtime refusal, not a configuration error, so that a
+   /// temporarily missing GUI binary cannot stop the firewall from starting.
+   /// `#[serde(default)]` keeps a config written before this key loading with the
+   /// compatibility behavior instead of failing the daemon's fatal parse.
+   #[serde(default)]
+   pub gui_path: Option<PathBuf>,
    pub log_level: LogLevel,
    /// Unix socket the GUI connects to.
    pub socket_path: PathBuf,
@@ -100,7 +150,10 @@ impl Default for Config {
          prompt_timeout_secs: 30,
          default_action: DefaultAction::Prompt,
          unattributable_closed_flow: ClosedFlowAction::Drop,
+         unmatched_transport: UnmatchedTransport::Deny,
+         icmp_echo: IcmpAction::Deny,
          allowed_uid: None,
+         gui_path: None,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
          rules_path: PathBuf::from("/etc/netshield/rules.db"),
@@ -291,9 +344,23 @@ mod tests {
          config.unattributable_closed_flow,
          ClosedFlowAction::Drop
       );
+      assert_eq!(
+         config.unmatched_transport,
+         UnmatchedTransport::Deny,
+         "an installed config without the key must not open port-less transports"
+      );
+      assert_eq!(
+         config.icmp_echo,
+         IcmpAction::Deny,
+         "an installed config without the key must not allow ICMP echo"
+      );
       assert_eq!(config.table_name(), "netshield");
       assert_eq!(Config::default().table_name(), "netshield");
       assert_eq!(Config::default().table, "netshield");
+      assert_eq!(
+         config.gui_path, None,
+         "an installed config without the key keeps the compatibility behavior"
+      );
 
       for (json, expected) in [
          ("\"allow\"", ClosedFlowAction::Allow),
@@ -317,6 +384,48 @@ mod tests {
          ClosedFlowAction::Drop
       );
       assert_eq!(back, Config::default());
+   }
+
+   #[test]
+   fn the_transport_settings_default_to_deny_and_round_trip() {
+      // The defaults are the security posture: a missing key must deny, never allow.
+      assert_eq!(
+         UnmatchedTransport::default(),
+         UnmatchedTransport::Deny
+      );
+      assert_eq!(IcmpAction::default(), IcmpAction::Deny);
+      assert_eq!(
+         Config::default().unmatched_transport,
+         UnmatchedTransport::Deny
+      );
+      assert_eq!(Config::default().icmp_echo, IcmpAction::Deny);
+
+      let config = Config {
+         unmatched_transport: UnmatchedTransport::Allow,
+         icmp_echo: IcmpAction::Allow,
+         ..Config::default()
+      };
+      let json = serde_json::to_string(&config).expect("serialize the transport settings");
+      assert!(
+         json.contains("\"unmatched_transport\":\"allow\""),
+         "the key must be written lowercase, got: {json}"
+      );
+      assert!(
+         json.contains("\"icmp_echo\":\"allow\""),
+         "the key must be written lowercase, got: {json}"
+      );
+      let back: Config = serde_json::from_str(&json).expect("read the transport settings back");
+      assert_eq!(back, config);
+
+      // An explicit `deny` also round-trips, so the owner can spell out the default.
+      let config = Config {
+         unmatched_transport: UnmatchedTransport::Deny,
+         icmp_echo: IcmpAction::Deny,
+         ..Config::default()
+      };
+      let back: Config = serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+         .expect("deserialize");
+      assert_eq!(back, config);
    }
 
    #[test]
@@ -385,6 +494,30 @@ mod tests {
    }
 
    #[test]
+   fn a_configured_gui_path_is_preserved_and_an_absent_one_defaults() {
+      // The key is what lets the daemon tell the configured GUI from any other process of
+      // the same uid, so a configured path must survive serialisation exactly.
+      let path = PathBuf::from("/usr/local/bin/netshield-gui");
+      let config = Config {
+         gui_path: Some(path.clone()),
+         ..Config::default()
+      };
+      assert_eq!(config.gui_path.as_deref(), Some(path.as_path()));
+      let json = serde_json::to_string(&config).expect("serialize");
+      let back: Config = serde_json::from_str(&json).expect("deserialize");
+      assert_eq!(back.gui_path, Some(path));
+
+      // A config that predates the key must not fail to load: the daemon then warns and
+      // keeps the historical uid-only rule.
+      let without = "{\"queue_num\": 0, \"dns_queue_num\": 1, \"prompt_timeout_secs\": 30, \
+                     \"default_action\": \"prompt\", \"allowed_uid\": 1000, \
+                     \"log_level\": \"info\", \"socket_path\": \"/run/x\", \
+                     \"rules_path\": \"/etc/x\"}";
+      let config: Config = serde_json::from_str(without).expect("an old config must load");
+      assert_eq!(config.gui_path, None);
+   }
+
+   #[test]
    fn the_config_round_trips_through_serde() {
       let config = Config {
          queue_num: 3,
@@ -392,6 +525,7 @@ mod tests {
          prompt_timeout_secs: 45,
          default_action: DefaultAction::Deny,
          allowed_uid: Some(1000),
+         gui_path: Some(PathBuf::from("/usr/local/bin/netshield-gui")),
          log_level: LogLevel::Trace,
          ..Config::default()
       };

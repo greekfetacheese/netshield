@@ -103,6 +103,9 @@ pub struct Connection {
    pub process: Attribution,
    /// Hostname learned from DNS for `remote.addr`, when one was observed.
    pub domain: Option<String>,
+   /// Every other live name for the remote address, so a domain rule matches all of them;
+   /// the first is still `domain`, which stays what a prompt shows.
+   pub also_domains: Vec<String>,
 }
 
 /// The identity of a flow for grant caching and prompt de-duplication.
@@ -185,6 +188,7 @@ mod tests {
             Some("firefox"),
          ),
          domain: Some("api.github.com".to_owned()),
+         also_domains: Vec::new(),
       }
    }
 

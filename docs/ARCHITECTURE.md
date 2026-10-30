@@ -62,6 +62,15 @@ Four properties, each deliberate:
 - **`policy accept`** — the chain is an interception hook, not a filter. Packets that
   match no rule (established flows) continue normally.
 
+The daemon does not trust the table it installed for ever. Every 30 s it reads the table
+back with `nft list table` and re-runs the same check as startup: both chains, both queue
+numbers. A table removed or rewritten by anything else would otherwise leave the daemon
+logging decisions while nothing enforces them. The read-back is one process per interval
+and never per packet; a failure is logged once per transition and published through
+`StatusInfo::table_verified`, which returns to true — with one `info!` — on the next
+successful check. A stalled loop catches up one interval per check rather than running
+the missed probes back to back.
+
 Established flows are *not* re-examined. The first packet of a flow is the decision
 point; afterwards the kernel conntrack entry already exists, so the rest of the
 connection is not interrupted mid-stream by a GUI that has gone away.
@@ -78,6 +87,13 @@ Known and documented gaps (honest limits of a userspace firewall):
   calls at all.
 - DNS over HTTPS/TLS is upstream-encrypted; the daemon can see *that* a resolver
   connection happened, but not the name inside it. See §7.
+- Every queued flow is now decided, prompted or denied; none is waved through. ICMP echo
+  requests and port-less transports (SCTP, DCCP, GRE, ESP, IP-in-IP) are **denied by
+  default**, because no rule can express a decision about them — an unfiltered channel is
+  what this firewall exists to remove. `icmp_echo: allow` and `unmatched_transport: allow`
+  restore the pass-through explicitly. ICMP error types (unreachable, time exceeded,
+  parameter problem, packet too big) always pass: the kernel generates them, and dropping
+  path-MTU messages breaks ordinary TCP.
 
 ## 3. Processes and data flow
 
@@ -107,6 +123,14 @@ Known and documented gaps (honest limits of a userspace firewall):
 - **IPC** is a `SOCK_STREAM` Unix socket, newline-delimited JSON. The daemon is the
   server; it authenticates each connection with `SO_PEERCRED` and rejects any UID other
   than `allowed_uid` (default: the user who owns the session, configured at install).
+  Authorization has two tiers: a peer of `allowed_uid` may always `Hello`, `Subscribe`,
+  `ListRules` and `Status`, but only the configured GUI executable may `Decide`, edit rules
+  or `SetMode`. The server compares the peer's `/proc/<pid>/exe` (with a trailing
+  `" (deleted)"` stripped) to `gui_path` once at connect and again immediately before every
+  state-changing request; a mismatch, an unreadable link or pid 0 is a refusal that answers
+  `Error` and closes the connection. When `gui_path` is absent the historical uid-only rule
+  stands and the daemon warns at startup that any process of that uid can change state; every
+  state-changing request is logged at `info` with the client id, pid, executable and request.
 
 ## 4. The verdict path
 
@@ -184,6 +208,12 @@ Two cases are decided without a prompt, because a prompt could not change anythi
 Both defaults exist because the alternative was measured: Chromium opens and closes speculative
 sockets (QUIC racing losers, cancelled preconnects) inside the ~5 ms attribution window, so the
 old behaviour produced an `unknown` prompt for traffic that had already been abandoned.
+
+A flow whose transport has no ports never reaches attribution at all: an ICMP echo request
+(`icmp_echo`, default `deny`) and every port-less protocol (`unmatched_transport`, default
+`deny`) are decided from the parsed packet and the owner's settings, logged at most once per
+protocol and ICMP type per minute, counted in `queue_drops`, and denied unless explicitly
+allowed. ICMP error types are always accepted so path-MTU discovery keeps working.
 
 On the same machine the daemon also loads a small BPF program on the `sys_enter_sendto` and
 `sys_enter_connect` tracepoints. It records `(uid, destination) -> (thread group id, timestamp)`
@@ -291,8 +321,13 @@ Consequences worth stating plainly:
 - A resolver using DoH/DoT to a local stub (systemd-resolved with `DNSOverTLS=yes`) hides
   the answer from us, so the prompt can only show an IP. The domain option is then
   disabled rather than guessed.
-- When several names map to one address, the most recently learned one is shown and the
-  rest are available in the prompt's details.
+- When several names map to one address, the prompt shows the most recently learned one, but
+  **matching** considers every live name for that address: a domain rule matches if any of
+  them does, and the best match sets its rank. Otherwise a `deny evil.com` would be silently
+  shadowed the moment another name on the same shared address (a CDN edge, typically) was
+  learned, and an `allow bank.com` would only hold while it happened to be the newest name.
+- Per-application name ownership is a v2 item: the app's own query goes over loopback, which
+  this design does not filter, so the cache cannot attribute a name to the process that asked.
 - Entries expire with their record TTL (capped at 1 h) so a reassigned address does not
   inherit a stale name.
 
@@ -314,6 +349,13 @@ Consequences worth stating plainly:
    because a browser can queue dozens of flows before the first answer; queued prompts a
    rule now covers are verdicted and never shown. The prompt being answered is never swept,
    and a queued prompt a rule does not cover keeps waiting without a deadline.
+8. The open prompt set is capped at 2000 (`PendingPrompts::MAX_PROMPTS`). An unbounded set
+   is a same-uid memory DoS: a process that opens distinct flows keeps every one of their
+   `Connection`s and packet ids alive until it is answered or times out. A flow that would
+   create a prompt at the cap is denied and logged once per 60 s, never queued silently;
+   a flow of an app whose prompt is already open still joins it at the cap, because that
+   only adds a destination or a packet id to a prompt that exists and capping it would
+   drop verdicts.
 
 The alert is modelled on Little Snitch's connection alert: app icon and name, "wants to
 connect to *host*", a duration selector, a scope radio group ("Any connection" / "Only
@@ -322,6 +364,15 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 ## 9. Storage and packaging
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
+  `icmp_echo` (`deny` by default) decides an ICMP echo request; `unmatched_transport`
+  (`deny` by default) decides a queued flow whose protocol has no ports (SCTP, DCCP, GRE,
+  ESP, IP-in-IP). `allow` on either restores the pre-2026 pass-through; missing keys load as
+  `deny`, so an upgrade never opens them. ICMP error types always pass.
+  `gui_path` names the only executable allowed to change firewall state over the control
+  socket (the installer writes `$PREFIX/bin/netshield-gui`); every other process of
+  `allowed_uid` stays read-only. `gui_path: null` means any process of `allowed_uid` may
+  change state, and the daemon warns prominently about it at startup. A path that does not
+  exist is not a config error: it is a runtime refusal of every write.
 - `$XDG_CONFIG_HOME/netshield/gui.json` (`~/.config/netshield/gui.json`) — the GUI's own
   preferences: the Connections log's caps, `rows_per_app` (default 100, range 10–1000) and
   `max_apps` (default 32, range 1–128). Written atomically by the unprivileged GUI and never
@@ -372,7 +423,11 @@ parser, the DNS message parser, the netlink socket plumbing. Each is a few hundr
 with unit tests, and each replaces a dependency (or a C library) that would otherwise
 dominate the tree. `nft` is invoked as a process with `nft -f -` (one atomic transaction
 per change) rather than linking `libnftables`; it is a required system tool, not a crate,
-and going native is a later optimisation.
+and going native is a later optimisation. The binary is resolved from a fixed list of
+absolute paths (`/usr/sbin/nft`, `/usr/bin/nft`, `/sbin/nft`, `/bin/nft`), never through
+`PATH`: the daemon runs as root, and a unit or a privileged shell that put a writable
+directory on `PATH` would otherwise choose which binary programs the firewall. If none of the
+four exists the result is `FirewallError::NftMissing`, which already says nftables is required.
 
 ## 11. Testing
 

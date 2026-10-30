@@ -14,9 +14,13 @@
 //! Every frame is bounded by [`MAX_FRAME_LEN`]: the reader accumulates at most that many
 //! bytes and closes the connection rather than letting a client grow the buffer without
 //! limit.
+//!
+//! Outbound frames never go to a socket from the thread that produces them. Each client
+//! owns a writer thread and a bounded queue; the daemon loop and the reader threads only
+//! enqueue, so a peer that stops reading cannot block packet processing.
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -27,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration as StdDuration;
 
 use log::{debug, info, warn};
 use netshield_core::Rule;
@@ -35,13 +40,36 @@ use netshield_core::ipc::{
    frame_len_ok,
 };
 
-use crate::netlink::socket::peer_uid;
+use crate::netlink::socket::peer_creds;
 
 /// The largest frame the reader accepts, quoted in the refusal log line.
 const FRAME_LIMIT: usize = MAX_FRAME_LEN;
 
 /// Bytes taken from the socket per call, so an oversized frame is noticed early.
 const READ_CHUNK: usize = 4096;
+
+/// Frames buffered per control client before the daemon sheds that client.
+///
+/// The bound buys a busy GUI about a second of lag without ever stalling the firewall,
+/// and caps what a peer that stops reading can make the daemon hold in memory. A client
+/// that cannot drain a queue this deep is not reading at all, so the packet path wins.
+const CLIENT_QUEUE_FRAMES: usize = 1024;
+
+/// How long one frame may take to reach a control client before its writer gives up.
+///
+/// A GUI that has not drained 64 KiB in five seconds is gone: either it stopped reading
+/// or the peer is hostile. Without this bound the writer thread parks inside `write_all`
+/// for ever after the client is shed, holding its socket and its stack, so a peer that
+/// connects and never reads would grow the daemon by one thread per connection. The writer
+/// must not outlive the client, so a timed-out write ends the thread instead of retrying.
+const WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+/// Concurrent control clients the daemon serves before refusing new ones.
+///
+/// A desktop has one GUI and maybe a CLI probe, so 64 concurrent control connections is
+/// already pathological: the limit turns "a peer that connects and never reads" from a
+/// thread and socket leak into a refusal, while leaving ample room for the real clients.
+const MAX_CLIENTS: usize = 64;
 
 /// Why the control socket could not be created.
 #[derive(Debug)]
@@ -87,8 +115,13 @@ impl From<io::Error> for IpcError {
 }
 
 /// An authenticated client.
+///
+/// The uid decides whether the peer may talk to the daemon at all; the pid decides whether
+/// it is the configured GUI and may therefore change state, checked against
+/// `/proc/<pid>/exe`. A pid of `0` means the kernel did not report one and can never match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
+   pub pid: u32,
    pub uid: u32,
 }
 
@@ -112,6 +145,64 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
 /// never a wildcard, matching [`netshield_core::Config::allowed_uid`].
 fn peer_allowed(uid: u32, allowed_uid: Option<u32>) -> bool {
    uid == 0 || Some(uid) == allowed_uid
+}
+
+/// The GUI identity the control socket enforces, fixed once at bind time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuiPolicy {
+   /// The uid permitted to talk to the socket at all; `None` is root only.
+   pub allowed_uid: Option<u32>,
+   /// The only executable allowed to change firewall state; `None` keeps the uid-only rule
+   /// for a config installed before the key existed, and is warned about at bind time.
+   pub gui_path: Option<PathBuf>,
+}
+
+/// Whether a peer may change firewall state: only the configured GUI executable.
+///
+/// `exe` is the peer's already-resolved `/proc/<pid>/exe`, so the caller does one `readlink`
+/// per state-changing request and uses the same answer for the audit line. With a
+/// `gui_path` the executable must equal it; a different path, an unreadable link or pid 0
+/// is a refusal. Without one the historical uid-only rule stands, which [`IpcServer::bind`]
+/// warns about because any process of that uid then qualifies.
+fn peer_may_mutate(policy: &GuiPolicy, peer: &Peer, exe: Option<&Path>) -> bool {
+   match policy.gui_path.as_deref() {
+      Some(gui_path) => peer.pid != 0 && exe == Some(gui_path),
+      None => peer_allowed(peer.uid, policy.allowed_uid),
+   }
+}
+
+/// Why a state-changing request was refused, phrased as the requirement it failed.
+fn refusal(policy: &GuiPolicy) -> String {
+   match policy.gui_path.as_deref() {
+      Some(path) => format!(
+         "changing firewall state requires the configured GUI executable {}",
+         path.display()
+      ),
+      None => "changing firewall state requires the allowed uid".to_owned(),
+   }
+}
+
+/// Resolves the executable `/proc/<pid>/exe` points at.
+///
+/// `readlink` on a deleted binary returns the original path with a trailing `" (deleted)"`,
+/// which is stripped so a GUI replaced by an upgrade keeps working until it restarts.
+/// Any error or non-UTF-8 target is `None`, which the caller treats as not-the-GUI.
+fn executable_path(pid: u32) -> Option<PathBuf> {
+   let target = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+   let bytes = target.as_os_str().as_bytes();
+   let suffix = b" (deleted)";
+   if let Some(path) = bytes.strip_suffix(suffix) {
+      return Some(PathBuf::from(OsStr::from_bytes(path)));
+   }
+   Some(target)
+}
+
+/// Whether a request only reads daemon state.
+fn is_read_only(request: &Request) -> bool {
+   matches!(
+      request,
+      Request::Hello { .. } | Request::Subscribe | Request::ListRules | Request::Status
+   )
 }
 
 /// The ownership the control socket gets after bind: uid, gid and mode.
@@ -190,9 +281,57 @@ struct State {
    status: Option<StatusInfo>,
 }
 
-/// One connected client's write half.
+/// One connected client's outbound path: a bounded queue its writer thread drains.
+///
+/// The registry holds only this handle, never the socket, so no thread that produces a
+/// frame can end up blocked in the kernel behind a peer that stopped reading.
 struct Client {
-   writer: Mutex<UnixStream>,
+   queue: mpsc::SyncSender<Vec<u8>>,
+   /// Frames this client could not accept, quoted in the line that sheds it.
+   dropped: AtomicU64,
+}
+
+/// How handing a frame to a client's writer thread ended.
+enum Enqueue {
+   /// The frame is queued; the writer thread will send it in order.
+   Queued,
+   /// The queue is full, so the client is not draining its socket.
+   Stalled,
+   /// The writer thread is gone, so the registry entry is stale.
+   Gone,
+}
+
+/// Hands one encoded frame to a client's writer thread without ever blocking.
+fn enqueue(client: &Client, bytes: &[u8]) -> Enqueue {
+   match client.queue.try_send(bytes.to_vec()) {
+      Ok(()) => Enqueue::Queued,
+      Err(mpsc::TrySendError::Full(_)) => {
+         client.dropped.fetch_add(1, Ordering::Relaxed);
+         Enqueue::Stalled
+      }
+      Err(mpsc::TrySendError::Disconnected(_)) => Enqueue::Gone,
+   }
+}
+
+/// Drains one client's frame queue onto its socket.
+///
+/// The thread owns the write half, so frames leave in the order they were enqueued. It
+/// exits when the client is unregistered (the last sender is dropped) or a write fails;
+/// either way the failure stays on this thread instead of the packet path. The socket
+/// carries [`WRITE_TIMEOUT`], so a peer that never reads makes the write fail with
+/// `WouldBlock`/`TimedOut` after that bound instead of parking the thread for ever; every
+/// write error, including `BrokenPipe`/`ConnectionReset`, ends the writer without a retry.
+fn write_frames(mut writer: UnixStream, receiver: mpsc::Receiver<Vec<u8>>) {
+   if let Err(err) = writer.set_write_timeout(Some(WRITE_TIMEOUT)) {
+      debug!("control client writer cannot bound its write, stopping: {err}");
+      return;
+   }
+   for bytes in receiver {
+      if let Err(err) = writer.write_all(&bytes) {
+         debug!("control client writer stopped: {err}");
+         break;
+      }
+   }
 }
 
 /// State shared by the acceptor, the reader threads and the daemon loop.
@@ -205,13 +344,32 @@ struct Shared {
 }
 
 impl Shared {
+   /// Registers a client and starts its writer thread.
+   ///
+   /// The count is checked and the new entry inserted under one lock, so concurrent
+   /// acceptors cannot both slip past [`MAX_CLIENTS`]. A refusal is an
+   /// [`io::ErrorKind::ConnectionAborted`] error and leaves the registry untouched; the
+   /// caller drops the socket.
    fn register(&self, stream: &UnixStream) -> io::Result<u64> {
+      let mut clients = self.clients.lock().expect("client registry");
+      if clients.len() >= MAX_CLIENTS {
+         return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("control client limit of {MAX_CLIENTS} reached"),
+         ));
+      }
       let writer = stream.try_clone()?;
       let id = self.next_client.fetch_add(1, Ordering::Relaxed);
-      self.clients.lock().expect("client registry").insert(
+      let (queue, receiver) = mpsc::sync_channel(CLIENT_QUEUE_FRAMES);
+      let name = format!("netshield-ipc-writer-{id}");
+      thread::Builder::new()
+         .name(name)
+         .spawn(move || write_frames(writer, receiver))?;
+      clients.insert(
          id,
          Client {
-            writer: Mutex::new(writer),
+            queue,
+            dropped: AtomicU64::new(0),
          },
       );
       Ok(id)
@@ -236,13 +394,20 @@ impl Shared {
             return;
          }
       };
-      let clients = self.clients.lock().expect("client registry");
-      let Some(client) = clients.get(&id) else {
-         return;
+      let outcome = {
+         let clients = self.clients.lock().expect("client registry");
+         clients.get(&id).map(|client| enqueue(client, &bytes))
       };
-      let mut writer = client.writer.lock().expect("client writer");
-      if let Err(err) = writer.write_all(&bytes) {
-         debug!("control client {id}: write failed: {err}");
+      match outcome {
+         None | Some(Enqueue::Queued) => {}
+         Some(Enqueue::Stalled) => self.shed(id, message),
+         Some(Enqueue::Gone) => {
+            debug!(
+               "control client {id} is gone; its {} frame was dropped",
+               kind(message)
+            );
+            self.unregister(id);
+         }
       }
    }
 
@@ -259,23 +424,48 @@ impl Shared {
          }
       };
 
+      let mut stalled = Vec::new();
       let mut gone = Vec::new();
       {
          let clients = self.clients.lock().expect("client registry");
          for (id, client) in clients.iter() {
-            let mut writer = client.writer.lock().expect("client writer");
-            if writer.write_all(&bytes).is_err() {
-               gone.push(*id);
+            match enqueue(client, &bytes) {
+               Enqueue::Queued => {}
+               Enqueue::Stalled => stalled.push(*id),
+               Enqueue::Gone => gone.push(*id),
             }
          }
       }
-      if gone.is_empty() {
-         return;
-      }
-      let mut clients = self.clients.lock().expect("client registry");
       for id in gone {
-         clients.remove(&id);
+         debug!("control client {id} is gone; unregistering it");
+         self.unregister(id);
       }
+      for id in stalled {
+         self.shed(id, message);
+      }
+   }
+
+   /// Unregisters a client that cannot keep up and warns about it once.
+   ///
+   /// The client is removed on the first full queue, so the warning needs no timer of its
+   /// own: there is exactly one per client. Dropping the queue sender ends its writer
+   /// thread and discards the backlog, which is the whole point — a peer that does not
+   /// read its socket is either dead or hostile, and the packet path must not wait for it.
+   fn shed(&self, id: u64, message: &Response) {
+      let dropped = self
+         .clients
+         .lock()
+         .expect("client registry")
+         .remove(&id)
+         .map(|client| client.dropped.load(Ordering::Relaxed));
+      let Some(dropped) = dropped else {
+         return;
+      };
+      warn!(
+         "control client {id} cannot keep up; closing it or the firewall stalls \
+          ({dropped} {} frame(s) could not be queued; its backlog is discarded)",
+         kind(message)
+      );
    }
 }
 
@@ -296,7 +486,7 @@ fn kind(message: &Response) -> &'static str {
 pub struct IpcServer {
    listener: UnixListener,
    path: PathBuf,
-   allowed_uid: Option<u32>,
+   policy: GuiPolicy,
    shared: Arc<Shared>,
 }
 
@@ -306,7 +496,11 @@ impl IpcServer {
    /// Refuses to run unless the caller is root. The socket file is mode `0660`; a parent
    /// directory this call creates is mode `0750`, while an existing one (for example
    /// `/run`) is left exactly as the system set it up.
-   pub fn bind(socket_path: &Path, allowed_uid: Option<u32>) -> Result<Self, IpcError> {
+   pub fn bind(
+      socket_path: &Path,
+      allowed_uid: Option<u32>,
+      gui_path: Option<PathBuf>,
+   ) -> Result<Self, IpcError> {
       if effective_uid() != Some(0) {
          warn!("refusing to bind the control socket: not running as root");
          return Err(IpcError::NotRoot);
@@ -329,16 +523,27 @@ impl IpcServer {
          );
       }
 
+      if gui_path.is_none() {
+         warn!(
+            "no gui_path configured: any process running as uid {} can change rules and mode",
+            allowed_uid.map_or_else(|| "root".to_owned(), |uid| uid.to_string())
+         );
+      }
+
       let (sender, receiver) = mpsc::channel();
       info!(
-         "control socket listening on {} (allowed uid {:?})",
+         "control socket listening on {} (allowed uid {:?}, gui path {:?})",
          socket_path.display(),
-         allowed_uid
+         allowed_uid,
+         gui_path
       );
       Ok(Self {
          listener,
          path: socket_path.to_path_buf(),
-         allowed_uid,
+         policy: GuiPolicy {
+            allowed_uid,
+            gui_path,
+         },
          shared: Arc::new(Shared {
             clients: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -359,7 +564,7 @@ impl IpcServer {
    /// or silent client cannot hold up the accept loop for everyone else.
    pub fn spawn(self) -> IpcHandle {
       let shared = Arc::clone(&self.shared);
-      let allowed_uid = self.allowed_uid;
+      let policy = self.policy;
       let listener = self.listener;
       let path = self.path;
 
@@ -374,9 +579,10 @@ impl IpcServer {
                   }
                };
                let reader_shared = Arc::clone(&shared);
+               let reader_policy = policy.clone();
                let reader = thread::Builder::new()
                   .name("netshield-ipc-client".to_owned())
-                  .spawn(move || serve(stream, reader_shared, allowed_uid));
+                  .spawn(move || serve(stream, reader_shared, reader_policy));
                if let Err(err) = reader {
                   warn!("could not spawn a control reader: {err}");
                }
@@ -480,19 +686,25 @@ fn remove_stale_socket(path: &Path) -> Result<(), IpcError> {
 }
 
 /// Serves one client: authenticate, handshake, then dispatch until it disconnects.
-fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) {
-   let uid = match peer_uid(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
-      Ok(uid) => uid,
+fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+   let cred = match peer_creds(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
+      Ok(cred) => cred,
       Err(err) => {
          warn!("could not read a control peer's credentials, closing it: {err}");
          return;
       }
    };
-   if !peer_allowed(uid, allowed_uid) {
-      warn!("refusing the control socket to uid {uid}: not root and not the allowed user");
+   if !peer_allowed(cred.uid, policy.allowed_uid) {
+      warn!(
+         "refusing the control socket to uid {}: not root and not the allowed user",
+         cred.uid
+      );
       return;
    }
-   let client = Peer { uid };
+   let client = Peer {
+      pid: cred.pid,
+      uid: cred.uid,
+   };
    let id = match shared.register(&stream) {
       Ok(id) => id,
       Err(err) => {
@@ -500,9 +712,10 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) 
          return;
       }
    };
+   let exe = executable_path(client.pid);
    debug!(
-      "control client {id} connected as uid {}",
-      client.uid
+      "control client {id} connected as uid {} (pid {}, exe {exe:?})",
+      client.uid, client.pid
    );
 
    let mut buffered = Vec::new();
@@ -539,7 +752,7 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) 
          }
       };
 
-      if !dispatch(id, request, &shared) {
+      if !dispatch(id, request, &shared, &policy, &client) {
          break;
       }
    }
@@ -604,7 +817,29 @@ fn handshake(stream: &mut UnixStream, shared: &Shared, id: u64, buffered: &mut V
 }
 
 /// Handles one decoded request; `false` closes the connection.
-fn dispatch(id: u64, request: Request, shared: &Shared) -> bool {
+///
+/// The read/mutate split is enforced here. A read-only request is served for any peer that
+/// passed [`peer_allowed`]. A state-changing one is refused unless the peer is the GUI,
+/// and the executable is re-read before every such request: a process can `exec` a
+/// different binary after connecting, so the check at accept time is not enough.
+fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer: &Peer) -> bool {
+   if !is_read_only(&request) {
+      let exe = executable_path(peer.pid);
+      if !peer_may_mutate(policy, peer, exe.as_deref()) {
+         let message = refusal(policy);
+         warn!(
+            "refusing the control request from client {id} (pid {}, exe {exe:?}): {message}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message });
+         return false;
+      }
+      info!(
+         "control client {id} (pid {}, exe {exe:?}) {request:?}",
+         peer.pid
+      );
+   }
+
    match request {
       Request::Hello { .. } => {
          shared.send(
@@ -720,6 +955,7 @@ mod tests {
    use netshield_core::rule::{Action, AppMatcher, DestMatcher, Duration, RuleId};
    use std::io::Cursor;
    use std::time::Duration as StdDuration;
+   use std::time::Instant;
 
    fn shared() -> Arc<Shared> {
       let (sender, receiver) = mpsc::channel();
@@ -786,6 +1022,63 @@ mod tests {
 
    fn pair() -> (UnixStream, UnixStream) {
       UnixStream::pair().expect("socketpair")
+   }
+
+   /// The `/proc` prefix the daemon's writer threads appear under.
+   ///
+   /// Linux truncates a thread name to 15 bytes, so `netshield-ipc-writer-<id>` reads back
+   /// as `netshield-ipc-w`; the shortened prefix is what the kernel actually reports.
+   const WRITER_PREFIX: &str = "netshield-ipc-w";
+
+   /// The ids of this process's threads whose `/proc` name starts with `prefix`.
+   ///
+   /// Ids rather than a count: tests share the process and exactly one other test may have
+   /// a writer thread parked for up to [`WRITE_TIMEOUT`], so "our writer is gone" is "no id
+   /// outside the baseline set is alive", which cannot be satisfied by an unrelated thread
+   /// dying at the same moment.
+   fn threads_named(prefix: &str) -> Vec<u32> {
+      let tasks = fs::read_dir("/proc/self/task").expect("this process's thread directory");
+      tasks
+         .filter_map(Result::ok)
+         .filter(|task| {
+            fs::read_to_string(task.path().join("comm"))
+               .is_ok_and(|comm| comm.trim_end().starts_with(prefix))
+         })
+         .filter_map(|task| task.file_name().to_str()?.parse().ok())
+         .collect()
+   }
+
+   /// Serialises the tests that create many writer threads, so they never overlap.
+   fn serial() -> std::sync::MutexGuard<'static, ()> {
+      static LOCK: Mutex<()> = Mutex::new(());
+      LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+   }
+
+   /// Polls `predicate` every 100 ms until `deadline`, returning whether it became true.
+   fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool) -> bool {
+      loop {
+         if predicate() {
+            return true;
+         }
+         if Instant::now() >= deadline {
+            return false;
+         }
+         thread::sleep(StdDuration::from_millis(100));
+      }
+   }
+
+   /// The policy the pre-existing tests run under: the configured uid may change state
+   /// because no `gui_path` is set, which is the compatibility branch.
+   fn policy(allowed_uid: Option<u32>) -> GuiPolicy {
+      GuiPolicy {
+         allowed_uid,
+         gui_path: None,
+      }
+   }
+
+   /// The path of this test binary, which is its own peer's `/proc/<pid>/exe`.
+   fn self_exe() -> PathBuf {
+      fs::read_link("/proc/self/exe").expect("the test binary's own exe")
    }
 
    fn read_response(client: &mut UnixStream, buffered: &mut Vec<u8>) -> Response {
@@ -913,6 +1206,172 @@ mod tests {
    }
 
    #[test]
+   fn a_client_that_never_reads_cannot_stall_the_loop() {
+      let shared = shared();
+      let (server, _client) = pair();
+
+      // Make "never reads" deterministic before the writer thread exists: fill this
+      // direction's socket buffer with non-blocking writes from the server end, so the
+      // writer has no room to absorb a frame and blocks on its first write. Otherwise the
+      // writer could swallow a few hundred frames into the socket buffer before the queue
+      // filled, leaving the outcome dependent on the kernel's buffer size.
+      {
+         let mut filler = server.try_clone().expect("fill the socket buffer");
+         filler.set_nonblocking(true).expect("non-blocking");
+         let chunk = [b'x'; READ_CHUNK];
+         while filler.write(&chunk).is_ok() {}
+         filler.set_nonblocking(false).expect("blocking again");
+      }
+      // The peer end is never read from here on.
+
+      shared.register(&server).expect("register the silent client");
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      assert_eq!(handle.clients(), 1);
+
+      let status = status(Mode::Alert, 0);
+      let started = Instant::now();
+      for _ in 0..CLIENT_QUEUE_FRAMES + 50 {
+         shared.broadcast(&Response::Status(status.clone()));
+      }
+      let elapsed = started.elapsed();
+      assert!(
+         elapsed < StdDuration::from_secs(2),
+         "a silent client blocked the loop for {elapsed:?}"
+      );
+      assert_eq!(
+         handle.clients(),
+         0,
+         "a client that cannot keep up must be unregistered"
+      );
+   }
+
+   #[test]
+   fn a_shed_client_stops_its_writer_thread() {
+      let _serial = serial();
+      // Another test's writer could still be alive here, so only the return to this
+      // baseline is asserted, and the poll below waits for every writer to be gone.
+      let baseline = threads_named(WRITER_PREFIX);
+
+      let shared = shared();
+      let (server, _client) = pair();
+
+      // The same deterministic setup as `a_client_that_never_reads_cannot_stall_the_loop`:
+      // fill this direction's socket buffer from the server end before the writer exists,
+      // so the writer blocks on its first byte and is parked in `write_all`, not merely
+      // holding a full queue.
+      {
+         let mut filler = server.try_clone().expect("fill the socket buffer");
+         filler.set_nonblocking(true).expect("non-blocking");
+         let chunk = [b'x'; READ_CHUNK];
+         while filler.write(&chunk).is_ok() {}
+         filler.set_nonblocking(false).expect("blocking again");
+      }
+      // The peer end is never read from here on.
+
+      shared.register(&server).expect("register the silent client");
+      // The name is applied by the thread itself; a count taken before that would miss the
+      // writer and let the test pass without ever observing a parked one, so confirm the
+      // thread is visible before shedding it.
+      assert!(
+         wait_until(Instant::now() + StdDuration::from_secs(2), || {
+            threads_named(WRITER_PREFIX).iter().any(|id| !baseline.contains(id))
+         }),
+         "the registered client's writer thread never appeared"
+      );
+
+      let status = status(Mode::Alert, 0);
+      for _ in 0..CLIENT_QUEUE_FRAMES + 50 {
+         shared.broadcast(&Response::Status(status.clone()));
+      }
+      assert_eq!(shared.clients(), 0, "a silent client is shed");
+
+      // The writer is parked in a write that the socket timeout now bounds; it can only
+      // disappear once that `write_all` returns and the thread runs off the end of its
+      // loop, so this waits out `WRITE_TIMEOUT` plus scheduling slack.
+      let deadline = Instant::now() + WRITE_TIMEOUT * 3;
+      assert!(
+         wait_until(deadline, || {
+            threads_named(WRITER_PREFIX).iter().all(|id| baseline.contains(id))
+         }),
+         "a shed client's writer thread outlived WRITE_TIMEOUT: {:?} writer thread(s) still \
+          alive, baseline {baseline:?}",
+         threads_named(WRITER_PREFIX)
+      );
+   }
+
+   #[test]
+   fn the_client_registry_refuses_more_than_the_limit() {
+      let _serial = serial();
+      let shared = shared();
+      // Hold every peer end so no writer sees EOF and no socket is dropped early.
+      let mut peers = Vec::with_capacity(MAX_CLIENTS);
+      for _ in 0..MAX_CLIENTS {
+         let (server, peer) = pair();
+         shared.register(&server).expect("register within the limit");
+         peers.push(peer);
+      }
+      assert_eq!(shared.clients(), MAX_CLIENTS);
+
+      let (server, _peer) = pair();
+      let err = shared.register(&server).expect_err("the registry is full");
+      assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+      assert!(
+         err.to_string().contains(&MAX_CLIENTS.to_string()),
+         "the refusal must name the limit, got: {err}"
+      );
+      assert_eq!(
+         shared.clients(),
+         MAX_CLIENTS,
+         "a refused client must not be registered"
+      );
+   }
+
+   #[test]
+   fn a_reading_client_receives_frames_in_order() {
+      let shared = shared();
+      let (server, mut client) = pair();
+      shared.register(&server).expect("register the reading client");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+
+      let reader = thread::spawn(move || {
+         let mut buffered = Vec::new();
+         let mut frames = Vec::new();
+         for _ in 0..2 {
+            frames.push(read_response(&mut client, &mut buffered));
+         }
+         frames
+      });
+
+      shared.broadcast(&Response::Error {
+         message: "one".to_owned(),
+      });
+      shared.broadcast(&Response::Error {
+         message: "two".to_owned(),
+      });
+
+      let frames = reader.join().expect("reader thread");
+      assert_eq!(
+         frames,
+         vec![
+            Response::Error {
+               message: "one".to_owned()
+            },
+            Response::Error {
+               message: "two".to_owned()
+            },
+         ],
+         "frames must arrive complete and in the order they were broadcast"
+      );
+      assert_eq!(
+         shared.clients(),
+         1,
+         "a client that keeps reading stays registered"
+      );
+   }
+
+   #[test]
    fn the_handle_publishes_status_rules_and_mode() {
       let shared = shared();
       let handle = IpcHandle {
@@ -939,7 +1398,7 @@ mod tests {
       let (server, mut client) = pair();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
       client
@@ -980,7 +1439,7 @@ mod tests {
          return;
       }
       let path = temp_socket("nonroot");
-      let err = match IpcServer::bind(&path, Some(1000)) {
+      let err = match IpcServer::bind(&path, Some(1000), None) {
          Ok(_) => panic!("a non-root caller must be refused"),
          Err(err) => err,
       };
@@ -1002,7 +1461,7 @@ mod tests {
 
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
       client
@@ -1031,7 +1490,7 @@ mod tests {
       let shared = shared();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION + 1)).expect("hello");
       let mut buffered = Vec::new();
@@ -1055,7 +1514,7 @@ mod tests {
       let shared = shared();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
       let mut buffered = Vec::new();
@@ -1073,7 +1532,7 @@ mod tests {
       let probe = Arc::clone(&shared);
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       let decide = Request::Decide(DecideRequest {
          prompt_id: 9,
@@ -1106,9 +1565,19 @@ mod tests {
       let (server, mut client) = pair();
       let shared = shared();
       let allowed = our_uid().map(|uid| uid.wrapping_add(1));
-      let reader = thread::spawn(move || serve(server, shared, allowed));
+      let reader = thread::spawn(move || serve(server, shared, policy(allowed)));
 
-      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      // The server (correctly) closes an unauthorised peer before its Hello lands, so a
+      // failed write here means it already closed us — exactly what this test asserts.
+      if let Err(err) = client.write_all(&hello(PROTOCOL_VERSION)) {
+         assert!(
+            matches!(
+               err.kind(),
+               std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "the Hello write failed for a reason other than the server closing: {err}"
+         );
+      }
       let mut rest = Vec::new();
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
       // Closing a socket that still holds unread client bytes makes the kernel answer
@@ -1122,6 +1591,141 @@ mod tests {
          rest.is_empty(),
          "the server must not answer an unauthorised peer"
       );
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_non_gui_peer_may_read_but_not_mutate() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let rule = rule();
+      handle.set_rules(std::slice::from_ref(&rule));
+      handle.set_status(status(Mode::Alert, 1));
+
+      let uid = our_uid().expect("our own uid");
+      let gui = GuiPolicy {
+         allowed_uid: Some(uid),
+         gui_path: Some(PathBuf::from("/bin/definitely-not-the-gui")),
+      };
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, gui));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::ListRules).expect("list rules"))
+         .expect("send");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut buffered = Vec::new();
+      assert_eq!(
+         read_response(&mut client, &mut buffered),
+         Response::Rules { rules: vec![rule] },
+         "reads stay available to a non-GUI peer of the allowed uid"
+      );
+      match read_response(&mut client, &mut buffered) {
+         Response::Error { message } => assert!(
+            message.contains("GUI"),
+            "the refusal must name the requirement, got: {message}"
+         ),
+         other => panic!("expected Error, got {other:?}"),
+      }
+
+      // A refusal closes the connection: a clean EOF or the RST the kernel sends when the
+      // server closes a socket that still holds the client's unread bytes.
+      let mut rest = Vec::new();
+      match client.read_to_end(&mut rest) {
+         Ok(0) => {}
+         Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+         other => panic!("expected the peer to be closed, got {other:?}"),
+      }
+      assert_eq!(
+         handle.mode(),
+         Mode::Alert,
+         "the refused SetMode must not reach the server state"
+      );
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn the_configured_gui_may_change_state() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let uid = our_uid().expect("our own uid");
+      let gui = GuiPolicy {
+         allowed_uid: Some(uid),
+         gui_path: Some(self_exe()),
+      };
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, gui));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut changed = false;
+      for _ in 0..100 {
+         if handle.mode() == Mode::Silent {
+            changed = true;
+            break;
+         }
+         thread::sleep(StdDuration::from_millis(10));
+      }
+      assert!(changed, "the configured GUI's SetMode must apply");
+
+      // The connection stayed open and no Error frame was queued: the next request is a
+      // read that the same session must be able to serve.
+      client
+         .write_all(&encode_line(&Request::ListRules).expect("list rules"))
+         .expect("send");
+      let mut buffered = Vec::new();
+      assert!(matches!(
+         read_response(&mut client, &mut buffered),
+         Response::Rules { .. }
+      ));
+
+      drop(client);
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn without_a_gui_path_the_uid_rule_still_applies() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let uid = our_uid().expect("our own uid");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut changed = false;
+      for _ in 0..100 {
+         if handle.mode() == Mode::Silent {
+            changed = true;
+            break;
+         }
+         thread::sleep(StdDuration::from_millis(10));
+      }
+      assert!(
+         changed,
+         "without gui_path the allowed uid keeps the old write permission"
+      );
+
+      drop(client);
       reader.join().expect("reader thread");
    }
 }
