@@ -39,6 +39,7 @@ use netshield_core::ipc::{
    MAX_FRAME_LEN, Mode, PROTOCOL_VERSION, Request, Response, StatusInfo, decode_line, encode_line,
    frame_len_ok,
 };
+use netshield_core::rule::socket_rule_refusal;
 
 use crate::netlink::socket::peer_creds;
 
@@ -838,6 +839,26 @@ fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer
          "control client {id} (pid {}, exe {exe:?}) {request:?}",
          peer.pid
       );
+   }
+
+   // A rule the socket may not express is answered with an error instead of being forwarded: the
+   // daemon loop applies whatever reaches it verbatim, and one request must not be a silent
+   // allow-all on disk. The connection stays open — this is a refusal of the request, not of the
+   // peer.
+   if let Request::UpsertRule { rule } = &request
+      && let Some(reason) = socket_rule_refusal(rule)
+   {
+      warn!(
+         "refusing a rule from client {id} (pid {}): {reason}",
+         peer.pid
+      );
+      shared.send(
+         id,
+         &Response::Error {
+            message: reason.to_owned(),
+         },
+      );
+      return true;
    }
 
    match request {
@@ -1724,6 +1745,46 @@ mod tests {
       assert!(
          changed,
          "without gui_path the allowed uid keeps the old write permission"
+      );
+
+      drop(client);
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_global_rule_is_refused_even_from_the_gui() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let uid = our_uid().expect("our own uid");
+      let gui = GuiPolicy {
+         allowed_uid: Some(uid),
+         gui_path: Some(self_exe()),
+      };
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, gui));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      let mut broad = rule();
+      broad.app = AppMatcher::Any;
+      broad.dest = DestMatcher::Any;
+      client
+         .write_all(&encode_line(&Request::UpsertRule { rule: broad }).expect("upsert"))
+         .expect("send");
+
+      let mut buffered = Vec::new();
+      match read_response(&mut client, &mut buffered) {
+         Response::Error { message } => assert!(
+            message.contains("every application") && message.contains("every destination"),
+            "the refusal must say what the rule may not express, got: {message}"
+         ),
+         other => panic!("expected Error, got {other:?}"),
+      }
+      assert!(
+         handle.try_recv().is_none(),
+         "a refused rule must never reach the daemon loop"
       );
 
       drop(client);
