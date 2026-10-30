@@ -1567,7 +1567,17 @@ mod tests {
       let allowed = our_uid().map(|uid| uid.wrapping_add(1));
       let reader = thread::spawn(move || serve(server, shared, policy(allowed)));
 
-      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      // The server (correctly) closes an unauthorised peer before its Hello lands, so a
+      // failed write here means it already closed us — exactly what this test asserts.
+      if let Err(err) = client.write_all(&hello(PROTOCOL_VERSION)) {
+         assert!(
+            matches!(
+               err.kind(),
+               std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+            ),
+            "the Hello write failed for a reason other than the server closing: {err}"
+         );
+      }
       let mut rest = Vec::new();
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
       // Closing a socket that still holds unread client bytes makes the kernel answer
