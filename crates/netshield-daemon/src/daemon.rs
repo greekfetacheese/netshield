@@ -684,8 +684,10 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
       "the daemon started",
    );
    if daemon.config.dns_servers.is_empty() {
-      info!(
-         "dns names are learned from any source; set dns_servers to restrict them to your resolvers"
+      warn!(
+         "dns names are learned from any sender on port 53: a host that answers a query can name its \
+          own address, so a domain rule can be made to match it; set dns_servers to your resolver \
+          addresses to refuse names from anywhere else"
       );
    } else {
       info!(
