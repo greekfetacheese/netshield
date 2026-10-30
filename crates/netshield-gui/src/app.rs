@@ -429,14 +429,10 @@ impl App {
          && Instant::now() >= at
       {
          self.prefs_save_at = None;
-         let submitted = self
+         let _ = self
             .work
             .as_ref()
             .is_some_and(|work| work.submit(work::Job::SavePrefs(self.prefs)));
-         if !submitted {
-            // No work thread: write it here rather than lose the user's setting.
-            self.prefs.save();
-         }
       }
 
       let now = Instant::now();
