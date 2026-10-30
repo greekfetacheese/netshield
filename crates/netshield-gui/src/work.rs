@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::ipc::Waker;
+use crate::prefs::Prefs;
 use crate::ui::connections::{LinesJob, LinesReady, derive};
 
 /// One unit of work handed to the thread.
@@ -15,6 +16,10 @@ use crate::ui::connections::{LinesJob, LinesReady, derive};
 pub enum Job {
    /// Rebuild the Connections lines from an owned snapshot of the log and the rules.
    Lines(Box<LinesJob>),
+   /// Write the preferences file. The UI has already applied these caps, so nothing comes
+   /// back: the file is the output, and an `fsync` on the paint thread is exactly what this
+   /// job exists to avoid.
+   SavePrefs(Prefs),
 }
 
 /// One finished derivation, tagged with the inputs it was built from.
@@ -37,13 +42,17 @@ impl Worker {
       let (done_tx, done) = mpsc::channel::<Done>();
       let spawned = thread::Builder::new().name("netshield-work".to_owned()).spawn(move || {
          while let Ok(job) = job_rx.recv() {
-            let finished = match job {
-               Job::Lines(job) => Done::Lines(Box::new(derive(&job))),
-            };
-            if done_tx.send(finished).is_err() {
-               break;
+            match job {
+               Job::Lines(job) => {
+                  if done_tx.send(Done::Lines(Box::new(derive(&job)))).is_err() {
+                     break;
+                  }
+                  // Only a finished derivation has something for the UI to install; a save
+                  // wakes nobody.
+                  waker();
+               }
+               Job::SavePrefs(prefs) => prefs.save(),
             }
-            waker();
          }
       });
       match spawned {
@@ -60,8 +69,32 @@ impl Worker {
       self.jobs.send(job).is_ok()
    }
 
+   /// A submitting handle, for callers that do not own this worker.
+   pub fn handle(&self) -> Handle {
+      Handle {
+         jobs: self.jobs.clone(),
+      }
+   }
+
    /// Non-blocking drain for the UI: `None` when nothing has finished yet.
    pub fn poll(&self) -> Option<Done> {
       self.done.try_recv().ok()
+   }
+}
+
+/// A second way into the work thread's queue.
+///
+/// The `Worker` owns the result channel and belongs to the Connections cache; anything else
+/// that only needs to *submit* work (the preferences save) takes a handle instead, so one
+/// thread serves the whole GUI and nothing has to be re-plumbed to reach it.
+#[derive(Debug)]
+pub struct Handle {
+   jobs: Sender<Job>,
+}
+
+impl Handle {
+   /// Queues one job; `false` when the thread is gone, so the caller can fall back.
+   pub fn submit(&self, job: Job) -> bool {
+      self.jobs.send(job).is_ok()
    }
 }

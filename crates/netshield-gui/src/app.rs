@@ -75,6 +75,9 @@ pub struct App {
    /// When the caps changed last, if the file has not been written since. `None` means
    /// there is nothing to write.
    prefs_save_at: Option<Instant>,
+   /// The work thread's submitting handle, kept so the preferences save never runs an
+   /// `fsync` on the paint thread. `None` when the thread could not start, or in the tests.
+   work: Option<work::Handle>,
    mock: bool,
    /// `--alert`: the root window is the alert instead of the main navigation shell.
    alert: bool,
@@ -239,6 +242,7 @@ impl App {
          })
       };
       let work = work::Worker::spawn(work_waker);
+      let save_work = work.as_ref().map(work::Worker::handle);
       let ipc = if cli.mock {
          None
       } else {
@@ -269,6 +273,7 @@ impl App {
          log: ConnectionLog::new(prefs.rows_per_app, prefs.max_apps),
          prefs,
          prefs_save_at: None,
+         work: save_work,
          mock: cli.mock,
          alert: cli.alert,
          pending: Vec::new(),
@@ -419,11 +424,19 @@ impl App {
       self.sync_pending();
 
       // A dragged cap changes on every frame; the file is written once the value settles.
+      // The write itself (temp file + fsync + rename) runs on the work thread, never here.
       if let Some(at) = self.prefs_save_at
          && Instant::now() >= at
       {
          self.prefs_save_at = None;
-         self.prefs.save();
+         let submitted = self
+            .work
+            .as_ref()
+            .is_some_and(|work| work.submit(work::Job::SavePrefs(self.prefs)));
+         if !submitted {
+            // No work thread: write it here rather than lose the user's setting.
+            self.prefs.save();
+         }
       }
 
       let now = Instant::now();
