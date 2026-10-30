@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod connection;
+pub mod destlist;
 pub mod dns;
 pub mod dns_cache;
 pub mod ipc;

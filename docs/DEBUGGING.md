@@ -225,9 +225,11 @@ is a documented limit, not a regression; see `docs/ARCHITECTURE.md` §5.
 Two further traps:
 
 - **`Until restart` rules are memory-only.** Choosing *until restart* (wire value `session`)
-  deliberately does **not** write `rules.json`; the file staying empty or unchanged is
-  correct. Only `forever` persists. If you expected a rule in the file, check the decision
-  line in §2 for the duration, not the file.
+  deliberately does **not** reach the rule store; the database staying unchanged is correct. Only
+  `forever` persists. If you expected a rule on disk, check the decision line in §2 for the
+  duration, not the store. The store is a redb database (`/etc/netshield/rules.db` by default), so
+  it cannot be read with `cat`; ask the daemon (`listrules` on the control socket) instead of
+  inspecting the file.
 - **`stat` follows the link; `lstat` gives the descriptor's own time.** `/proc/<pid>/fd/*`
   entries are symlinks, and the two calls do not mean the same thing:
 

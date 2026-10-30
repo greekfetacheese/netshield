@@ -123,7 +123,7 @@ install_config() {
   "allowed_uid": $allowed_uid,
   "log_level": "info",
   "socket_path": "$SOCKET_PATH",
-  "rules_path": "/etc/netshield/rules.json"
+  "rules_path": "/etc/netshield/rules.db"
 }
 EOF
    chmod 0640 "$CONFIG_FILE"

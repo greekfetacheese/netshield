@@ -14,8 +14,10 @@ use crate::connection::{Attribution, Connection, Family, L4Proto};
 use crate::rule::{Action, Duration, Rule, RuleId};
 
 /// Bumped whenever the meaning of a message changes; a client that does not match is
-/// rejected at `Hello` instead of failing later in the middle of a prompt.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// rejected at `Hello` instead of failing later in the middle of a prompt. A rule's scope can
+/// now be a list, and a client that cannot read it must be turned away at `Hello` rather than
+/// dropping the whole rules frame, which renders as an empty Rules page.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The largest frame the daemon will accept or produce, including the newline.
 pub const MAX_FRAME_LEN: usize = 64 * 1024;

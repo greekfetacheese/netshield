@@ -19,7 +19,7 @@
 #   daemon.pid    the daemon's PID, so the trap can stop it
 #   trigger       write a line here to make the namespace create a flow
 #   control.sock  the control socket dev/decide-client.py connects to
-#   rules.json    the rule store; `forever` rules land here, memory-only ones do not
+#   rules.db      the rule store; `forever` rules land here, memory-only ones do not
 set -u
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -29,7 +29,7 @@ daemon_log="$run/daemon.log"
 pid_file="$run/daemon.pid"
 trigger="$run/trigger"
 sock="$run/control.sock"
-rules="$run/rules.json"
+rules="$run/rules.db"
 dummy_ip="10.88.0.1/24"
 dummy_peer="10.88.0.2"
 

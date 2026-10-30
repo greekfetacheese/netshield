@@ -103,7 +103,7 @@ impl Default for Config {
          allowed_uid: None,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
-         rules_path: PathBuf::from("/etc/netshield/rules.json"),
+         rules_path: PathBuf::from("/etc/netshield/rules.db"),
       }
    }
 }
@@ -267,7 +267,7 @@ mod tests {
       );
       assert_eq!(
          config.rules_path,
-         PathBuf::from("/etc/netshield/rules.json")
+         PathBuf::from("/etc/netshield/rules.db")
       );
       assert!(config.validate().is_ok());
    }
@@ -284,7 +284,7 @@ mod tests {
   "allowed_uid": null,
   "log_level": "info",
   "socket_path": "/run/netshield/control.sock",
-  "rules_path": "/etc/netshield/rules.json"
+  "rules_path": "/etc/netshield/rules.db"
 }"#;
       let config: Config = serde_json::from_str(installed).expect("the installed config must load");
       assert_eq!(

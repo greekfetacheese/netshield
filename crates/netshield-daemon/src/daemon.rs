@@ -47,7 +47,7 @@ use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
 use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
 use crate::policy::{Applied, Decision, Policy};
 use crate::proc::{Attributor, FlowOwner, LiveFlow, Missing, ProcessCache, live_flows};
-use crate::store::{RuleStore, StoreError};
+use crate::store::RuleStore;
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
@@ -143,7 +143,6 @@ fn upsert_revoke(rule: &Rule) -> Revoke {
 /// Why the daemon or `--check` could not run.
 #[derive(Debug)]
 pub enum DaemonError {
-   Store(StoreError),
    Firewall(FirewallError),
    Ipc(IpcError),
    Queue {
@@ -157,7 +156,6 @@ pub enum DaemonError {
 impl fmt::Display for DaemonError {
    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
       match self {
-         Self::Store(err) => write!(f, "{err}"),
          Self::Firewall(err) => write!(f, "{err}"),
          Self::Ipc(err) => write!(f, "{err}"),
          Self::Queue { queue, reason } => write!(f, "NFQUEUE {queue}: {reason}"),
@@ -167,12 +165,6 @@ impl fmt::Display for DaemonError {
 }
 
 impl std::error::Error for DaemonError {}
-
-impl From<StoreError> for DaemonError {
-   fn from(err: StoreError) -> Self {
-      Self::Store(err)
-   }
-}
 
 impl From<FirewallError> for DaemonError {
    fn from(err: FirewallError) -> Self {
@@ -578,7 +570,7 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    SHUTDOWN.store(false, Ordering::SeqCst);
    install_signal_handlers().map_err(DaemonError::Thread)?;
 
-   let (store, _seeded) = RuleStore::load_or_seed(&config.rules_path)?;
+   let (store, _seeded) = RuleStore::load_or_seed(&config.rules_path);
    info!(
       "loaded {} rule(s) from {}",
       store.rules().len(),
@@ -1006,16 +998,27 @@ impl Daemon {
    ) -> (usize, usize) {
       let mut created = 0;
       let mut updated = 0;
+      let mut forever = Vec::new();
       for rule in rules_for(record, decide, now) {
-         let forever = rule.duration == RuleDuration::Forever;
+         // Read before the move: `policy.apply` takes the rule by value.
+         let persist = rule.duration == RuleDuration::Forever;
          let (rule, applied) = self.policy.apply(rule);
          match applied {
             Applied::Created => created += 1,
             Applied::Refreshed => updated += 1,
          }
-         if forever && let Err(err) = self.store.upsert(rule) {
-            error!("could not persist a forever rule: {err}");
+         if persist {
+            forever.push(rule);
          }
+      }
+      // One answer can create a rule per destination; one transaction instead of one commit each.
+      if !forever.is_empty()
+         && let Err(err) = self.store.upsert_many(&forever)
+      {
+         error!(
+            "could not persist {} forever rule(s): {err}",
+            forever.len()
+         );
       }
       (created, updated)
    }
@@ -2075,7 +2078,7 @@ pub fn check(config: Config, rules_path: &Path) -> Result<(), DaemonError> {
       ..config
    };
 
-   let (store, seeded) = RuleStore::load_or_seed(&config.rules_path)?;
+   let (store, seeded) = RuleStore::load_or_seed(&config.rules_path);
    adopt_or_install(&config)?;
 
    let queues = (|| {
