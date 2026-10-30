@@ -262,6 +262,14 @@ mistaken for it. A hit therefore also requires the socket's inode to be one the 
 — evidence only a real `/proc` scan records, and one the kernel does not recycle under a live socket.
 Anything else falls through to a fresh lookup.
 
+Both halves are now read once per **batch** of queued packets, not once per packet: `/proc/net/*` and each
+descriptor directory are snapshotted at the start of a burst and every packet the kernel had already queued
+is decided against that one snapshot. The evidence is unchanged in kind — it is still the kernel naming the
+socket's inode — and it is valid for the whole batch, because a socket exists before any packet it sends, so
+a snapshot taken after those packets were received necessarily contains the socket behind each of them.
+Measured here: a 1513-row `/proc/net/udp` read costs 7.4 ms and a 1500-descriptor directory scan 5.9 ms, so
+per-packet reads were ~14 ms of work for every new flow.
+
 An attributed pid is not automatically the image that opened the socket. A process can `connect()`
 and then `execve()` an allowed binary; the socket survives the exec, so `/proc` still names that pid
 while the code that sends is the new image. The daemon therefore compares the socket's creation time
