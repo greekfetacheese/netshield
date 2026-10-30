@@ -175,7 +175,7 @@ impl ProcessCache {
 
    /// Seeds from a full `/proc` sweep; failures are skipped, never fatal.
    pub fn seed(&mut self) {
-      let Some(pids) = numeric_pids() else {
+      let Some(pids) = numeric_pids_unsorted() else {
          return;
       };
       for pid in pids {
@@ -227,6 +227,18 @@ impl ProcessCache {
    /// executable" from the evidence attribution already gathered instead of rescanning `/proc`.
    pub fn identities(&self) -> impl Iterator<Item = &CachedIdentity> {
       self.identities.values()
+   }
+
+   /// Iterates over each cached pid and when its image started.
+   ///
+   /// A pid whose start time could not be derived at record time is skipped, so its caller
+   /// falls back to reading the process directory exactly as it does for a pid the cache has
+   /// never seen.
+   fn starts(&self) -> impl Iterator<Item = (u32, SystemTime)> + '_ {
+      self
+         .identities
+         .iter()
+         .filter_map(|(pid, identity)| identity.image_started.map(|start| (*pid, start)))
    }
 
    /// Returns the number of cached identities.
@@ -725,6 +737,19 @@ impl Attributor {
       cache.get(pid).cloned()
    }
 
+   /// Snapshots every known pid and its image start, so one scan orders its pid list from
+   /// evidence the connector already gathered instead of statting `/proc` once per pid.
+   ///
+   /// Empty when the lock was poisoned: the scan then treats every pid as unknown and reads
+   /// the directory time, which is slower but never wrong.
+   fn process_starts(&self) -> HashMap<u32, SystemTime> {
+      self
+         .process_cache
+         .lock()
+         .map(|cache| cache.starts().collect())
+         .unwrap_or_default()
+   }
+
    /// Stores an identity read from `/proc`, without overwriting a fuller cached one.
    fn remember_identity(&self, pid: u32, process: &ProcessInfo) {
       let Ok(mut cache) = self.process_cache.lock() else {
@@ -947,7 +972,8 @@ impl Attributor {
       inode: u32,
       uid: Option<u32>,
    ) -> Option<(u32, u32, Option<SystemTime>)> {
-      let pids = numeric_pids()?;
+      let starts = self.process_starts();
+      let pids = numeric_pids_sorted_by(&starts)?;
       self.scan_pids_for_inode(pids, inode, uid, socket_inodes)
    }
 
@@ -1306,7 +1332,7 @@ pub fn live_flows(owner: FlowOwner<'_>) -> Vec<LiveFlow> {
       return Vec::new();
    }
 
-   let Some(pids) = numeric_pids() else {
+   let Some(pids) = numeric_pids_unsorted() else {
       return Vec::new();
    };
    let mut flows: Vec<LiveFlow> = Vec::new();
@@ -1658,17 +1684,18 @@ fn read_pid_uid_at(dir: &Path) -> Option<u32> {
    fs::metadata(dir).ok().map(|meta| meta.uid())
 }
 
-/// Lists the numeric entries of `/proc`, newest process first only when the list exceeds
-/// [`MAX_PIDS`].
+/// Lists the numeric entries of `/proc` in readdir order.
 ///
-/// The order exists solely so a *trimmed* scan keeps the newest processes. An untrimmed
-/// scan is order-independent because [`scan_pids_for_inode`] examines every pid of the
-/// packet's uid before it may answer `None`, so a process directory's age is read only
-/// when the budget cut applies. A pid whose directory time cannot be read is still
-/// scanned, only last, so a racing exit or an unreadable entry never hides a younger
-/// process.
-fn numeric_pids() -> Option<Vec<u32>> {
-   let entries = fs::read_dir(PROC).ok()?;
+/// This is for a caller that examines the whole list — [`ProcessCache::seed`] and
+/// [`live_flows`] do — so no order is worth a syscall per pid. A scan that can stop at the
+/// owner must use [`numeric_pids_sorted_by`] instead.
+fn numeric_pids_unsorted() -> Option<Vec<u32>> {
+   numeric_pids_in(Path::new(PROC))
+}
+
+/// Lists the numeric entries of `root` in readdir order.
+fn numeric_pids_in(root: &Path) -> Option<Vec<u32>> {
+   let entries = fs::read_dir(root).ok()?;
    let mut pids = Vec::new();
    for entry in entries.flatten() {
       let Ok(name) = entry.file_name().into_string() else {
@@ -1679,30 +1706,49 @@ fn numeric_pids() -> Option<Vec<u32>> {
       };
       pids.push(pid);
    }
-   if pids.len() <= MAX_PIDS {
-      return Some(pids);
-   }
-   // The order matters only to the cut, so re-read `/proc` once to collect the ages it
-   // sorts on. If it cannot be re-read, the list is still over budget and the caller
-   // rejects it either way.
-   let Some(entries) = fs::read_dir(PROC).ok() else {
-      return Some(pids);
-   };
-   let mut aged = Vec::new();
-   for entry in entries.flatten() {
-      let Ok(name) = entry.file_name().into_string() else {
-         continue;
-      };
-      let Ok(pid) = name.parse::<u32>() else {
-         continue;
-      };
-      let mtime = fs::metadata(entry.path()).ok().and_then(|meta| meta.modified().ok());
-      aged.push((pid, mtime));
-   }
+   Some(pids)
+}
+
+/// Lists the numeric entries of `/proc`, newest process first.
+///
+/// The order is what keeps a scan short: the socket being attributed was created moments
+/// ago, so the process that started last is the likeliest owner and a hit early in the list
+/// ends the scan. The keys come from the process cache, so ordering a pid the connector has
+/// already seen costs no syscall; only a pid that appeared since the last connector event is
+/// statted. A pid whose directory time cannot be read is still scanned, only last, so a
+/// racing exit or an unreadable entry never hides a younger process.
+fn numeric_pids_sorted_by(starts: &HashMap<u32, SystemTime>) -> Option<Vec<u32>> {
+   numeric_pids_sorted_in(Path::new(PROC), starts)
+}
+
+/// Lists the numeric entries of `root`, newest first by `starts`, falling back to the
+/// directory's own time for a pid the cache does not know.
+///
+/// Split from [`numeric_pids_sorted_by`] so the ordering can be exercised on a fixture
+/// directory instead of a live `/proc`.
+fn numeric_pids_sorted_in(root: &Path, starts: &HashMap<u32, SystemTime>) -> Option<Vec<u32>> {
+   let pids = numeric_pids_in(root)?;
+   let aged = pids
+      .into_iter()
+      .map(|pid| {
+         (
+            pid,
+            starts.get(&pid).copied().or_else(|| pid_dir_mtime(root, pid)),
+         )
+      })
+      .collect();
    Some(sort_pids_newest_first(aged))
 }
 
-/// Sorts `(pid, mtime)` pairs newest-first; entries without a time go last, ties keep input
+/// Reads a process directory's modification time, the fallback ordering key for a pid the
+/// process cache does not know yet.
+fn pid_dir_mtime(root: &Path, pid: u32) -> Option<SystemTime> {
+   fs::metadata(root.join(pid.to_string()))
+      .ok()
+      .and_then(|meta| meta.modified().ok())
+}
+
+/// Sorts `(pid, start)` pairs newest-first; entries without a time go last, ties keep input
 /// order.
 fn sort_pids_newest_first(entries: Vec<(u32, Option<SystemTime>)>) -> Vec<u32> {
    sort_newest_first(entries).into_iter().map(|(pid, _)| pid).collect()
@@ -3236,6 +3282,44 @@ mod tests {
             let _ = child.wait();
          }
       }
+   }
+
+   /// The scan's shape comes from the cache: a known pid is ordered by its start time, not by
+   /// reading its `/proc` directory. The fixture directories are all created at the same time,
+   /// so only the cached starts can produce the expected order.
+   #[test]
+   fn the_pid_list_is_newest_first_from_the_cache() {
+      let nanos = SystemTime::now()
+         .duration_since(std::time::UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let root = std::env::temp_dir().join(format!("netshield-pid-order-{nanos}"));
+      for pid in [101u32, 202, 303] {
+         fs::create_dir_all(root.join(pid.to_string())).expect("create a pid directory");
+      }
+      let now = SystemTime::now();
+      let starts = HashMap::from([
+         (101, now - StdDuration::from_secs(300)),
+         (202, now),
+         (303, now - StdDuration::from_secs(120)),
+      ]);
+
+      let pids = numeric_pids_sorted_in(&root, &starts).expect("the fixture directory is readable");
+
+      assert_eq!(
+         pids,
+         vec![202, 303, 101],
+         "newest first, from the cached starts rather than the directory times"
+      );
+      let mut distinct = pids.clone();
+      distinct.sort_unstable();
+      distinct.dedup();
+      assert_eq!(
+         distinct.len(),
+         3,
+         "every pid is kept exactly once"
+      );
+
+      let _ = fs::remove_dir_all(&root);
    }
 
    /// Nothing is trimmed below the pid budget, so the owning pid may sit at the end of the
