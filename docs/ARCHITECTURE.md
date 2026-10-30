@@ -107,6 +107,14 @@ Known and documented gaps (honest limits of a userspace firewall):
 - **IPC** is a `SOCK_STREAM` Unix socket, newline-delimited JSON. The daemon is the
   server; it authenticates each connection with `SO_PEERCRED` and rejects any UID other
   than `allowed_uid` (default: the user who owns the session, configured at install).
+  Authorization has two tiers: a peer of `allowed_uid` may always `Hello`, `Subscribe`,
+  `ListRules` and `Status`, but only the configured GUI executable may `Decide`, edit rules
+  or `SetMode`. The server compares the peer's `/proc/<pid>/exe` (with a trailing
+  `" (deleted)"` stripped) to `gui_path` once at connect and again immediately before every
+  state-changing request; a mismatch, an unreadable link or pid 0 is a refusal that answers
+  `Error` and closes the connection. When `gui_path` is absent the historical uid-only rule
+  stands and the daemon warns at startup that any process of that uid can change state; every
+  state-changing request is logged at `info` with the client id, pid, executable and request.
 
 ## 4. The verdict path
 
@@ -322,6 +330,11 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 ## 9. Storage and packaging
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
+  `gui_path` names the only executable allowed to change firewall state over the control
+  socket (the installer writes `$PREFIX/bin/netshield-gui`); every other process of
+  `allowed_uid` stays read-only. `gui_path: null` means any process of `allowed_uid` may
+  change state, and the daemon warns prominently about it at startup. A path that does not
+  exist is not a config error: it is a runtime refusal of every write.
 - `$XDG_CONFIG_HOME/netshield/gui.json` (`~/.config/netshield/gui.json`) — the GUI's own
   preferences: the Connections log's caps, `rows_per_app` (default 100, range 10–1000) and
   `max_apps` (default 32, range 1–128). Written atomically by the unprivileged GUI and never

@@ -656,7 +656,11 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
 
 /// Binds the control socket and opens both queues with the loop's receive timeout.
 fn start_runtime(config: &Config) -> Result<(IpcHandle, NfQueue, NfQueue), DaemonError> {
-   let server = IpcServer::bind(&config.socket_path, config.allowed_uid)?;
+   let server = IpcServer::bind(
+      &config.socket_path,
+      config.allowed_uid,
+      config.gui_path.clone(),
+   )?;
    let ipc = server.spawn();
 
    let queue = open_queue(config.queue_num)?;

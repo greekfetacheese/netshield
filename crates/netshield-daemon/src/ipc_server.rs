@@ -16,7 +16,7 @@
 //! limit.
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -35,7 +35,7 @@ use netshield_core::ipc::{
    frame_len_ok,
 };
 
-use crate::netlink::socket::peer_uid;
+use crate::netlink::socket::peer_creds;
 
 /// The largest frame the reader accepts, quoted in the refusal log line.
 const FRAME_LIMIT: usize = MAX_FRAME_LEN;
@@ -87,8 +87,13 @@ impl From<io::Error> for IpcError {
 }
 
 /// An authenticated client.
+///
+/// The uid decides whether the peer may talk to the daemon at all; the pid decides whether
+/// it is the configured GUI and may therefore change state, checked against
+/// `/proc/<pid>/exe`. A pid of `0` means the kernel did not report one and can never match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
+   pub pid: u32,
    pub uid: u32,
 }
 
@@ -112,6 +117,64 @@ fn parse_effective_uid(status: &str) -> Option<u32> {
 /// never a wildcard, matching [`netshield_core::Config::allowed_uid`].
 fn peer_allowed(uid: u32, allowed_uid: Option<u32>) -> bool {
    uid == 0 || Some(uid) == allowed_uid
+}
+
+/// The GUI identity the control socket enforces, fixed once at bind time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuiPolicy {
+   /// The uid permitted to talk to the socket at all; `None` is root only.
+   pub allowed_uid: Option<u32>,
+   /// The only executable allowed to change firewall state; `None` keeps the uid-only rule
+   /// for a config installed before the key existed, and is warned about at bind time.
+   pub gui_path: Option<PathBuf>,
+}
+
+/// Whether a peer may change firewall state: only the configured GUI executable.
+///
+/// `exe` is the peer's already-resolved `/proc/<pid>/exe`, so the caller does one `readlink`
+/// per state-changing request and uses the same answer for the audit line. With a
+/// `gui_path` the executable must equal it; a different path, an unreadable link or pid 0
+/// is a refusal. Without one the historical uid-only rule stands, which [`IpcServer::bind`]
+/// warns about because any process of that uid then qualifies.
+fn peer_may_mutate(policy: &GuiPolicy, peer: &Peer, exe: Option<&Path>) -> bool {
+   match policy.gui_path.as_deref() {
+      Some(gui_path) => peer.pid != 0 && exe == Some(gui_path),
+      None => peer_allowed(peer.uid, policy.allowed_uid),
+   }
+}
+
+/// Why a state-changing request was refused, phrased as the requirement it failed.
+fn refusal(policy: &GuiPolicy) -> String {
+   match policy.gui_path.as_deref() {
+      Some(path) => format!(
+         "changing firewall state requires the configured GUI executable {}",
+         path.display()
+      ),
+      None => "changing firewall state requires the allowed uid".to_owned(),
+   }
+}
+
+/// Resolves the executable `/proc/<pid>/exe` points at.
+///
+/// `readlink` on a deleted binary returns the original path with a trailing `" (deleted)"`,
+/// which is stripped so a GUI replaced by an upgrade keeps working until it restarts.
+/// Any error or non-UTF-8 target is `None`, which the caller treats as not-the-GUI.
+fn executable_path(pid: u32) -> Option<PathBuf> {
+   let target = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+   let bytes = target.as_os_str().as_bytes();
+   let suffix = b" (deleted)";
+   if let Some(path) = bytes.strip_suffix(suffix) {
+      return Some(PathBuf::from(OsStr::from_bytes(path)));
+   }
+   Some(target)
+}
+
+/// Whether a request only reads daemon state.
+fn is_read_only(request: &Request) -> bool {
+   matches!(
+      request,
+      Request::Hello { .. } | Request::Subscribe | Request::ListRules | Request::Status
+   )
 }
 
 /// The ownership the control socket gets after bind: uid, gid and mode.
@@ -296,7 +359,7 @@ fn kind(message: &Response) -> &'static str {
 pub struct IpcServer {
    listener: UnixListener,
    path: PathBuf,
-   allowed_uid: Option<u32>,
+   policy: GuiPolicy,
    shared: Arc<Shared>,
 }
 
@@ -306,7 +369,11 @@ impl IpcServer {
    /// Refuses to run unless the caller is root. The socket file is mode `0660`; a parent
    /// directory this call creates is mode `0750`, while an existing one (for example
    /// `/run`) is left exactly as the system set it up.
-   pub fn bind(socket_path: &Path, allowed_uid: Option<u32>) -> Result<Self, IpcError> {
+   pub fn bind(
+      socket_path: &Path,
+      allowed_uid: Option<u32>,
+      gui_path: Option<PathBuf>,
+   ) -> Result<Self, IpcError> {
       if effective_uid() != Some(0) {
          warn!("refusing to bind the control socket: not running as root");
          return Err(IpcError::NotRoot);
@@ -329,16 +396,27 @@ impl IpcServer {
          );
       }
 
+      if gui_path.is_none() {
+         warn!(
+            "no gui_path configured: any process running as uid {} can change rules and mode",
+            allowed_uid.map_or_else(|| "root".to_owned(), |uid| uid.to_string())
+         );
+      }
+
       let (sender, receiver) = mpsc::channel();
       info!(
-         "control socket listening on {} (allowed uid {:?})",
+         "control socket listening on {} (allowed uid {:?}, gui path {:?})",
          socket_path.display(),
-         allowed_uid
+         allowed_uid,
+         gui_path
       );
       Ok(Self {
          listener,
          path: socket_path.to_path_buf(),
-         allowed_uid,
+         policy: GuiPolicy {
+            allowed_uid,
+            gui_path,
+         },
          shared: Arc::new(Shared {
             clients: Mutex::new(HashMap::new()),
             state: Mutex::new(State {
@@ -359,7 +437,7 @@ impl IpcServer {
    /// or silent client cannot hold up the accept loop for everyone else.
    pub fn spawn(self) -> IpcHandle {
       let shared = Arc::clone(&self.shared);
-      let allowed_uid = self.allowed_uid;
+      let policy = self.policy;
       let listener = self.listener;
       let path = self.path;
 
@@ -374,9 +452,10 @@ impl IpcServer {
                   }
                };
                let reader_shared = Arc::clone(&shared);
+               let reader_policy = policy.clone();
                let reader = thread::Builder::new()
                   .name("netshield-ipc-client".to_owned())
-                  .spawn(move || serve(stream, reader_shared, allowed_uid));
+                  .spawn(move || serve(stream, reader_shared, reader_policy));
                if let Err(err) = reader {
                   warn!("could not spawn a control reader: {err}");
                }
@@ -480,19 +559,25 @@ fn remove_stale_socket(path: &Path) -> Result<(), IpcError> {
 }
 
 /// Serves one client: authenticate, handshake, then dispatch until it disconnects.
-fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) {
-   let uid = match peer_uid(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
-      Ok(uid) => uid,
+fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+   let cred = match peer_creds(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
+      Ok(cred) => cred,
       Err(err) => {
          warn!("could not read a control peer's credentials, closing it: {err}");
          return;
       }
    };
-   if !peer_allowed(uid, allowed_uid) {
-      warn!("refusing the control socket to uid {uid}: not root and not the allowed user");
+   if !peer_allowed(cred.uid, policy.allowed_uid) {
+      warn!(
+         "refusing the control socket to uid {}: not root and not the allowed user",
+         cred.uid
+      );
       return;
    }
-   let client = Peer { uid };
+   let client = Peer {
+      pid: cred.pid,
+      uid: cred.uid,
+   };
    let id = match shared.register(&stream) {
       Ok(id) => id,
       Err(err) => {
@@ -500,9 +585,10 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) 
          return;
       }
    };
+   let exe = executable_path(client.pid);
    debug!(
-      "control client {id} connected as uid {}",
-      client.uid
+      "control client {id} connected as uid {} (pid {}, exe {exe:?})",
+      client.uid, client.pid
    );
 
    let mut buffered = Vec::new();
@@ -539,7 +625,7 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, allowed_uid: Option<u32>) 
          }
       };
 
-      if !dispatch(id, request, &shared) {
+      if !dispatch(id, request, &shared, &policy, &client) {
          break;
       }
    }
@@ -604,7 +690,29 @@ fn handshake(stream: &mut UnixStream, shared: &Shared, id: u64, buffered: &mut V
 }
 
 /// Handles one decoded request; `false` closes the connection.
-fn dispatch(id: u64, request: Request, shared: &Shared) -> bool {
+///
+/// The read/mutate split is enforced here. A read-only request is served for any peer that
+/// passed [`peer_allowed`]. A state-changing one is refused unless the peer is the GUI,
+/// and the executable is re-read before every such request: a process can `exec` a
+/// different binary after connecting, so the check at accept time is not enough.
+fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer: &Peer) -> bool {
+   if !is_read_only(&request) {
+      let exe = executable_path(peer.pid);
+      if !peer_may_mutate(policy, peer, exe.as_deref()) {
+         let message = refusal(policy);
+         warn!(
+            "refusing the control request from client {id} (pid {}, exe {exe:?}): {message}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message });
+         return false;
+      }
+      info!(
+         "control client {id} (pid {}, exe {exe:?}) {request:?}",
+         peer.pid
+      );
+   }
+
    match request {
       Request::Hello { .. } => {
          shared.send(
@@ -788,6 +896,20 @@ mod tests {
       UnixStream::pair().expect("socketpair")
    }
 
+   /// The policy the pre-existing tests run under: the configured uid may change state
+   /// because no `gui_path` is set, which is the compatibility branch.
+   fn policy(allowed_uid: Option<u32>) -> GuiPolicy {
+      GuiPolicy {
+         allowed_uid,
+         gui_path: None,
+      }
+   }
+
+   /// The path of this test binary, which is its own peer's `/proc/<pid>/exe`.
+   fn self_exe() -> PathBuf {
+      fs::read_link("/proc/self/exe").expect("the test binary's own exe")
+   }
+
    fn read_response(client: &mut UnixStream, buffered: &mut Vec<u8>) -> Response {
       let frame = read_frame(client, buffered).expect("readable").expect("a frame");
       decode_line(&frame).expect("a decodable response")
@@ -939,7 +1061,7 @@ mod tests {
       let (server, mut client) = pair();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
       client
@@ -980,7 +1102,7 @@ mod tests {
          return;
       }
       let path = temp_socket("nonroot");
-      let err = match IpcServer::bind(&path, Some(1000)) {
+      let err = match IpcServer::bind(&path, Some(1000), None) {
          Ok(_) => panic!("a non-root caller must be refused"),
          Err(err) => err,
       };
@@ -1002,7 +1124,7 @@ mod tests {
 
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
       client
@@ -1031,7 +1153,7 @@ mod tests {
       let shared = shared();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION + 1)).expect("hello");
       let mut buffered = Vec::new();
@@ -1055,7 +1177,7 @@ mod tests {
       let shared = shared();
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
       let mut buffered = Vec::new();
@@ -1073,7 +1195,7 @@ mod tests {
       let probe = Arc::clone(&shared);
       let uid = our_uid().expect("our own uid");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
-      let reader = thread::spawn(move || serve(server, shared, Some(uid)));
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       let decide = Request::Decide(DecideRequest {
          prompt_id: 9,
@@ -1106,7 +1228,7 @@ mod tests {
       let (server, mut client) = pair();
       let shared = shared();
       let allowed = our_uid().map(|uid| uid.wrapping_add(1));
-      let reader = thread::spawn(move || serve(server, shared, allowed));
+      let reader = thread::spawn(move || serve(server, shared, policy(allowed)));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
       let mut rest = Vec::new();
@@ -1122,6 +1244,141 @@ mod tests {
          rest.is_empty(),
          "the server must not answer an unauthorised peer"
       );
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_non_gui_peer_may_read_but_not_mutate() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let rule = rule();
+      handle.set_rules(std::slice::from_ref(&rule));
+      handle.set_status(status(Mode::Alert, 1));
+
+      let uid = our_uid().expect("our own uid");
+      let gui = GuiPolicy {
+         allowed_uid: Some(uid),
+         gui_path: Some(PathBuf::from("/bin/definitely-not-the-gui")),
+      };
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, gui));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::ListRules).expect("list rules"))
+         .expect("send");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut buffered = Vec::new();
+      assert_eq!(
+         read_response(&mut client, &mut buffered),
+         Response::Rules { rules: vec![rule] },
+         "reads stay available to a non-GUI peer of the allowed uid"
+      );
+      match read_response(&mut client, &mut buffered) {
+         Response::Error { message } => assert!(
+            message.contains("GUI"),
+            "the refusal must name the requirement, got: {message}"
+         ),
+         other => panic!("expected Error, got {other:?}"),
+      }
+
+      // A refusal closes the connection: a clean EOF or the RST the kernel sends when the
+      // server closes a socket that still holds the client's unread bytes.
+      let mut rest = Vec::new();
+      match client.read_to_end(&mut rest) {
+         Ok(0) => {}
+         Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+         other => panic!("expected the peer to be closed, got {other:?}"),
+      }
+      assert_eq!(
+         handle.mode(),
+         Mode::Alert,
+         "the refused SetMode must not reach the server state"
+      );
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn the_configured_gui_may_change_state() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let uid = our_uid().expect("our own uid");
+      let gui = GuiPolicy {
+         allowed_uid: Some(uid),
+         gui_path: Some(self_exe()),
+      };
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, gui));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut changed = false;
+      for _ in 0..100 {
+         if handle.mode() == Mode::Silent {
+            changed = true;
+            break;
+         }
+         thread::sleep(StdDuration::from_millis(10));
+      }
+      assert!(changed, "the configured GUI's SetMode must apply");
+
+      // The connection stayed open and no Error frame was queued: the next request is a
+      // read that the same session must be able to serve.
+      client
+         .write_all(&encode_line(&Request::ListRules).expect("list rules"))
+         .expect("send");
+      let mut buffered = Vec::new();
+      assert!(matches!(
+         read_response(&mut client, &mut buffered),
+         Response::Rules { .. }
+      ));
+
+      drop(client);
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn without_a_gui_path_the_uid_rule_still_applies() {
+      let (server, mut client) = pair();
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      let uid = our_uid().expect("our own uid");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut changed = false;
+      for _ in 0..100 {
+         if handle.mode() == Mode::Silent {
+            changed = true;
+            break;
+         }
+         thread::sleep(StdDuration::from_millis(10));
+      }
+      assert!(
+         changed,
+         "without gui_path the allowed uid keeps the old write permission"
+      );
+
+      drop(client);
       reader.join().expect("reader thread");
    }
 }

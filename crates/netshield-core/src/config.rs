@@ -79,6 +79,16 @@ pub struct Config {
    /// `None` means root only. It is never a wildcard: a missing value must not widen the
    /// socket permissions to every user.
    pub allowed_uid: Option<u32>,
+   /// The only executable allowed to change firewall state over the control socket.
+   ///
+   /// Every other process of `allowed_uid` keeps read-only access. `None` means any process
+   /// of `allowed_uid` may change state, which the daemon warns about at startup; a path
+   /// that does not exist is a runtime refusal, not a configuration error, so that a
+   /// temporarily missing GUI binary cannot stop the firewall from starting.
+   /// `#[serde(default)]` keeps a config written before this key loading with the
+   /// compatibility behavior instead of failing the daemon's fatal parse.
+   #[serde(default)]
+   pub gui_path: Option<PathBuf>,
    pub log_level: LogLevel,
    /// Unix socket the GUI connects to.
    pub socket_path: PathBuf,
@@ -101,6 +111,7 @@ impl Default for Config {
          default_action: DefaultAction::Prompt,
          unattributable_closed_flow: ClosedFlowAction::Drop,
          allowed_uid: None,
+         gui_path: None,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
          rules_path: PathBuf::from("/etc/netshield/rules.db"),
@@ -294,6 +305,10 @@ mod tests {
       assert_eq!(config.table_name(), "netshield");
       assert_eq!(Config::default().table_name(), "netshield");
       assert_eq!(Config::default().table, "netshield");
+      assert_eq!(
+         config.gui_path, None,
+         "an installed config without the key keeps the compatibility behavior"
+      );
 
       for (json, expected) in [
          ("\"allow\"", ClosedFlowAction::Allow),
@@ -385,6 +400,30 @@ mod tests {
    }
 
    #[test]
+   fn a_configured_gui_path_is_preserved_and_an_absent_one_defaults() {
+      // The key is what lets the daemon tell the configured GUI from any other process of
+      // the same uid, so a configured path must survive serialisation exactly.
+      let path = PathBuf::from("/usr/local/bin/netshield-gui");
+      let config = Config {
+         gui_path: Some(path.clone()),
+         ..Config::default()
+      };
+      assert_eq!(config.gui_path.as_deref(), Some(path.as_path()));
+      let json = serde_json::to_string(&config).expect("serialize");
+      let back: Config = serde_json::from_str(&json).expect("deserialize");
+      assert_eq!(back.gui_path, Some(path));
+
+      // A config that predates the key must not fail to load: the daemon then warns and
+      // keeps the historical uid-only rule.
+      let without = "{\"queue_num\": 0, \"dns_queue_num\": 1, \"prompt_timeout_secs\": 30, \
+                     \"default_action\": \"prompt\", \"allowed_uid\": 1000, \
+                     \"log_level\": \"info\", \"socket_path\": \"/run/x\", \
+                     \"rules_path\": \"/etc/x\"}";
+      let config: Config = serde_json::from_str(without).expect("an old config must load");
+      assert_eq!(config.gui_path, None);
+   }
+
+   #[test]
    fn the_config_round_trips_through_serde() {
       let config = Config {
          queue_num: 3,
@@ -392,6 +431,7 @@ mod tests {
          prompt_timeout_secs: 45,
          default_action: DefaultAction::Deny,
          allowed_uid: Some(1000),
+         gui_path: Some(PathBuf::from("/usr/local/bin/netshield-gui")),
          log_level: LogLevel::Trace,
          ..Config::default()
       };
