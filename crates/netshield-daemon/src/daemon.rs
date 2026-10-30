@@ -23,7 +23,7 @@ use std::hash::Hash;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1636,7 +1636,10 @@ impl Daemon {
       if removed > 0 {
          debug!("expired {removed} flow grant(s)");
       }
-      self.dns_cache.lock().expect("dns cache").expire(epoch);
+      // A panic while the cache was held must not take the packet path with it: the poison flag is
+      // evidence of a bug, not a reason to stop enforcing — and a panic here leaves the table
+      // installed with no queue bound, which the kernel accepts.
+      self.dns_cache.lock().unwrap_or_else(PoisonError::into_inner).expire(epoch);
    }
 
    /// Builds the [`Connection`] for a parsed packet and, when it has no owner, why — or
@@ -1716,7 +1719,7 @@ impl Daemon {
       self
          .dns_cache
          .lock()
-         .expect("dns cache")
+         .unwrap_or_else(PoisonError::into_inner)
          .names_for(addr, now_secs())
          .into_iter()
          .map(str::to_owned)
@@ -2432,7 +2435,7 @@ fn cache_answer(cache: &Mutex<DnsCache>, payload: &[u8]) {
    };
 
    let now = now_secs();
-   let mut cache = cache.lock().expect("dns cache");
+   let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
 
    // The edges that link every address back to the name the application queried. They are
    // collected first because a CNAME may follow the address it points at in the answer.
