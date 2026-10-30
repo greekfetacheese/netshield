@@ -34,6 +34,33 @@ pub enum ClosedFlowAction {
    Prompt,
 }
 
+/// What to do with a queued flow whose L4 protocol has no ports.
+///
+/// `Deny` is the default: SCTP, DCCP, GRE, ESP and IP-in-IP carry no port pair, so no rule
+/// can express a decision about them, and an unfiltered channel is exactly what this
+/// firewall exists to remove. `Allow` is the explicit way to restore the pre-2026
+/// pass-through for those transports.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnmatchedTransport {
+   #[default]
+   Deny,
+   Allow,
+}
+
+/// What to do with an ICMP echo request.
+///
+/// `Deny` is the default: an echo request is an outbound connection attempt by any
+/// reasonable reading, and an ICMP tunnel rides on it; allowing it unfiltered would keep a
+/// channel no rule can gate. `Allow` restores the pre-2026 pass-through for ping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IcmpAction {
+   #[default]
+   Deny,
+   Allow,
+}
+
 /// Verbosity of the daemon log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -74,6 +101,19 @@ pub struct Config {
    /// fatal, and every config written by the current installer lacks this key.
    #[serde(default)]
    pub unattributable_closed_flow: ClosedFlowAction,
+   /// How a queued flow whose L4 protocol has no ports is decided.
+   ///
+   /// `#[serde(default)]` is load-bearing twice: every installed config predates the key,
+   /// and the default is `deny`, so an upgrade must not open the transports this setting
+   /// exists to close.
+   #[serde(default)]
+   pub unmatched_transport: UnmatchedTransport,
+   /// How an ICMP echo request is decided.
+   ///
+   /// `#[serde(default)]` because every installed config predates the key, and the default
+   /// is `deny`: an echo request is an outbound attempt an ICMP tunnel can ride on.
+   #[serde(default)]
+   pub icmp_echo: IcmpAction,
    /// The only non-root UID allowed to use the control socket.
    ///
    /// `None` means root only. It is never a wildcard: a missing value must not widen the
@@ -110,6 +150,8 @@ impl Default for Config {
          prompt_timeout_secs: 30,
          default_action: DefaultAction::Prompt,
          unattributable_closed_flow: ClosedFlowAction::Drop,
+         unmatched_transport: UnmatchedTransport::Deny,
+         icmp_echo: IcmpAction::Deny,
          allowed_uid: None,
          gui_path: None,
          log_level: LogLevel::Info,
@@ -302,6 +344,16 @@ mod tests {
          config.unattributable_closed_flow,
          ClosedFlowAction::Drop
       );
+      assert_eq!(
+         config.unmatched_transport,
+         UnmatchedTransport::Deny,
+         "an installed config without the key must not open port-less transports"
+      );
+      assert_eq!(
+         config.icmp_echo,
+         IcmpAction::Deny,
+         "an installed config without the key must not allow ICMP echo"
+      );
       assert_eq!(config.table_name(), "netshield");
       assert_eq!(Config::default().table_name(), "netshield");
       assert_eq!(Config::default().table, "netshield");
@@ -332,6 +384,48 @@ mod tests {
          ClosedFlowAction::Drop
       );
       assert_eq!(back, Config::default());
+   }
+
+   #[test]
+   fn the_transport_settings_default_to_deny_and_round_trip() {
+      // The defaults are the security posture: a missing key must deny, never allow.
+      assert_eq!(
+         UnmatchedTransport::default(),
+         UnmatchedTransport::Deny
+      );
+      assert_eq!(IcmpAction::default(), IcmpAction::Deny);
+      assert_eq!(
+         Config::default().unmatched_transport,
+         UnmatchedTransport::Deny
+      );
+      assert_eq!(Config::default().icmp_echo, IcmpAction::Deny);
+
+      let config = Config {
+         unmatched_transport: UnmatchedTransport::Allow,
+         icmp_echo: IcmpAction::Allow,
+         ..Config::default()
+      };
+      let json = serde_json::to_string(&config).expect("serialize the transport settings");
+      assert!(
+         json.contains("\"unmatched_transport\":\"allow\""),
+         "the key must be written lowercase, got: {json}"
+      );
+      assert!(
+         json.contains("\"icmp_echo\":\"allow\""),
+         "the key must be written lowercase, got: {json}"
+      );
+      let back: Config = serde_json::from_str(&json).expect("read the transport settings back");
+      assert_eq!(back, config);
+
+      // An explicit `deny` also round-trips, so the owner can spell out the default.
+      let config = Config {
+         unmatched_transport: UnmatchedTransport::Deny,
+         icmp_echo: IcmpAction::Deny,
+         ..Config::default()
+      };
+      let back: Config = serde_json::from_str(&serde_json::to_string(&config).expect("serialize"))
+         .expect("deserialize");
+      assert_eq!(back, config);
    }
 
    #[test]

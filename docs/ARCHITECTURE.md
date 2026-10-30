@@ -78,6 +78,13 @@ Known and documented gaps (honest limits of a userspace firewall):
   calls at all.
 - DNS over HTTPS/TLS is upstream-encrypted; the daemon can see *that* a resolver
   connection happened, but not the name inside it. See §7.
+- Every queued flow is now decided, prompted or denied; none is waved through. ICMP echo
+  requests and port-less transports (SCTP, DCCP, GRE, ESP, IP-in-IP) are **denied by
+  default**, because no rule can express a decision about them — an unfiltered channel is
+  what this firewall exists to remove. `icmp_echo: allow` and `unmatched_transport: allow`
+  restore the pass-through explicitly. ICMP error types (unreachable, time exceeded,
+  parameter problem, packet too big) always pass: the kernel generates them, and dropping
+  path-MTU messages breaks ordinary TCP.
 
 ## 3. Processes and data flow
 
@@ -192,6 +199,12 @@ Two cases are decided without a prompt, because a prompt could not change anythi
 Both defaults exist because the alternative was measured: Chromium opens and closes speculative
 sockets (QUIC racing losers, cancelled preconnects) inside the ~5 ms attribution window, so the
 old behaviour produced an `unknown` prompt for traffic that had already been abandoned.
+
+A flow whose transport has no ports never reaches attribution at all: an ICMP echo request
+(`icmp_echo`, default `deny`) and every port-less protocol (`unmatched_transport`, default
+`deny`) are decided from the parsed packet and the owner's settings, logged at most once per
+protocol and ICMP type per minute, counted in `queue_drops`, and denied unless explicitly
+allowed. ICMP error types are always accepted so path-MTU discovery keeps working.
 
 On the same machine the daemon also loads a small BPF program on the `sys_enter_sendto` and
 `sys_enter_connect` tracepoints. It records `(uid, destination) -> (thread group id, timestamp)`
@@ -330,6 +343,10 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 ## 9. Storage and packaging
 
 - `/etc/netshield/config.json` — settings, written atomically (temp file + `rename`).
+  `icmp_echo` (`deny` by default) decides an ICMP echo request; `unmatched_transport`
+  (`deny` by default) decides a queued flow whose protocol has no ports (SCTP, DCCP, GRE,
+  ESP, IP-in-IP). `allow` on either restores the pre-2026 pass-through; missing keys load as
+  `deny`, so an upgrade never opens them. ICMP error types always pass.
   `gui_path` names the only executable allowed to change firewall state over the control
   socket (the installer writes `$PREFIX/bin/netshield-gui`); every other process of
   `allowed_uid` stays read-only. `gui_path: null` means any process of `allowed_uid` may

@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
-use netshield_core::config::{ClosedFlowAction, Config};
+use netshield_core::config::{ClosedFlowAction, Config, IcmpAction, UnmatchedTransport};
 use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
 use netshield_core::dns::{DnsRecord, RecordKind, Target, parse_response, parse_tcp_response};
 use netshield_core::dns_cache::DnsCache;
@@ -54,6 +55,15 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Minimum gap between `dns: no name` debug lines for one address.
 const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
+
+/// Minimum gap between denial lines for one unmodelled transport and ICMP type.
+///
+/// A ping flood or an SCTP association would otherwise put one line per packet in the
+/// journal; the packet is still dropped, only the line is rate-limited.
+const TRANSPORT_LOG_GAP: Duration = Duration::from_secs(60);
+
+/// Upper bound on the transport keys the denial limiter remembers.
+const TRANSPORT_LOG_LIMIT: usize = 256;
 
 /// Upper bound on the addresses the DNS miss limiter remembers.
 const DNS_MISS_LIMIT: usize = 1024;
@@ -261,6 +271,7 @@ struct Daemon {
    table_verified: bool,
    dns_misses: MissLimiter,
    closed_flows: MissLimiter,
+   transport_denials: KeyLimiter<(u8, Option<u8>)>,
    multicast_logged: HashSet<String>,
 }
 
@@ -299,6 +310,7 @@ impl Daemon {
          table_verified,
          dns_misses: MissLimiter::new(),
          closed_flows: MissLimiter::new(),
+         transport_denials: KeyLimiter::new(TRANSPORT_LOG_GAP, TRANSPORT_LOG_LIMIT),
          multicast_logged: HashSet::new(),
       }
    }
@@ -1213,9 +1225,7 @@ impl Daemon {
       };
 
       let Some((connection, missing)) = self.connection_for(&parsed, &packet) else {
-         // Not a flow the policy governs (ICMP, an unknown transport, a family mismatch);
-         // accept rather than invent a decision for a packet the model cannot express.
-         self.accept(packet.id);
+         self.handle_unmodelled(&parsed, &packet);
          return;
       };
 
@@ -1246,6 +1256,72 @@ impl Daemon {
             Unmatched::AllowClosed => self.closed_flow_allowed(&connection, packet.id),
             Unmatched::AllowMulticast => self.multicast_allowed(&connection, packet.id),
          },
+      }
+   }
+
+   /// Decides a queued packet the policy model cannot express a flow for.
+   ///
+   /// [`connection_for`](Self::connection_for) returns `None` for three unrelated reasons and
+   /// they must not share a verdict: an established TCP packet is not a policy question, a
+   /// transport without ports (and an ICMP echo) has no rule that could govern it, and a
+   /// family mismatch is a packet the model reads but cannot place. Only the middle case is
+   /// an accept the owner asked to close; the other two keep the historical accept.
+   fn handle_unmodelled(&mut self, parsed: &ParsedPacket, packet: &Packet) {
+      // The protocol number the kernel put on the wire. `L4Payload` carries no protocol
+      // field, so it is read from the IP header the parser already validated.
+      let protocol = packet_protocol(&packet.payload);
+      match transport_verdict(&parsed.l4, &self.config) {
+         TransportAction::Ignore => {
+            // Not a flow the policy governs (an established TCP segment, a family
+            // mismatch, or a packet whose header no longer carries a protocol). Accept
+            // rather than invent a decision for a packet the model cannot express.
+            self.accept(packet.id);
+         }
+         TransportAction::Drop => {
+            self.drop_packet(packet.id);
+            self.queue_drops = self.queue_drops.saturating_add(1);
+            self.log_transport_denial(parsed, protocol, packet.uid);
+         }
+         TransportAction::Allow => self.accept(packet.id),
+      }
+   }
+
+   /// Logs a transport denial once per (protocol, ICMP type) per [`TRANSPORT_LOG_GAP`].
+   fn log_transport_denial(
+      &mut self,
+      parsed: &ParsedPacket,
+      protocol: Option<u8>,
+      uid: Option<u32>,
+   ) {
+      let key = (
+         protocol.unwrap_or(0),
+         match parsed.l4 {
+            L4Payload::Icmp { icmp_type, .. } => Some(icmp_type),
+            _ => None,
+         },
+      );
+      if !self.transport_denials.record(key, Instant::now()) {
+         return;
+      }
+      let family = match parsed.family {
+         Family::V4 => "ipv4",
+         Family::V6 => "ipv6",
+      };
+      let uid = uid.map_or_else(|| "unknown".to_owned(), |uid| uid.to_string());
+      match parsed.l4 {
+         L4Payload::Icmp { icmp_type, .. } => warn!(
+            "denied icmp echo (type {icmp_type}, {family}, protocol {}) from uid {uid}: set \
+             icmp_echo to allow to permit it",
+            protocol.unwrap_or(0)
+         ),
+         _ => warn!(
+            "denied transport {} ({family}, protocol has no policy) from uid {uid}: set \
+             unmatched_transport to allow to permit it",
+            protocol.map_or_else(
+               || "unknown".to_owned(),
+               |protocol| protocol.to_string()
+            )
+         ),
       }
    }
 
@@ -1604,6 +1680,103 @@ fn unmatched(
       (Some(Missing::SocketGone), ClosedFlowAction::Drop) => Unmatched::DropClosed,
       (Some(Missing::SocketGone), ClosedFlowAction::Allow) => Unmatched::AllowClosed,
       _ => Unmatched::Prompt,
+   }
+}
+
+/// The IP next-header byte of a packet the parser already validated.
+///
+/// The parsed payload carries no protocol number, and the denial line must name the real
+/// one, so it is read from the same header the parser used: byte 9 of an IPv4 header, byte 6
+/// of an IPv6 header. `None` only for a buffer too short to be either, which `parse` has
+/// already rejected.
+fn packet_protocol(payload: &[u8]) -> Option<u8> {
+   match payload.first().map(|first| first >> 4) {
+      Some(4) => payload.get(9).copied(),
+      Some(6) => payload.get(6).copied(),
+      _ => None,
+   }
+}
+
+/// What happens to a queued packet no [`Connection`] can be built for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransportAction {
+   /// Not a transport the policy model declines for a reason of its own: an established
+   /// TCP or UDP packet, or a family mismatch, keeps the historical accept.
+   Ignore,
+   /// An unmodelled transport or an ICMP echo the owner has not allowed.
+   Drop,
+   /// An allowed ICMP echo, an allowed port-less transport, or an ICMP error.
+   Allow,
+}
+
+/// Decides a packet the flow model cannot express, from its transport and the owner's
+/// settings.
+///
+/// This is deliberately a pure function on the parsed payload: the packet never reaches a
+/// [`Connection`], so the decision cannot depend on attribution and can be unit-tested
+/// without a queue. The family needs no parameter because the ambiguous ICMP types are
+/// already distinct on the wire (v4 echo is 8, v6 echo is 128).
+fn transport_verdict(l4: &L4Payload, config: &Config) -> TransportAction {
+   match l4 {
+      // ICMP echo request (v4 type 8) and ICMPv6 echo request (type 128) are the outbound
+      // half of a ping, and an ICMP tunnel rides on them, so the owner's setting decides.
+      L4Payload::Icmp {
+         icmp_type: 8 | 128, ..
+      } => match config.icmp_echo {
+         IcmpAction::Deny => TransportAction::Drop,
+         IcmpAction::Allow => TransportAction::Allow,
+      },
+      // Everything else in ICMP is a diagnostic the kernel or a well-behaved peer emits:
+      // destination unreachable (v4 3, v6 1), packet too big (v6 2), time exceeded (v4 11,
+      // v6 3) and parameter problem (v4 12, v6 4). Dropping those breaks path-MTU discovery
+      // and ordinary TCP, so this is the one deliberate allow.
+      L4Payload::Icmp { .. } => TransportAction::Allow,
+      // SCTP, DCCP, GRE, ESP and IP-in-IP carry no port pair, so no rule can express a
+      // decision: the owner's setting, denying by default, is the only decision available.
+      L4Payload::Other => match config.unmatched_transport {
+         UnmatchedTransport::Deny => TransportAction::Drop,
+         UnmatchedTransport::Allow => TransportAction::Allow,
+      },
+      // Only an opening TCP SYN reaches here as a `None` from `connection_for`; every
+      // other TCP segment, and a family the model cannot place, is not a policy question.
+      L4Payload::Tcp { .. } | L4Payload::Udp { .. } => TransportAction::Ignore,
+   }
+}
+
+/// A per-key one-line-per-gap log limiter.
+///
+/// Same shape and contract as [`MissLimiter`], keyed by the transport a denial names
+/// instead of an address: a ping flood or an SCTP association must not put one line per
+/// packet in the journal, while still recording that the drop happened.
+struct KeyLimiter<K> {
+   last: HashMap<K, Instant>,
+   gap: Duration,
+   limit: usize,
+}
+
+impl<K: Eq + Hash> KeyLimiter<K> {
+   fn new(gap: Duration, limit: usize) -> Self {
+      Self {
+         last: HashMap::new(),
+         gap,
+         limit,
+      }
+   }
+
+   /// Whether an event for `key` at `now` should be logged.
+   fn record(&mut self, key: K, now: Instant) -> bool {
+      if let Some(at) = self.last.get(&key) {
+         if now.duration_since(*at) < self.gap {
+            return false;
+         }
+      } else if self.last.len() >= self.limit {
+         self.last.retain(|_, at| now.duration_since(*at) < self.gap);
+         if self.last.len() >= self.limit {
+            return false;
+         }
+      }
+      self.last.insert(key, now);
+      true
    }
 }
 
@@ -2352,6 +2525,76 @@ mod tests {
             "{remote}:{port} with {missing:?} in {mode:?} must be {expected:?}"
          );
       }
+   }
+
+   /// A queued packet no flow can be built for: an ICMP echo and a port-less transport are
+   /// denied unless the owner allows them, while an ICMP error always passes and an
+   /// established TCP/UDP segment keeps the historical accept.
+   #[test]
+   fn the_transport_verdict_for_unmodelled_flows() {
+      let icmp = |icmp_type: u8| L4Payload::Icmp {
+         icmp_type,
+         icmp_code: 0,
+      };
+      let allow_icmp = Config {
+         icmp_echo: IcmpAction::Allow,
+         ..Config::default()
+      };
+      let allow_transport = Config {
+         unmatched_transport: UnmatchedTransport::Allow,
+         ..Config::default()
+      };
+
+      for (l4, config, expected) in [
+         // An echo request is an outbound attempt: denied by default, allowed on request.
+         (icmp(8), Config::default(), TransportAction::Drop),
+         (
+            icmp(8),
+            allow_icmp.clone(),
+            TransportAction::Allow,
+         ),
+         (
+            icmp(128),
+            Config::default(),
+            TransportAction::Drop,
+         ),
+         (
+            icmp(128),
+            allow_icmp.clone(),
+            TransportAction::Allow,
+         ),
+         // An ICMP error is the kernel's own diagnostic: dropping it breaks path MTU and
+         // ordinary TCP, so it passes whatever the owner set.
+         (icmp(3), Config::default(), TransportAction::Allow),
+         (icmp(3), allow_icmp, TransportAction::Allow),
+         (icmp(2), Config::default(), TransportAction::Allow),
+         // SCTP (132) carries no ports: no rule can express it, so the owner's setting is
+         // the whole decision, and it denies by default.
+         (
+            L4Payload::Other,
+            Config::default(),
+            TransportAction::Drop,
+         ),
+         (
+            L4Payload::Other,
+            allow_transport,
+            TransportAction::Allow,
+         ),
+      ] {
+         assert_eq!(
+            transport_verdict(&l4, &config),
+            expected,
+            "{l4:?} must be {expected:?}"
+         );
+      }
+
+      // A TCP segment that is not an opening SYN never reaches this decision; if it did, the
+      // model has no new flow to judge and keeps the historical accept.
+      let established = parse(&tcp_packet(0x10)).expect("an ACK parses").l4;
+      assert_eq!(
+         transport_verdict(&established, &Config::default()),
+         TransportAction::Ignore
+      );
    }
 
    /// A hand-built IPv4/TCP packet, so the SYN filter is tested on real parsed flags.
