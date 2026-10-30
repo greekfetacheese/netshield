@@ -112,8 +112,6 @@ pub struct AttributeStats {
    pub table_reads: u64,
    /// Descriptor directories read, one per pid a lookup could not rule out from its snapshot.
    pub fd_scans: u64,
-   /// Lookups answered from a socket table already indexed for the batch.
-   pub snapshot_hits: u64,
    /// Wall time spent in [`Attributor::attribute`], in nanoseconds.
    pub attribute_ns: u64,
    /// The `/proc/net` read-and-index half of that time, in nanoseconds.
@@ -831,18 +829,15 @@ impl Attributor {
                );
                return None;
             }
-            // `cmdline` is not an identity field, so it is not cached; read it when the
-            // process is still around and leave it empty when the cache is all that is
-            // left, which is exactly the vanished-process case.
-            let cmdline = fs::read(format!("{PROC}/{pid}/cmdline"))
-               .ok()
-               .and_then(|bytes| join_cmdline(&bytes));
+            // `cmdline` is not an identity field and nothing renders it: read it once per identity (in
+            // `read_process`) rather than on every packet of the flow. The `read_link` above stays — it is
+            // the evidence that the cached identity still describes the running image.
             return Some(ProcessInfo {
                pid,
                uid: cached.uid,
                exe: cached.exe.clone(),
                comm: Some(cached.comm.clone()).filter(|comm| !comm.is_empty()),
-               cmdline,
+               cmdline: None,
             });
          }
          // The pid was recycled into another user: the cached identity is not evidence
@@ -943,10 +938,6 @@ impl Attributor {
          self.last_summary_stats.table_reads,
       );
       let fd_scans = delta(current.fd_scans, self.last_summary_stats.fd_scans);
-      let snapshot_hits = delta(
-         current.snapshot_hits,
-         self.last_summary_stats.snapshot_hits,
-      );
       let attribute_ns = delta(
          current.attribute_ns,
          self.last_summary_stats.attribute_ns,
@@ -962,14 +953,11 @@ impl Attributor {
       }
       let per_lookup_ms = |nanos: u64| nanos as f64 / 1_000_000.0 / lookups as f64;
       let line = format!(
-         "attribution: {lookups} lookups in 30s, {}% snapshot hits, {:.2}ms/lookup (table \
-          {:.2}ms, fd {:.2}ms, {} fd scans, {} table reads)",
-         snapshot_hits.saturating_mul(100) / lookups,
+         "attribution: {lookups} lookups in 30s, {table_reads} table reads, {fd_scans} fd scans, \
+          {:.2}ms/lookup (table {:.2}ms, fd {:.2}ms)",
          per_lookup_ms(attribute_ns),
          per_lookup_ms(table_ns),
          per_lookup_ms(fd_ns),
-         fd_scans,
-         table_reads,
       );
       self.last_perf_summary = Some(now);
       self.last_summary_stats = current;
@@ -1011,10 +999,6 @@ impl Attributor {
          self.stats.table_ns = self.stats.table_ns.saturating_add(elapsed_ns(started));
          self.tables.insert((proto, family), index?);
          self.stats.table_reads = self.stats.table_reads.saturating_add(1);
-      } else {
-         // Answered from the table this batch already indexed: the only case the summary counts,
-         // so the hit rate measures the batching rather than the number of lookups.
-         self.stats.snapshot_hits = self.stats.snapshot_hits.saturating_add(1);
       }
       let table = self.tables.get(&(proto, family))?;
       Some(Candidates {
@@ -4233,6 +4217,35 @@ mod tests {
       assert!(
          attributor.cached_identity(pid).is_none(),
          "the stale entry is forgotten, so the next attribution reads /proc fresh"
+      );
+   }
+
+   #[test]
+   fn a_cached_identity_does_not_read_the_command_line() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      // Seed the cache the way the connector does, with the image this test really runs as, so the cached
+      // path's liveness check agrees with /proc and the cache is the branch under test.
+      let exe = std::fs::read_link("/proc/self/exe").ok();
+      attributor.process_cache.lock().expect("process cache").insert(
+         pid,
+         CachedIdentity {
+            exe,
+            comm: "netshield-test".to_owned(),
+            uid,
+            starttime: 0,
+            image_started: None,
+         },
+      );
+      let process = attributor
+         .process_identity(pid, uid)
+         .expect("the cache answers for its own pid");
+      assert_eq!(process.pid, pid);
+      assert_eq!(process.uid, uid);
+      assert_eq!(
+         process.cmdline, None,
+         "the packet path must not read /proc/<pid>/cmdline: nothing consumes it"
       );
    }
 
