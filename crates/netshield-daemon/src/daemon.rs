@@ -2166,7 +2166,9 @@ fn spawn_proc_connector(cache: Arc<Mutex<ProcessCache>>) {
                if let Ok(mut cache) = cache.lock() {
                   for event in events.drain(..) {
                      match event {
-                        ProcEvent::Exec { pid } => cache.record_exec(pid),
+                        ProcEvent::Exec { pid, image_started } => {
+                           cache.record_exec(pid, image_started)
+                        }
                         ProcEvent::Exit { pid } => cache.forget(pid),
                      }
                   }

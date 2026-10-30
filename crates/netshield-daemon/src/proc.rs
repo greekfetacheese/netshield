@@ -67,13 +67,15 @@ const MAX_UDP_CANDIDATES: usize = 64;
 /// Most bytes of `/proc/<pid>/cmdline` kept after joining its NUL-separated arguments.
 const MAX_CMDLINE: usize = 4096;
 
-/// Allowance for a socket descriptor existing just before its socket's time is stamped.
+/// Allowance for reading the socket's creation time and the event's stamp as a pair.
 ///
-/// Both observations come from the same kernel clock, but the descriptor can be installed
-/// a few microseconds before the socket inode is stamped, and an exec event is handled some
-/// time after the kernel logged it. 50 ms absorbs that gap without letting an exec that
-/// clearly followed the socket creation pass as the image that opened it.
-const SLACK: StdDuration = StdDuration::from_millis(50);
+/// Both are kernel observations on the same timeline: the descriptor link's `mtime` is stamped when
+/// the socket is created, and the event carries the kernel's CLOCK_MONOTONIC, converted with a
+/// clock pair read microseconds apart. 1 ms absorbs that skew. It is deliberately not the old 50 ms
+/// — that figure budgeted the connector thread's scheduling lag, which disappeared once the stamp
+/// came from the kernel. A kernel that stamps no events falls back to the receipt time and pays in
+/// extra refusals (a prompt), never in a missed one.
+const SLACK: StdDuration = StdDuration::from_millis(1);
 
 /// How long one exec-after-connect warning stays quiet, so a burst cannot flood the journal.
 const EXEC_WARN_GAP: StdDuration = StdDuration::from_secs(1);
@@ -200,16 +202,17 @@ impl ProcessCache {
       }
    }
 
-   /// Records a pid that called `execve`, stamping the new image at this moment.
+   /// Records a pid that called `execve`, stamping the new image when the kernel logged the event.
    ///
-   /// `/proc` cannot tell an exec from a fork: the pid and its `stat` start time survive
-   /// both. The connector's event is the only evidence that the executable changed, so the
-   /// new image starts when the event is handled; attribution compares that against the
-   /// socket's creation time to refuse an exec-after-connect.
-   pub fn record_exec(&mut self, pid: u32) {
+   /// `/proc` cannot tell an exec from a fork: the pid and its `stat` start time survive both. The
+   /// connector's event is the only evidence that the executable changed, and it carries the kernel's
+   /// own CLOCK_MONOTONIC stamp — attribution compares that against the socket's creation time to
+   /// refuse an exec-after-connect. `None` means the kernel wrote no stamp (pre-4.2, or a truncated
+   /// message); the receipt time then stands in, and `SLACK` is what that costs in precision.
+   pub fn record_exec(&mut self, pid: u32, image_started: Option<SystemTime>) {
       self.record(pid);
       if let Some(identity) = self.identities.get_mut(&pid) {
-         identity.image_started = Some(SystemTime::now());
+         identity.image_started = Some(image_started.unwrap_or_else(SystemTime::now));
       }
    }
 
@@ -612,9 +615,11 @@ impl Attributor {
    ) -> Attributed {
       // An exec between the socket's creation and this scan replaces the image that opened
       // it, so the executable now at `exe` is not the one the flow should be judged as.
-      // Only a positive observation on both sides may refuse; a missing time is ignorance,
-      // not evidence, and keeps today's attribution. A uid disagreement is left to
-      // `process_identity`, which drops the stale record and re-reads `/proc`.
+      // Both times are kernel observations: the descriptor link's `mtime` for the socket,
+      // the connector event's stamp for the image, so `SLACK` only covers reading them as
+      // a pair. Only a positive observation on both sides may refuse; a missing time is
+      // ignorance, not evidence, and keeps today's attribution. A uid disagreement is left
+      // to `process_identity`, which drops the stale record and re-reads `/proc`.
       if let Some(identity) = self.cached_identity(hit.pid)
          && identity.uid == hit.uid
          && let (Some(created), Some(image_started)) = (hit.created, identity.image_started)
@@ -3615,6 +3620,26 @@ mod tests {
          Attribution::Unknown => panic!("an unknown socket time must keep today's attribution"),
       }
       assert_eq!(attributed.missing, None);
+   }
+
+   #[test]
+   fn a_stamped_exec_uses_the_event_time_not_the_receipt_time() {
+      let mut cache = ProcessCache::new();
+      cache.record(std::process::id());
+      let stamped = SystemTime::now() - StdDuration::from_secs(60);
+      cache.record_exec(std::process::id(), Some(stamped));
+      let identity = cache.get(std::process::id()).expect("recorded");
+      assert_eq!(
+         identity.image_started,
+         Some(stamped),
+         "the kernel's stamp wins"
+      );
+      cache.record_exec(std::process::id(), None);
+      let identity = cache.get(std::process::id()).expect("recorded");
+      assert!(
+         identity.image_started.is_some_and(|start| start > stamped),
+         "no stamp falls back to the receipt clock"
+      );
    }
 
    /// A `/proc/<pid>` fixture holding the four files `ProcessCache::record` reads.

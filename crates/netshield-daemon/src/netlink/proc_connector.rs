@@ -18,7 +18,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::socket::{MessageIter, RECV_BUF_LEN};
 
@@ -47,6 +47,9 @@ const CN_IDX_OFFSET: usize = 0;
 const CN_VAL_OFFSET: usize = 4;
 const CN_LEN_OFFSET: usize = 16;
 const PROC_WHAT_OFFSET: usize = 20;
+/// `timestamp_ns` in `struct proc_event`: CLOCK_MONOTONIC at the moment the kernel logged the
+/// event, in nanoseconds since boot. Kernels before 4.2 wrote no such field.
+const PROC_TIMESTAMP_OFFSET: usize = 28;
 const PROC_PID_OFFSET: usize = 36;
 /// The smallest `proc_event` that carries both header and the pid pair: 16 bytes of
 /// common header plus the union's first field and `process_tgid`.
@@ -55,8 +58,12 @@ const PROC_EVENT_LEN: usize = 24;
 /// One process lifecycle event decoded from the connector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcEvent {
-   /// `pid` called `execve`; its identity can be read now.
-   Exec { pid: u32 },
+   /// `pid` called `execve`; its identity can be read now. `image_started` is the kernel's
+   /// CLOCK_MONOTONIC stamp converted to wall time, or `None` when the kernel wrote none.
+   Exec {
+      pid: u32,
+      image_started: Option<SystemTime>,
+   },
    /// `pid` is exiting; any cached identity is about to refer to a recycled pid.
    Exit { pid: u32 },
 }
@@ -298,8 +305,16 @@ fn parse_message(payload: &[u8]) -> Option<ProcEvent> {
    // `EXEC` and `EXIT`; the pid is the one the cache is keyed by.
    let what = read_u32(payload, PROC_WHAT_OFFSET)?;
    let pid = read_u32(payload, PROC_PID_OFFSET)?;
+   // A short message (an older kernel's event, or a lying length) simply has no stamp; the
+   // caller then falls back to its own clock, and `SLACK` covers that case.
+   let stamped = read_u64(payload, PROC_TIMESTAMP_OFFSET)
+      .filter(|nanos| *nanos != 0)
+      .map(monotonic_to_wall);
    match what {
-      PROC_EVENT_EXEC => Some(ProcEvent::Exec { pid }),
+      PROC_EVENT_EXEC => Some(ProcEvent::Exec {
+         pid,
+         image_started: stamped,
+      }),
       PROC_EVENT_EXIT => Some(ProcEvent::Exit { pid }),
       _ => None,
    }
@@ -311,6 +326,52 @@ fn read_u32(buf: &[u8], offset: usize) -> Option<u32> {
    Some(u32::from_ne_bytes(bytes.try_into().ok()?))
 }
 
+/// Reads a native-endian `u64` at `offset`, or `None` when the buffer ends before it.
+fn read_u64(buf: &[u8], offset: usize) -> Option<u64> {
+   let bytes = buf.get(offset..offset + 8)?;
+   Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+/// Converts a boot-relative CLOCK_MONOTONIC stamp to wall time.
+///
+/// The two clocks are read as a pair, so the conversion costs one `clock_gettime` and inherits only
+/// the microseconds between the reads — which is what `SLACK` budgets for. A failure to read
+/// CLOCK_MONOTONIC is not worth an error path: the caller keeps its own receipt time.
+fn monotonic_to_wall(event_ns: u64) -> SystemTime {
+   let Some(now_mono) = monotonic_ns() else {
+      return SystemTime::now();
+   };
+   wall_from_monotonic(event_ns, now_mono, SystemTime::now())
+}
+
+/// The pure half of [`monotonic_to_wall`], so the arithmetic is testable without a clock.
+fn wall_from_monotonic(event_ns: u64, now_mono_ns: u64, now_wall: SystemTime) -> SystemTime {
+   let lag = now_mono_ns.saturating_sub(event_ns);
+   now_wall.checked_sub(Duration::from_nanos(lag)).unwrap_or(now_wall)
+}
+
+/// CLOCK_MONOTONIC in nanoseconds, the clock the connector stamps its events with.
+///
+/// This is the one place in the crate that reads a clock through `libc`, and it stays here because
+/// `unsafe` is only allowed under `netlink/`.
+fn monotonic_ns() -> Option<u64> {
+   let mut now = libc::timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+   };
+   // SAFETY: `now` is a valid, writable `timespec` for the duration of the call, and
+   // CLOCK_MONOTONIC is one of the two clock ids `clock_gettime` requires.
+   let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+   if rc != 0 || now.tv_sec < 0 || now.tv_nsec < 0 {
+      return None;
+   }
+   Some(
+      (now.tv_sec as u64)
+         .saturating_mul(1_000_000_000)
+         .saturating_add(now.tv_nsec as u64),
+   )
+}
+
 #[cfg(test)]
 mod tests {
    use super::*;
@@ -320,14 +381,14 @@ mod tests {
    /// The bytes are assembled from explicit field offsets rather than from the parsing
    /// constants, so a wrong constant breaks the parser test instead of moving both sides
    /// together.
-   fn message(idx: u32, val: u32, what: u32, pid: u32) -> Vec<u8> {
+   fn message(idx: u32, val: u32, what: u32, pid: u32, stamp: u64) -> Vec<u8> {
       let mut msg = vec![0u8; 20 + 24];
       msg[0..4].copy_from_slice(&idx.to_ne_bytes());
       msg[4..8].copy_from_slice(&val.to_ne_bytes());
       msg[16..18].copy_from_slice(&24u16.to_ne_bytes());
       msg[20..24].copy_from_slice(&what.to_ne_bytes());
       msg[24..28].copy_from_slice(&3u32.to_ne_bytes()); // cpu
-      msg[28..36].copy_from_slice(&1_700_000_000_000_000_000u64.to_ne_bytes());
+      msg[28..36].copy_from_slice(&stamp.to_ne_bytes());
       msg[36..40].copy_from_slice(&pid.to_ne_bytes());
       msg[40..44].copy_from_slice(&pid.to_ne_bytes());
       msg
@@ -349,19 +410,28 @@ mod tests {
 
    #[test]
    fn exec_and_exit_frames_decode_to_their_pid() {
-      let bytes = message(1, 1, 2, 4242);
+      let bytes = message(1, 1, 2, 4242, 0);
       assert_eq!(
          parse_message(&bytes),
-         Some(ProcEvent::Exec { pid: 4242 })
+         Some(ProcEvent::Exec {
+            pid: 4242,
+            image_started: None,
+         })
       );
 
       let mut events = Vec::new();
       assert_eq!(drain_events(&datagram(&[bytes]), &mut events), 1);
-      assert_eq!(events, vec![ProcEvent::Exec { pid: 4242 }]);
+      assert_eq!(
+         events,
+         vec![ProcEvent::Exec {
+            pid: 4242,
+            image_started: None,
+         }]
+      );
 
       // `PROC_EVENT_EXIT` is bit 31 set; a signed or truncated comparison would read it
       // as an unknown event.
-      let bytes = message(1, 1, 0x8000_0000, 777);
+      let bytes = message(1, 1, 0x8000_0000, 777, 0);
       assert_eq!(
          parse_message(&bytes),
          Some(ProcEvent::Exit { pid: 777 })
@@ -374,7 +444,7 @@ mod tests {
 
    #[test]
    fn truncated_frames_are_rejected_without_panicking() {
-      let full = message(1, 1, 2, 9001);
+      let full = message(1, 1, 2, 9001, 0);
       for cut in [0, 1, 19, 20, 21, 35, 36, 39, 43] {
          assert_eq!(
             parse_message(&full[..cut]),
@@ -388,7 +458,7 @@ mod tests {
       assert_eq!(parse_message(&lying), None);
 
       // A header that announces more bytes than were received ends the datagram.
-      let mut short = datagram(&[message(1, 1, 2, 1)]);
+      let mut short = datagram(&[message(1, 1, 2, 1, 0)]);
       short[0..4].copy_from_slice(&80u32.to_ne_bytes());
       let mut events = Vec::new();
       assert_eq!(drain_events(&short, &mut events), 0);
@@ -398,30 +468,36 @@ mod tests {
    #[test]
    fn unrelated_messages_are_ignored() {
       // Another connector's index or val pair is not a proc event.
-      assert_eq!(parse_message(&message(2, 1, 2, 1)), None);
-      assert_eq!(parse_message(&message(1, 2, 2, 1)), None);
+      assert_eq!(parse_message(&message(2, 1, 2, 1, 0)), None);
+      assert_eq!(parse_message(&message(1, 2, 2, 1, 0)), None);
       assert_eq!(
-         parse_message(&message(0, 0, 2, 1)),
+         parse_message(&message(0, 0, 2, 1, 0)),
          None,
          "an unrelated connector index/val pair is not a proc event"
       );
 
       // `PROC_EVENT_FORK` is 1; this module only tracks exec and exit.
-      assert_eq!(parse_message(&message(1, 1, 1, 1)), None);
-      assert_eq!(parse_message(&message(1, 1, 0, 1)), None);
+      assert_eq!(parse_message(&message(1, 1, 1, 1, 0)), None);
+      assert_eq!(parse_message(&message(1, 1, 0, 1, 0)), None);
 
       // A datagram mixing one tracked event with an unknown one yields only the tracked
       // event, and both frames are still walked.
       let mut events = Vec::new();
       let bytes = datagram(&[
-         message(1, 1, 2, 10),
-         message(1, 1, 1, 11),
-         message(1, 1, 0x8000_0000, 12),
+         message(1, 1, 2, 10, 0),
+         message(1, 1, 1, 11, 0),
+         message(1, 1, 0x8000_0000, 12, 0),
       ]);
       assert_eq!(drain_events(&bytes, &mut events), 2);
       assert_eq!(
          events,
-         vec![ProcEvent::Exec { pid: 10 }, ProcEvent::Exit { pid: 12 }]
+         vec![
+            ProcEvent::Exec {
+               pid: 10,
+               image_started: None,
+            },
+            ProcEvent::Exit { pid: 12 },
+         ]
       );
    }
 
@@ -430,19 +506,79 @@ mod tests {
       // The kernel coalesces; keeping only the first would lose the exec that followed an
       // exit and leave its process identity unreadable.
       let bytes = datagram(&[
-         message(1, 1, 2, 100),
-         message(1, 1, 0x8000_0000, 200),
-         message(1, 1, 2, 300),
+         message(1, 1, 2, 100, 0),
+         message(1, 1, 0x8000_0000, 200, 0),
+         message(1, 1, 2, 300, 0),
       ]);
       let mut events = Vec::new();
       assert_eq!(drain_events(&bytes, &mut events), 3);
       assert_eq!(
          events,
          vec![
-            ProcEvent::Exec { pid: 100 },
+            ProcEvent::Exec {
+               pid: 100,
+               image_started: None,
+            },
             ProcEvent::Exit { pid: 200 },
-            ProcEvent::Exec { pid: 300 },
+            ProcEvent::Exec {
+               pid: 300,
+               image_started: None,
+            },
          ]
       );
+   }
+
+   #[test]
+   fn an_event_stamped_five_millis_ago_is_converted_to_five_millis_ago() {
+      let now_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+      let now_mono = 12_345_000_000_u64; // arbitrary boot-relative nanoseconds
+      let event = now_mono - 5_000_000;
+      assert_eq!(
+         wall_from_monotonic(event, now_mono, now_wall),
+         now_wall - Duration::from_millis(5)
+      );
+      assert_eq!(
+         wall_from_monotonic(now_mono, now_mono, now_wall),
+         now_wall,
+         "an event stamped now is now"
+      );
+      assert_eq!(
+         wall_from_monotonic(now_mono + 1, now_mono, now_wall),
+         now_wall,
+         "a stamp in the future cannot move the time forward"
+      );
+   }
+
+   #[test]
+   fn an_exec_message_carries_its_kernel_timestamp() {
+      let bytes = message(1, 1, 2, 42, 12_345_000_000);
+      let Some(ProcEvent::Exec { pid, image_started }) = parse_message(&bytes) else {
+         panic!("an exec message must decode");
+      };
+      assert_eq!(pid, 42);
+      assert!(
+         image_started.is_some(),
+         "a nonzero stamp is converted, not dropped"
+      );
+
+      // A zero stamp is the kernel's "no timestamp" value; attribution falls back to its
+      // own receipt clock.
+      assert_eq!(
+         parse_message(&message(1, 1, 2, 42, 0)),
+         Some(ProcEvent::Exec {
+            pid: 42,
+            image_started: None,
+         })
+      );
+
+      // Truncated before the stamp ends, the message cannot decode at all: no event may
+      // reach the cache without the pid, and no stamp may be invented for one.
+      let full = message(1, 1, 2, 42, 12_345_000_000);
+      assert_eq!(parse_message(&full[..35]), None);
+      assert_eq!(
+         read_u64(&full, PROC_TIMESTAMP_OFFSET),
+         Some(12_345_000_000)
+      );
+      assert_eq!(read_u64(&full[..35], PROC_TIMESTAMP_OFFSET), None);
    }
 }
