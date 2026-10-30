@@ -352,6 +352,7 @@ impl Daemon {
          queue_num: self.config.queue_num,
          queue_drops: self.queue_drops,
          table_verified: self.table_verified,
+         mutation_gated: self.config.gui_path.is_some(),
          started_at: self.started_at,
       }
    }

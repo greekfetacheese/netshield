@@ -584,6 +584,7 @@ mod tests {
          queue_num: 0,
          queue_drops: 0,
          table_verified: true,
+         mutation_gated: true,
          started_at: 1_700_000_000,
       })
    }

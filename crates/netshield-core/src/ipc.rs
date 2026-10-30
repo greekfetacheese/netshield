@@ -254,6 +254,15 @@ pub struct StatusInfo {
    /// way to observe enforcement from inside the daemon is this check, and an unverified
    /// table is a startup error, not a running state.
    pub table_verified: bool,
+   /// Whether only the configured GUI executable may change firewall state.
+   ///
+   /// False means every process of `allowed_uid` can flip the mode or write a rule, which the
+   /// daemon warns about at bind time; the Status page says it out loud rather than leaving it in
+   /// the journal. `#[serde(default)]` keeps a status frame from a daemon built before this key
+   /// parseable, and a missing key reads as `false` — the unguarded side, so an older daemon can
+   /// never make the GUI claim a guarantee it does not have.
+   #[serde(default)]
+   pub mutation_gated: bool,
    pub started_at: u64,
 }
 
@@ -413,6 +422,7 @@ mod tests {
             queue_num: 0,
             queue_drops: 2,
             table_verified: true,
+            mutation_gated: true,
             started_at: 100,
          }),
          Response::Error {
@@ -472,6 +482,29 @@ mod tests {
       assert!(prompt.dests.is_empty());
       assert_eq!(prompt.connection, view());
       assert_eq!(prompt.id, 3);
+   }
+
+   #[test]
+   fn a_status_frame_without_the_gate_parses_as_ungated() {
+      let status = StatusInfo {
+         daemon_pid: 7,
+         mode: Mode::Alert,
+         rule_count: 0,
+         pending_prompts: 0,
+         queue_num: 0,
+         queue_drops: 0,
+         table_verified: true,
+         mutation_gated: true,
+         started_at: 0,
+      };
+      let mut frame = serde_json::to_value(&status).expect("serialize a status");
+      let object = frame.as_object_mut().expect("a status is an object");
+      object.remove("mutation_gated");
+      let parsed: StatusInfo = serde_json::from_value(frame).expect("an older frame still parses");
+      assert!(
+         !parsed.mutation_gated,
+         "a missing key must read as the unguarded side"
+      );
    }
 
    #[test]
