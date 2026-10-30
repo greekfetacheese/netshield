@@ -72,6 +72,21 @@ const WRITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 /// thread and socket leak into a refusal, while leaving ample room for the real clients.
 const MAX_CLIENTS: usize = 64;
 
+/// Registry slots held back for the configured GUI binary.
+///
+/// The GUI must always be able to attach: without a reservation, foreign peers of the same
+/// uid can take every slot, and the GUI is locked out exactly when it is needed. Eight
+/// slots are more than any real GUI opens and still leave 56 for every other client.
+const RESERVED_GUI_SLOTS: usize = 8;
+
+/// How long a connecting peer has to finish the handshake before it is closed.
+///
+/// A peer that connects and says nothing is not a client: it holds a registry slot, a
+/// writer thread and a socket while it never becomes one. The timeout bounds exactly the
+/// un-handshaked state, so it cannot disturb a GUI that has already introduced itself and
+/// then sits idle for hours.
+const HANDSHAKE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
 /// Why the control socket could not be created.
 #[derive(Debug)]
 pub enum IpcError {
@@ -302,6 +317,15 @@ enum Enqueue {
    Gone,
 }
 
+/// What a connecting peer may claim from the registry's cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+   /// The configured GUI binary, which may use the reserved slots.
+   Gui,
+   /// Any other peer: capped below [`MAX_CLIENTS`] while a GUI path is configured.
+   Foreign { max: usize },
+}
+
 /// Hands one encoded frame to a client's writer thread without ever blocking.
 fn enqueue(client: &Client, bytes: &[u8]) -> Enqueue {
    match client.queue.try_send(bytes.to_vec()) {
@@ -350,13 +374,19 @@ impl Shared {
    /// The count is checked and the new entry inserted under one lock, so concurrent
    /// acceptors cannot both slip past [`MAX_CLIENTS`]. A refusal is an
    /// [`io::ErrorKind::ConnectionAborted`] error and leaves the registry untouched; the
-   /// caller drops the socket.
-   fn register(&self, stream: &UnixStream) -> io::Result<u64> {
+   /// caller drops the socket. The configured GUI keeps a slot: a [`Admission::Foreign`]
+   /// peer is capped below the full registry, so a flood of ordinary clients cannot lock it
+   /// out.
+   fn register(&self, stream: &UnixStream, admission: Admission) -> io::Result<u64> {
+      let limit = match admission {
+         Admission::Gui => MAX_CLIENTS,
+         Admission::Foreign { max } => max.min(MAX_CLIENTS),
+      };
       let mut clients = self.clients.lock().expect("client registry");
-      if clients.len() >= MAX_CLIENTS {
+      if clients.len() >= limit {
          return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
-            format!("control client limit of {MAX_CLIENTS} reached"),
+            format!("control client limit of {limit} reached"),
          ));
       }
       let writer = stream.try_clone()?;
@@ -687,7 +717,17 @@ fn remove_stale_socket(path: &Path) -> Result<(), IpcError> {
 }
 
 /// Serves one client: authenticate, handshake, then dispatch until it disconnects.
-fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+fn serve(stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
+   serve_with_timeout(stream, shared, policy, HANDSHAKE_TIMEOUT)
+}
+
+/// [`serve`] with an explicit handshake bound, so a test need not wait [`HANDSHAKE_TIMEOUT`].
+fn serve_with_timeout(
+   mut stream: UnixStream,
+   shared: Arc<Shared>,
+   policy: GuiPolicy,
+   handshake_timeout: StdDuration,
+) {
    let cred = match peer_creds(std::os::fd::AsRawFd::as_raw_fd(&stream)) {
       Ok(cred) => cred,
       Err(err) => {
@@ -706,23 +746,45 @@ fn serve(mut stream: UnixStream, shared: Arc<Shared>, policy: GuiPolicy) {
       pid: cred.pid,
       uid: cred.uid,
    };
-   let id = match shared.register(&stream) {
+   let exe = executable_path(client.pid);
+   let gui = policy.gui_path.as_deref().is_some_and(|path| exe.as_deref() == Some(path));
+   let admission = if gui {
+      Admission::Gui
+   } else {
+      Admission::Foreign {
+         max: if policy.gui_path.is_some() {
+            MAX_CLIENTS - RESERVED_GUI_SLOTS
+         } else {
+            MAX_CLIENTS
+         },
+      }
+   };
+   let id = match shared.register(&stream, admission) {
       Ok(id) => id,
       Err(err) => {
          warn!("could not register a control client: {err}");
          return;
       }
    };
-   let exe = executable_path(client.pid);
    debug!(
       "control client {id} connected as uid {} (pid {}, exe {exe:?})",
       client.uid, client.pid
    );
 
    let mut buffered = Vec::new();
+   // The bound covers the un-handshaked state only: a peer that never speaks must not hold
+   // a slot for ever, while a real GUI sits silent for hours once it has said Hello.
+   if let Err(err) = stream.set_read_timeout(Some(handshake_timeout)) {
+      warn!("could not bound a control client's handshake timeout: {err}");
+   }
    if !handshake(&mut stream, &shared, id, &mut buffered) {
       shared.unregister(id);
       return;
+   }
+   // Clear the bound now: idleness after the handshake is healthy, and the loop below treats
+   // a timed-out read as a dead peer, which would close a GUI that simply has nothing to say.
+   if let Err(err) = stream.set_read_timeout(None) {
+      warn!("could not clear a control client's handshake timeout: {err}");
    }
 
    loop {
@@ -1246,7 +1308,9 @@ mod tests {
       }
       // The peer end is never read from here on.
 
-      shared.register(&server).expect("register the silent client");
+      shared
+         .register(&server, Admission::Foreign { max: MAX_CLIENTS })
+         .expect("register the silent client");
       let handle = IpcHandle {
          shared: Arc::clone(&shared),
       };
@@ -1266,6 +1330,39 @@ mod tests {
          handle.clients(),
          0,
          "a client that cannot keep up must be unregistered"
+      );
+   }
+
+   #[test]
+   fn a_client_that_never_speaks_is_closed_after_the_handshake_timeout() {
+      let _serial = serial();
+      let shared = shared();
+      let (server, mut peer) = pair();
+
+      let serviced = Arc::clone(&shared);
+      thread::spawn(move || {
+         serve_with_timeout(
+            server,
+            serviced,
+            policy(Some(1000)),
+            StdDuration::from_millis(50),
+         );
+      });
+
+      // The peer never writes, so the server sends nothing either: EOF here is the server
+      // dropping the socket, which proves the connection was closed instead of polled for
+      // a registration that a 50 ms window may already have erased.
+      peer.set_read_timeout(Some(StdDuration::from_secs(2))).expect("read timeout");
+      let mut byte = [0u8; 1];
+      assert!(
+         matches!(peer.read(&mut byte), Ok(0)),
+         "an un-handshaked client must be closed"
+      );
+      assert!(
+         wait_until(Instant::now() + StdDuration::from_secs(2), || {
+            shared.clients() == 0
+         }),
+         "an un-handshaked client must be closed"
       );
    }
 
@@ -1292,7 +1389,9 @@ mod tests {
       }
       // The peer end is never read from here on.
 
-      shared.register(&server).expect("register the silent client");
+      shared
+         .register(&server, Admission::Foreign { max: MAX_CLIENTS })
+         .expect("register the silent client");
       // The name is applied by the thread itself; a count taken before that would miss the
       // writer and let the test pass without ever observing a parked one, so confirm the
       // thread is visible before shedding it.
@@ -1331,13 +1430,17 @@ mod tests {
       let mut peers = Vec::with_capacity(MAX_CLIENTS);
       for _ in 0..MAX_CLIENTS {
          let (server, peer) = pair();
-         shared.register(&server).expect("register within the limit");
+         shared
+            .register(&server, Admission::Foreign { max: MAX_CLIENTS })
+            .expect("register within the limit");
          peers.push(peer);
       }
       assert_eq!(shared.clients(), MAX_CLIENTS);
 
       let (server, _peer) = pair();
-      let err = shared.register(&server).expect_err("the registry is full");
+      let err = shared
+         .register(&server, Admission::Foreign { max: MAX_CLIENTS })
+         .expect_err("the registry is full");
       assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
       assert!(
          err.to_string().contains(&MAX_CLIENTS.to_string()),
@@ -1351,10 +1454,45 @@ mod tests {
    }
 
    #[test]
+   fn the_configured_gui_is_admitted_when_foreign_clients_have_filled_the_registry() {
+      let _serial = serial();
+      let shared = shared();
+      let foreign_max = MAX_CLIENTS - RESERVED_GUI_SLOTS;
+      // Hold every peer end so no writer sees EOF and no socket is dropped early.
+      let mut peers = Vec::with_capacity(foreign_max);
+      for _ in 0..foreign_max {
+         let (server, peer) = pair();
+         shared
+            .register(&server, Admission::Foreign { max: foreign_max })
+            .expect("register within the foreign limit");
+         peers.push(peer);
+      }
+      assert_eq!(shared.clients(), foreign_max);
+
+      let (server, _peer) = pair();
+      let err = shared
+         .register(&server, Admission::Foreign { max: foreign_max })
+         .expect_err("foreign clients are held below the reserved slots");
+      assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+
+      let (server, _peer) = pair();
+      shared
+         .register(&server, Admission::Gui)
+         .expect("the reserved slot admits the configured GUI");
+      assert_eq!(
+         shared.clients(),
+         foreign_max + 1,
+         "the GUI takes one of the slots held back for it"
+      );
+   }
+
+   #[test]
    fn a_reading_client_receives_frames_in_order() {
       let shared = shared();
       let (server, mut client) = pair();
-      shared.register(&server).expect("register the reading client");
+      shared
+         .register(&server, Admission::Foreign { max: MAX_CLIENTS })
+         .expect("register the reading client");
       client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
 
       let reader = thread::spawn(move || {
