@@ -11,8 +11,8 @@ Linux with nftables and systemd, root for the daemon, and a logged-in user for t
 Build the binaries first, then install them:
 
 ```sh
-cargo build --release
-sudo packaging/install.sh --bin-dir target/release
+cargo build --profile prod
+sudo packaging/install.sh --bin-dir target/prod
 ```
 
 The installer never builds. It installs `netshieldd` and `netshield-gui` to

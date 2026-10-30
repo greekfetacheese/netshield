@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
-BIN_DIR="target/release"
+BIN_DIR="target/prod"
 DRY_RUN=0
 UNINSTALL=0
 PURGE=0
@@ -26,7 +26,7 @@ Options:
   --prefix DIR     install binaries under DIR/bin and use them in the unit and
                    the autostart entry (default: /usr/local)
   --bin-dir DIR    directory holding the prebuilt netshieldd and netshield-gui
-                   (default: target/release)
+                   (default: target/prod)
   --dry-run        print every path and command instead of touching anything
   --uninstall      stop and disable the service, remove the unit, the autostart
                    entry, the nftables table and the binaries; keep /etc/netshield
