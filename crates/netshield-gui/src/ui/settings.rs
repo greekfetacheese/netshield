@@ -71,7 +71,7 @@ pub fn show(ui: &mut Ui, current: Mode, prefs: &mut Prefs) -> bool {
          changed |= ui
             .add(
                Slider::new(&mut prefs.rows_per_app, prefs::ROWS_PER_APP)
-                  .label("Rows per application"),
+                  .label("Tracked connections per application"),
             )
             .changed();
          changed |= ui
