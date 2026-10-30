@@ -444,6 +444,10 @@ fn duration_field(ui: &mut Ui, draft: &mut Draft) {
    });
 }
 
+/// How many text rows the destination box shows before it scrolls, so a pasted list cannot grow the
+/// modal past the window (egui's `TextEdit` allocates its whole galley with no scroll of its own).
+const DESTINATION_ROWS: f32 = 8.0;
+
 /// The scope row: the kind selector above the inputs that kind uses.
 fn scope_field(ui: &mut Ui, draft: &mut Draft) {
    ui.vertical(|ui| {
@@ -464,13 +468,19 @@ fn scope_field(ui: &mut Ui, draft: &mut Draft) {
       match &mut draft.scope {
          ScopeDraft::Any => {}
          ScopeDraft::Destinations { text } => {
-            ui.add(
-               egui::TextEdit::multiline(text)
-                  .font(egui::TextStyle::Monospace)
-                  .desired_rows(6)
-                  .desired_width(360.0)
-                  .hint_text("api.github.com\n*.example.org\n140.82.0.0/16"),
-            );
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            egui::ScrollArea::vertical()
+               .id_salt("rule-editor-destinations")
+               .max_height(row_height * DESTINATION_ROWS + 6.0)
+               .show(ui, |ui| {
+                  ui.add(
+                     egui::TextEdit::multiline(text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(6)
+                        .desired_width(360.0)
+                        .hint_text("api.github.com\n*.example.org\n140.82.0.0/16"),
+                  );
+               });
             ui.label(
                RichText::new("one IP, CIDR or domain per line; *.domain includes subdomains")
                   .small()
