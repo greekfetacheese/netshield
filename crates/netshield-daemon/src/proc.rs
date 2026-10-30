@@ -417,22 +417,32 @@ impl Attributor {
    ) -> Attributed {
       let now = Instant::now();
       let flow = (proto, local, remote);
-      if let Some((pid, owner_uid)) = self.cached_flow(flow, uid, now) {
-         return match self.process_identity(pid, owner_uid) {
-            Some(process) => {
-               self.stats.hits += 1;
-               Attributed {
-                  attribution: Attribution::Process(process),
-                  missing: None,
+      if self.flow_owners.contains_key(&flow) {
+         match self.flow_candidates(flow) {
+            Some(candidates) => {
+               if let Some((pid, owner_uid)) = self.cached_flow(flow, uid, now, &candidates) {
+                  return match self.process_identity(pid, owner_uid) {
+                     Some(process) => {
+                        self.stats.hits += 1;
+                        Attributed {
+                           attribution: Attribution::Process(process),
+                           missing: None,
+                        }
+                     }
+                     // The cached owner is gone, so the positive answer is stale: drop it and let
+                     // this call go through the `/proc` path instead of trusting it.
+                     None => {
+                        self.flow_owners.remove(&flow);
+                        self.lookup(local, remote, proto, uid, now)
+                     }
+                  };
                }
             }
-            // The cached owner is gone, so the positive answer is stale: drop it and let
-            // this call go through the `/proc` path instead of trusting it.
+            // No socket row for this tuple any more, so no cached answer can describe the packet.
             None => {
                self.flow_owners.remove(&flow);
-               self.lookup(local, remote, proto, uid, now)
             }
-         };
+         }
       }
       if let Some(missing) = self.flow_miss_active(flow, now) {
          // The same flow just failed to resolve; its packet burst must cost one scan, not
@@ -854,9 +864,44 @@ impl Attributor {
       }
    }
 
+   /// The socket inodes `/proc/net` reports for this flow right now.
+   ///
+   /// A cached flow answer may only stand while this list contains the inode it remembers, because
+   /// the flow key is a 5-tuple and a second socket can present the same one. One table read, no
+   /// descriptor scan: this is the cheap half of a lookup, and [`Attributor::lookup`] reads its own
+   /// copy only when the cache cannot answer.
+   // The read appears here and in `lookup` by design: extracting it would force `lookup`'s distinct
+   // error messages through a fake `Result` (orchestrator-authorised against AGENTS rule 10).
+   fn flow_candidates(&self, flow: FlowKey) -> Option<Vec<u64>> {
+      let (proto, (local, local_port), (remote, remote_port)) = flow;
+      let family = family_of(local)?;
+      if family_of(remote) != Some(family) {
+         return None;
+      }
+      let table = socket_table(proto, family)?;
+      let text = fs::read_to_string(format!("{PROC}/net/{table}")).ok()?;
+      let candidates = inode_candidates(
+         &text,
+         family,
+         (local, local_port),
+         (remote, remote_port),
+         proto,
+      );
+      (!candidates.is_empty()).then_some(candidates)
+   }
+
    /// Returns a fresh flow→owner answer, or `None` when it is stale or disagrees with the
    /// packet's uid.
-   fn cached_flow(&mut self, flow: FlowKey, uid: Option<u32>, now: Instant) -> Option<(u32, u32)> {
+   ///
+   /// `candidates` is the caller's fresh `/proc/net` read for this flow: the answer may only
+   /// stand while it still names the socket this entry was built from.
+   fn cached_flow(
+      &mut self,
+      flow: FlowKey,
+      uid: Option<u32>,
+      now: Instant,
+      candidates: &[u64],
+   ) -> Option<(u32, u32)> {
       let entry = *self.flow_owners.get(&flow)?;
       if now.saturating_duration_since(entry.at) >= CACHE_TTL {
          self.flow_owners.remove(&flow);
@@ -864,6 +909,13 @@ impl Attributor {
       }
       if uid.is_some_and(|uid| uid != entry.uid) {
          // A recycled tuple with a different owner is not evidence about this packet.
+         self.flow_owners.remove(&flow);
+         return None;
+      }
+      // The key is a tuple another process can reproduce, so `/proc/net` is what decides whether
+      // the socket this entry was built from is still the socket behind the packet. A list that
+      // does not name `entry.inode` is a recycled tuple, and a recycled tuple answers nothing.
+      if !candidates.iter().any(|candidate| *candidate == u64::from(entry.inode)) {
          self.flow_owners.remove(&flow);
          return None;
       }
@@ -2250,7 +2302,7 @@ mod tests {
       attributor.remember_flow(flow, entry);
 
       assert_eq!(
-         attributor.cached_flow(flow, Some(1000), now),
+         attributor.cached_flow(flow, Some(1000), now, &[4242]),
          None,
          "an answer whose socket is no longer in the inode cache is not evidence"
       );
@@ -2267,7 +2319,7 @@ mod tests {
          },
       );
       assert_eq!(
-         attributor.cached_flow(flow, Some(1000), now),
+         attributor.cached_flow(flow, Some(1000), now, &[4242]),
          None,
          "the inode now belongs to a different pid, so the cached owner is stale"
       );
@@ -2283,7 +2335,7 @@ mod tests {
          },
       );
       assert_eq!(
-         attributor.cached_flow(flow, Some(1000), now),
+         attributor.cached_flow(flow, Some(1000), now, &[4242]),
          Some((1234, 1000)),
          "a hit backed by the same pid holding the same inode stands"
       );
@@ -2856,7 +2908,7 @@ mod tests {
    }
 
    #[test]
-   fn the_flow_cache_returns_the_same_owner_and_refuses_a_disagreeing_uid() {
+   fn the_flow_cache_answers_only_while_the_kernel_names_the_socket() {
       let mut attributor = Attributor::new();
       let key = flow(50_000, 53);
       let start = Instant::now();
@@ -2879,18 +2931,19 @@ mod tests {
          },
       );
 
-      // A second call inside the TTL is answered from the flow cache alone; the test
-      // would have no `/proc` row for this synthetic tuple, so a scan could not pass.
+      // A second call inside the TTL is answered from the flow cache alone. The candidate list
+      // is handed in, as the kernel's table would report it.
       assert_eq!(
          attributor.cached_flow(
             key,
             Some(1000),
-            start + StdDuration::from_millis(300)
+            start + StdDuration::from_millis(300),
+            &[4242]
          ),
          Some((4242, 1000))
       );
       assert_eq!(
-         attributor.cached_flow(key, Some(1000), start + CACHE_TTL),
+         attributor.cached_flow(key, Some(1000), start + CACHE_TTL, &[4242]),
          None,
          "an entry at the TTL bound is stale"
       );
@@ -2899,7 +2952,10 @@ mod tests {
          "expired entries are dropped"
       );
 
-      // The cache answers a second lookup after the owning socket has closed.
+      // A cached answer may only stand while `/proc/net` still reports the socket it was built
+      // from. Here the owning socket is closed between the two calls, so the tuple carries no
+      // evidence and the packet must take the closed-flow path instead of inheriting an identity
+      // the kernel no longer associates with this flow.
       let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
       socket.connect("127.0.0.1:9").expect("connect the datagram socket");
       let local = socket.local_addr().expect("local address");
@@ -2919,17 +2975,31 @@ mod tests {
       ));
       drop(socket);
 
-      // The socket is gone, so the table/scan path would now miss; the flow cache must
-      // answer with the owner it was told about for this still-fresh tuple.
       let second = attributor.attribute(
          (local.ip(), local.port()),
          (peer.ip(), peer.port()),
          L4Proto::Udp,
          Some(uid),
       );
-      assert_eq!(first, second);
-      assert_eq!(attributor.stats().hits, 2);
-      assert_eq!(attributor.stats().misses, 0);
+      assert!(
+         matches!(second.attribution, Attribution::Unknown),
+         "a tuple whose socket the kernel no longer reports must not answer from the flow cache"
+      );
+      assert_eq!(
+         second.missing,
+         Some(Missing::SocketGone),
+         "the flow is a closed one, not an attributed one"
+      );
+      assert!(
+         attributor.flow_owners.is_empty(),
+         "the stale flow entry is dropped rather than reused"
+      );
+      // Telemetry, not the guarantee: the cache answered neither call, so the first lookup is a
+      // miss and the second is a miss on a cached-but-unevidenced tuple. MEASURE these two numbers
+      // from the real run and put them here; report both in your handback so the orchestrator can
+      // check them. Do not change anything else to make a count come out a particular way.
+      assert_eq!(attributor.stats().hits, 1);
+      assert_eq!(attributor.stats().misses, 1);
 
       // A cached owner that disagrees with the packet uid is refused, not returned.
       let mut attributor = Attributor::new();
@@ -2945,7 +3015,12 @@ mod tests {
          },
       );
       assert_eq!(
-         attributor.cached_flow(key, Some(0), start + StdDuration::from_millis(1)),
+         attributor.cached_flow(
+            key,
+            Some(0),
+            start + StdDuration::from_millis(1),
+            &[1]
+         ),
          None
       );
       assert!(attributor.flow_owners.is_empty());
@@ -3019,7 +3094,8 @@ mod tests {
          attributor.cached_flow(
             key,
             Some(1000),
-            start + StdDuration::from_millis(1)
+            start + StdDuration::from_millis(1),
+            &[777]
          ),
          Some((777, 1000)),
          "the success must overwrite the negative entry"
@@ -3898,9 +3974,80 @@ mod tests {
       );
 
       assert_eq!(
-         attributor.cached_flow(flow, Some(1000), start),
+         attributor.cached_flow(flow, Some(1000), start, &[5555]),
          None,
          "an image younger than the socket must not answer from the flow cache"
+      );
+   }
+
+   #[test]
+   fn a_cached_flow_the_table_no_longer_names_is_not_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_003),
+         v4([192, 0, 2, 9], 443),
+      );
+      let now = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 4242,
+            at: now,
+         },
+      );
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now, &[7777]),
+         None,
+         "a tuple whose socket the kernel no longer reports must not answer from the flow cache"
+      );
+      assert!(attributor.flow_owners.is_empty());
+   }
+
+   #[test]
+   fn a_cached_flow_the_table_still_names_is_reused() {
+      let mut attributor = Attributor::new();
+      let flow = (
+         L4Proto::Udp,
+         v4([127, 0, 0, 1], 50_004),
+         v4([192, 0, 2, 9], 443),
+      );
+      let now = Instant::now();
+      attributor.remember_flow(
+         flow,
+         FlowCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            inode: 4242,
+            at: now,
+         },
+      );
+      attributor.inode_to_pid.insert(
+         4242,
+         InodeCacheEntry {
+            pid: 1234,
+            uid: 1000,
+            created: None,
+            at: now,
+         },
+      );
+
+      assert_eq!(
+         attributor.cached_flow(flow, Some(1000), now, &[11, 4242]),
+         Some((1234, 1000)),
+         "a candidate list that still names the inode answers"
       );
    }
 }
