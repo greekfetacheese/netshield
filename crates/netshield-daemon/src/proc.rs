@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -80,6 +81,12 @@ const SLACK: StdDuration = StdDuration::from_millis(1);
 /// How long one exec-after-connect warning stays quiet, so a burst cannot flood the journal.
 const EXEC_WARN_GAP: StdDuration = StdDuration::from_secs(1);
 
+/// How often [`Attributor::perf_summary`] is allowed to emit a line.
+///
+/// Rare enough to stay out of the journal on a quiet box and frequent enough that an operator
+/// watching a torrent client at its connection limit sees the snapshot working.
+const PERF_SUMMARY_INTERVAL: StdDuration = StdDuration::from_secs(30);
+
 /// The kernel's per-process metadata directory.
 const PROC: &str = "/proc";
 
@@ -101,6 +108,16 @@ pub struct AttributeStats {
    /// Lookups the registry was asked for and had nothing to say: no record within the TTL. This is
    /// the real coverage number — the flows a `sendmmsg` or a connected-`send` hook would catch.
    pub registry_misses: u64,
+   /// Socket tables read and indexed, one per batch that had to read one.
+   pub table_reads: u64,
+   /// Descriptor directories read, one per pid a lookup could not rule out from its snapshot.
+   pub fd_scans: u64,
+   /// Wall time spent in [`Attributor::attribute`], in nanoseconds.
+   pub attribute_ns: u64,
+   /// The `/proc/net` read-and-index half of that time, in nanoseconds.
+   pub table_ns: u64,
+   /// The descriptor-scan half of that time, in nanoseconds.
+   pub fd_ns: u64,
 }
 
 /// A flow that was attributed, keyed by protocol and both endpoints.
@@ -290,6 +307,27 @@ pub struct Attributor {
    last_exec_warn: Option<Instant>,
    /// The kernel's record of recent senders, when the probe could be attached.
    senders: Option<Box<dyn SenderLookup>>,
+   /// Socket tables read for the batch being decided, keyed by protocol and family.
+   tables: HashMap<(L4Proto, Family), SocketTable>,
+   /// The arrival time of the batch being decided. A snapshot taken at or after it is evidence for
+   /// every packet in the batch; `None` means "not in a batch", which trusts no cached negative.
+   batch_arrived: Option<Instant>,
+   /// Scratch buffer for one table read, so a 194 KB table is not reallocated per snapshot.
+   table_buf: Vec<u8>,
+   /// The newest-first pid list for the batch, with the time it was built.
+   ///
+   /// Rebuilt at most once per batch, for the same reason the socket table is: `readdir("/proc")` plus a
+   /// stat per pid the process cache does not know costs ~2 ms here, and a burst asks the same question
+   /// once per flow. A process exists before any socket it opens, so a list taken at or after the batch's
+   /// arrival time names every pid that could own a socket behind one of its packets.
+   pid_order: Option<(Instant, Vec<u32>)>,
+   /// When [`Attributor::perf_summary`] last emitted a line, so it can be rate-limited.
+   last_perf_summary: Option<Instant>,
+   /// The counters as they were when the last summary line was emitted.
+   ///
+   /// The counters themselves are never reset: the shutdown line reports them as session totals, so a
+   /// summary that zeroed them would leave that line claiming the last interval was the whole session.
+   last_summary_stats: AttributeStats,
 }
 
 /// A cached inode→pid answer, with the owner recorded for the UID cross-check.
@@ -392,6 +430,12 @@ impl Attributor {
          last_budget_warn: None,
          last_exec_warn: None,
          senders: None,
+         tables: HashMap::new(),
+         batch_arrived: None,
+         table_buf: Vec::new(),
+         pid_order: None,
+         last_perf_summary: None,
+         last_summary_stats: AttributeStats::default(),
       }
    }
 
@@ -400,6 +444,12 @@ impl Attributor {
    pub fn with_senders(mut self, senders: Box<dyn SenderLookup>) -> Self {
       self.senders = Some(senders);
       self
+   }
+
+   /// Marks the start of a batch: from here, a snapshot taken after `arrived_at` is valid evidence for
+   /// every packet the caller has already received, because a socket exists before the packet it sends.
+   pub fn begin_batch(&mut self, arrived_at: Instant) {
+      self.batch_arrived = Some(arrived_at);
    }
 
    /// Attributes the socket owning this outbound flow.
@@ -415,7 +465,21 @@ impl Attributor {
       proto: L4Proto,
       uid: Option<u32>,
    ) -> Attributed {
-      let now = Instant::now();
+      let started = Instant::now();
+      let attributed = self.attribute_flow(local, remote, proto, uid, started);
+      self.stats.attribute_ns = self.stats.attribute_ns.saturating_add(elapsed_ns(started));
+      attributed
+   }
+
+   /// The body of [`Attributor::attribute`], timed by its caller.
+   fn attribute_flow(
+      &mut self,
+      local: (IpAddr, u16),
+      remote: (IpAddr, u16),
+      proto: L4Proto,
+      uid: Option<u32>,
+      now: Instant,
+   ) -> Attributed {
       let flow = (proto, local, remote);
       if self.flow_owners.contains_key(&flow) {
          match self.flow_candidates(flow) {
@@ -505,23 +569,27 @@ impl Attributor {
          ..context
       };
 
-      let text = match fs::read_to_string(format!("{PROC}/net/{table}")) {
-         Ok(text) => text,
-         Err(error) => {
-            return self.unknown(
-               &context,
-               Some(Missing::NotOurs),
-               &format!("cannot read /proc/net/{table}: {error}"),
-               now,
-            );
-         }
+      // `live_candidates` reads this batch's table at most once and indexes it. An exact row
+      // with inode 0 is a closed connection's leftover: the 4-tuple is still there but nothing
+      // holds the socket, so no descriptor scan can ever find an owner. It is not the same
+      // failure as "the table has no row for this flow", which is what `candidates.exact` says.
+      let Some(candidates) = self.live_candidates(family, proto, local, remote) else {
+         return self.unknown(
+            &context,
+            Some(Missing::NotOurs),
+            &format!("cannot read /proc/net/{table}"),
+            now,
+         );
       };
-      // An exact row with inode 0 is a closed connection's leftover: the 4-tuple is still
-      // there but nothing holds the socket, so no descriptor scan can ever find an owner.
-      // It is not the same failure as "the table has no row for this flow".
-      let candidates = inode_candidates(&text, family, local, remote, proto);
-      if candidates.is_empty() {
-         let (reason, count) = candidate_failure_reason(&text, family, local, remote);
+      if candidates.inodes.is_empty() {
+         let (reason, count) = match candidates.exact {
+            Some(0) => (
+               "the exact row has inode 0: no live socket, the connection was already \
+                closed when it was queued",
+               Some(0),
+            ),
+            _ => ("no matching socket row in the table", None),
+         };
          let context = FailureContext {
             candidates: count,
             ..context
@@ -535,16 +603,18 @@ impl Attributor {
          return self.unknown(&context, Some(missing), reason, now);
       }
       let context = FailureContext {
-         candidates: Some(candidates.len()),
+         candidates: Some(candidates.inodes.len()),
          ..context
       };
 
-      let owner = candidate_owner(&candidates, uid, |inode| {
-         match self.cached_owner(inode, uid) {
+      let owner = candidate_owner(
+         &candidates.inodes.iter().map(|inode| u64::from(*inode)).collect::<Vec<_>>(),
+         uid,
+         |inode| match self.cached_owner(inode, uid) {
             Some(owner) => Some(owner),
             None => self.scan_for_inode(inode, uid),
-         }
-      });
+         },
+      );
       let (inode, pid, process_uid, socket_created) = match owner {
          CandidateOwner::Found {
             inode,
@@ -759,18 +829,15 @@ impl Attributor {
                );
                return None;
             }
-            // `cmdline` is not an identity field, so it is not cached; read it when the
-            // process is still around and leave it empty when the cache is all that is
-            // left, which is exactly the vanished-process case.
-            let cmdline = fs::read(format!("{PROC}/{pid}/cmdline"))
-               .ok()
-               .and_then(|bytes| join_cmdline(&bytes));
+            // `cmdline` is not an identity field and nothing renders it: read it once per identity (in
+            // `read_process`) rather than on every packet of the flow. The `read_link` above stays — it is
+            // the evidence that the cached identity still describes the running image.
             return Some(ProcessInfo {
                pid,
                uid: cached.uid,
                exe: cached.exe.clone(),
                comm: Some(cached.comm.clone()).filter(|comm| !comm.is_empty()),
-               cmdline,
+               cmdline: None,
             });
          }
          // The pid was recycled into another user: the cached identity is not evidence
@@ -851,6 +918,52 @@ impl Attributor {
          .unwrap_or_default()
    }
 
+   /// A one-line performance summary, at most once per interval, with the numbers this task moves.
+   ///
+   /// Read from the packet path because that is the only place the cost exists; `None` when nothing was
+   /// attributed since the last summary, so an idle daemon says nothing.
+   pub fn perf_summary(&mut self, now: Instant) -> Option<String> {
+      if self
+         .last_perf_summary
+         .is_some_and(|last| now.saturating_duration_since(last) < PERF_SUMMARY_INTERVAL)
+      {
+         return None;
+      }
+      let current = self.stats;
+      let delta = |now: u64, before: u64| now.saturating_sub(before);
+      let hits = delta(current.hits, self.last_summary_stats.hits);
+      let misses = delta(current.misses, self.last_summary_stats.misses);
+      let table_reads = delta(
+         current.table_reads,
+         self.last_summary_stats.table_reads,
+      );
+      let fd_scans = delta(current.fd_scans, self.last_summary_stats.fd_scans);
+      let attribute_ns = delta(
+         current.attribute_ns,
+         self.last_summary_stats.attribute_ns,
+      );
+      let table_ns = delta(current.table_ns, self.last_summary_stats.table_ns);
+      let fd_ns = delta(current.fd_ns, self.last_summary_stats.fd_ns);
+      let lookups = hits.saturating_add(misses);
+      if lookups == 0 {
+         // Still stamp the interval so a daemon that only ever sees idle ticks does not scan the
+         // counters every iteration.
+         self.last_perf_summary = Some(now);
+         return None;
+      }
+      let per_lookup_ms = |nanos: u64| nanos as f64 / 1_000_000.0 / lookups as f64;
+      let line = format!(
+         "attribution: {lookups} lookups in 30s, {table_reads} table reads, {fd_scans} fd scans, \
+          {:.2}ms/lookup (table {:.2}ms, fd {:.2}ms)",
+         per_lookup_ms(attribute_ns),
+         per_lookup_ms(table_ns),
+         per_lookup_ms(fd_ns),
+      );
+      self.last_perf_summary = Some(now);
+      self.last_summary_stats = current;
+      Some(line)
+   }
+
    /// The reason to report when no owner was found, and how final that is.
    ///
    /// A complete scan that found nothing, for a packet the kernel gave a uid, means the socket
@@ -864,43 +977,67 @@ impl Attributor {
       }
    }
 
-   /// The socket inodes `/proc/net` reports for this flow right now.
+   /// The candidate inodes for one flow, reading its table at most once per batch.
+   ///
+   /// `None` means the table could not be read (the caller reports that exactly as it does today);
+   /// `Some` with an empty `inodes` means the kernel has no live row for the flow.
+   fn live_candidates(
+      &mut self,
+      family: Family,
+      proto: L4Proto,
+      local: (IpAddr, u16),
+      remote: (IpAddr, u16),
+   ) -> Option<Candidates> {
+      let fresh = self
+         .tables
+         .get(&(proto, family))
+         .is_some_and(|table| self.batch_arrived.is_some_and(|arrived| table.taken_at >= arrived));
+      if !fresh {
+         let started = Instant::now();
+         let table = socket_table(proto, family)?;
+         let index = SocketTable::read(table, family, proto, &mut self.table_buf);
+         self.stats.table_ns = self.stats.table_ns.saturating_add(elapsed_ns(started));
+         self.tables.insert((proto, family), index?);
+         self.stats.table_reads = self.stats.table_reads.saturating_add(1);
+      }
+      let table = self.tables.get(&(proto, family))?;
+      Some(Candidates {
+         inodes: table.candidates(local, remote, proto),
+         exact: table.exact(local, remote, proto),
+      })
+   }
+
+   /// The socket inodes `/proc/net` names for this flow in the batch snapshot.
    ///
    /// A cached flow answer may only stand while this list contains the inode it remembers, because
-   /// the flow key is a 5-tuple and a second socket can present the same one. One table read, no
-   /// descriptor scan: this is the cheap half of a lookup, and [`Attributor::lookup`] reads its own
-   /// copy only when the cache cannot answer.
-   // The read appears here and in `lookup` by design: extracting it would force `lookup`'s distinct
-   // error messages through a fake `Result` (orchestrator-authorised against AGENTS rule 10).
-   fn flow_candidates(&self, flow: FlowKey) -> Option<Vec<u64>> {
+   /// the flow key is a 5-tuple and a second socket can present the same one. The table is read at
+   /// most once per batch, so a hit costs two map lookups instead of a fresh `/proc/net` parse.
+   fn flow_candidates(&mut self, flow: FlowKey) -> Option<Vec<u32>> {
       let (proto, (local, local_port), (remote, remote_port)) = flow;
       let family = family_of(local)?;
       if family_of(remote) != Some(family) {
          return None;
       }
-      let table = socket_table(proto, family)?;
-      let text = fs::read_to_string(format!("{PROC}/net/{table}")).ok()?;
-      let candidates = inode_candidates(
-         &text,
+      let candidates = self.live_candidates(
          family,
+         proto,
          (local, local_port),
          (remote, remote_port),
-         proto,
-      );
-      (!candidates.is_empty()).then_some(candidates)
+      )?;
+      (!candidates.inodes.is_empty()).then_some(candidates.inodes)
    }
 
    /// Returns a fresh flow→owner answer, or `None` when it is stale or disagrees with the
    /// packet's uid.
    ///
-   /// `candidates` is the caller's fresh `/proc/net` read for this flow: the answer may only
-   /// stand while it still names the socket this entry was built from.
+   /// `candidates` is the batch snapshot for this flow: the answer may only stand while it still
+   /// names the socket this entry was built from.
    fn cached_flow(
       &mut self,
       flow: FlowKey,
       uid: Option<u32>,
       now: Instant,
-      candidates: &[u64],
+      candidates: &[u32],
    ) -> Option<(u32, u32)> {
       let entry = *self.flow_owners.get(&flow)?;
       if now.saturating_duration_since(entry.at) >= CACHE_TTL {
@@ -915,7 +1052,7 @@ impl Attributor {
       // The key is a tuple another process can reproduce, so `/proc/net` is what decides whether
       // the socket this entry was built from is still the socket behind the packet. A list that
       // does not name `entry.inode` is a recycled tuple, and a recycled tuple answers nothing.
-      if !candidates.iter().any(|candidate| *candidate == u64::from(entry.inode)) {
+      if !candidates.contains(&entry.inode) {
          self.flow_owners.remove(&flow);
          return None;
       }
@@ -1093,9 +1230,22 @@ impl Attributor {
       inode: u32,
       uid: Option<u32>,
    ) -> Option<(u32, u32, Option<SystemTime>)> {
-      let starts = self.process_starts();
-      let pids = numeric_pids_sorted_by(&starts)?;
-      self.scan_pids_for_inode(pids, inode, uid, socket_inodes)
+      let started = Instant::now();
+      let fresh = self.pid_order.as_ref().is_some_and(|(taken_at, _)| {
+         self.batch_arrived.is_some_and(|arrived| *taken_at >= arrived)
+      });
+      if !fresh {
+         let starts = self.process_starts();
+         let pids = numeric_pids_sorted_by(&starts)?;
+         self.pid_order = Some((Instant::now(), pids));
+      }
+      // One `Vec<u32>` copy per miss (~1.7 KB here) against the 2.19 ms the rebuild costs: taking the
+      // list out of the field to avoid the copy is not worth the borrow plumbing, and `scan_pids_for_inode`
+      // keeps its owned-`Vec` signature so its existing tests are untouched.
+      let pids = self.pid_order.as_ref().map(|(_, pids)| pids.clone()).unwrap_or_default();
+      let owner = self.scan_pids_for_inode(pids, inode, uid, socket_inodes);
+      self.stats.fd_ns = self.stats.fd_ns.saturating_add(elapsed_ns(started));
+      owner
    }
 
    /// The body of [`Attributor::scan_for_inode`], over an explicit pid list and descriptor
@@ -1120,15 +1270,16 @@ impl Attributor {
       // even though it examined everything it was willing to look at.
       let mut examined = false;
       for pid in pids {
-         if let Some((found, owner, created)) = self.cached_fd_lookup(pid, inode, uid)
-            && found
-         {
-            return Some((pid, owner, created));
+         if let Some((found, owner, created)) = self.cached_fd_lookup(pid, inode, uid) {
+            if found {
+               return Some((pid, owner, created));
+            }
+            // The snapshot predates no packet of this batch, so the missing descriptor is proof:
+            // this pid does not hold the inode and the whole directory need not be re-read.
+            continue;
          }
-         // A cached negative is a hint, not proof: the process may have opened the
-         // socket after the snapshot was taken (the resolver does exactly that per
-         // query). Fall through and re-read its descriptors once; the refresh below
-         // replaces the entry, so this pid is scanned at most once per lookup.
+         // `None` is a snapshot this packet cannot use (stale, a different uid, or outside a
+         // batch), so the pid's descriptors must be re-read before it can be ruled out.
 
          let owner_uid = match read_pid_uid(pid) {
             Some(owner_uid) => owner_uid,
@@ -1140,6 +1291,7 @@ impl Attributor {
          }
 
          examined = true;
+         self.stats.fd_scans = self.stats.fd_scans.saturating_add(1);
          let (sockets, over_budget) = match read_inodes(pid) {
             Ok(sockets) => (sockets, false),
             // The fresh entries were still inspected, so a socket among them is a real
@@ -1186,8 +1338,13 @@ impl Attributor {
       None
    }
 
-   /// Consults the pid→fd cache for one pid, returning `Some((found, uid, created))` only
-   /// when the entry is fresh and usable for this packet's uid.
+   /// Consults the pid→fd cache for one pid, returning `Some(false)` only when the snapshot can prove
+   /// the descriptor is absent.
+   ///
+   /// A cached descriptor list is a memory of one read. It proves absence for a packet that had already
+   /// been received when it was taken — because a socket exists before the packet it sends — and only
+   /// then. Refusing every negative ("the resolver may have opened the socket since") cost a full
+   /// directory re-read per lookup; the batch arrival time is what makes a negative usable.
    fn cached_fd_lookup(
       &mut self,
       pid: u32,
@@ -1207,6 +1364,11 @@ impl Attributor {
          .iter()
          .find(|(held, _)| *held == inode)
          .map(|(_, created)| *created);
+      if created.is_none() && !self.batch_arrived.is_some_and(|arrived| entry.at >= arrived) {
+         // Taken before this packet arrived (or not in a batch at all): the socket may have been
+         // opened since, so this snapshot cannot rule it out. Refresh instead.
+         return None;
+      }
       Some((created.is_some(), entry.uid, created.flatten()))
    }
 
@@ -1303,6 +1465,11 @@ fn uid_label(uid: Option<u32>) -> String {
    }
 }
 
+/// Elapsed nanoseconds since `started`, saturated so a long-lived daemon cannot wrap a counter.
+fn elapsed_ns(started: Instant) -> u64 {
+   u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 impl Default for Attributor {
    fn default() -> Self {
       Self::new()
@@ -1395,6 +1562,102 @@ fn socket_rows(
       let inode = fields[9].parse::<u64>().ok()?;
       Some((local, remote, inode))
    })
+}
+
+/// Every socket row the kernel reported when one socket table was read.
+///
+/// This is one batch's evidence, not a cache: [`Attributor::begin_batch`] makes it valid for every
+/// packet the caller has already received, because a socket exists before any packet it sends — so a
+/// snapshot taken after those packets arrived contains the socket behind each of them.
+#[derive(Debug)]
+struct SocketTable {
+   /// When the table was read.
+   taken_at: Instant,
+   /// The first row in table order for each exact 4-tuple, so a row whose socket is already closed
+   /// (inode 0) keeps the meaning it has in [`exact_row_inode`].
+   exact: HashMap<(L4Proto, IpAddr, u16, IpAddr, u16), u32>,
+   /// Unconnected UDP rows by `(local port, local address)`, in table order.
+   udp_port: HashMap<(u16, IpAddr), Vec<u32>>,
+}
+
+impl SocketTable {
+   fn new(taken_at: Instant) -> Self {
+      Self {
+         taken_at,
+         exact: HashMap::new(),
+         udp_port: HashMap::new(),
+      }
+   }
+
+   /// Indexes one table's text. Split from the read so a fixture can be indexed without `/proc`.
+   #[cfg(test)]
+   fn from_text(text: &str, family: Family, proto: L4Proto) -> Self {
+      let mut table = Self::new(Instant::now());
+      table.fill(text, family, proto);
+      table
+   }
+
+   fn fill(&mut self, text: &str, family: Family, proto: L4Proto) {
+      for (local, remote, inode) in socket_rows(text, family) {
+         let Ok(inode) = u32::try_from(inode) else {
+            continue;
+         };
+         self.exact.entry((proto, local.0, local.1, remote.0, remote.1)).or_insert(inode);
+         if proto == L4Proto::Udp && remote.0.is_unspecified() && remote.1 == 0 {
+            self.udp_port.entry((local.1, local.0)).or_default().push(inode);
+         }
+      }
+   }
+
+   /// Reads one `/proc/net/<table>` into `buf`, which the caller reuses across snapshots: the table is
+   /// ~200 KB with 1500 sockets and `read_to_string` on a size-0 procfs file otherwise reallocates and
+   /// copies it a dozen times.
+   fn read(table: &str, family: Family, proto: L4Proto, buf: &mut Vec<u8>) -> Option<Self> {
+      buf.clear();
+      let mut file = fs::File::open(Path::new(PROC).join("net").join(table)).ok()?;
+      file.read_to_end(buf).ok()?;
+      let text = std::str::from_utf8(buf).ok()?;
+      let mut index = Self::new(Instant::now());
+      index.fill(text, family, proto);
+      Some(index)
+   }
+
+   /// The exact row's inode, `Some(0)` when the row outlived its socket.
+   fn exact(&self, local: (IpAddr, u16), remote: (IpAddr, u16), proto: L4Proto) -> Option<u32> {
+      self.exact.get(&(proto, local.0, local.1, remote.0, remote.1)).copied()
+   }
+
+   /// The candidate inodes for one flow, with [`inode_candidates`]' exact-then-loose precedence.
+   fn candidates(&self, local: (IpAddr, u16), remote: (IpAddr, u16), proto: L4Proto) -> Vec<u32> {
+      if let Some(inode) = self.exact(local, remote, proto) {
+         return if inode == 0 { Vec::new() } else { vec![inode] };
+      }
+      if proto != L4Proto::Udp {
+         return Vec::new();
+      }
+      let mut out = Vec::new();
+      for key in [
+         (local.1, local.0),
+         (local.1, IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+      ] {
+         for inode in self.udp_port.get(&key).into_iter().flatten() {
+            if *inode != 0 && !out.contains(inode) {
+               out.push(*inode);
+            }
+         }
+      }
+      out.truncate(MAX_UDP_CANDIDATES);
+      out
+   }
+}
+
+/// What one snapshot says about one flow.
+struct Candidates {
+   /// Live inodes that could own the flow, in [`inode_candidates`]' order.
+   inodes: Vec<u32>,
+   /// The exact row's inode when the table had one, so the caller can tell "no row at all" from "a row
+   /// whose socket is already closed" (inode 0) in its diagnostic.
+   exact: Option<u32>,
 }
 
 /// Which live sockets a revocation covers.
@@ -1528,6 +1791,9 @@ fn revocable(local: (IpAddr, u16), remote: (IpAddr, u16), inode: u32) -> Option<
 /// (TIME_WAIT), so no process can hold it and returning it would send the scan chasing an
 /// inode no descriptor can contain. The diagnostic distinguishes "no row" from "a row with
 /// no live socket" through [`candidate_failure_reason`].
+///
+/// Kept as the text-scan reference the index must answer identically.
+#[cfg(test)]
 fn inode_candidates(
    text: &str,
    family: Family,
@@ -1577,6 +1843,9 @@ fn inode_candidates(
 /// "No row at all" and "a row whose socket is already closed" both leave the candidate
 /// list empty, but they have different causes and fixes, so the diagnostic must not
 /// collapse them into one message.
+///
+/// Kept as the text-scan reference the index must answer identically.
+#[cfg(test)]
 fn candidate_failure_reason(
    text: &str,
    family: Family,
@@ -1597,6 +1866,9 @@ fn candidate_failure_reason(
 ///
 /// This is the exact match TCP depends on and UDP prefers. A row with inode 0 is still a
 /// match: the caller needs to tell "no row" from "a row whose socket is already closed".
+///
+/// Kept as the text-scan reference the index must answer identically.
+#[cfg(test)]
 fn exact_row_inode(
    text: &str,
    family: Family,
@@ -3949,6 +4221,35 @@ mod tests {
    }
 
    #[test]
+   fn a_cached_identity_does_not_read_the_command_line() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      // Seed the cache the way the connector does, with the image this test really runs as, so the cached
+      // path's liveness check agrees with /proc and the cache is the branch under test.
+      let exe = std::fs::read_link("/proc/self/exe").ok();
+      attributor.process_cache.lock().expect("process cache").insert(
+         pid,
+         CachedIdentity {
+            exe,
+            comm: "netshield-test".to_owned(),
+            uid,
+            starttime: 0,
+            image_started: None,
+         },
+      );
+      let process = attributor
+         .process_identity(pid, uid)
+         .expect("the cache answers for its own pid");
+      assert_eq!(process.pid, pid);
+      assert_eq!(process.uid, uid);
+      assert_eq!(
+         process.cmdline, None,
+         "the packet path must not read /proc/<pid>/cmdline: nothing consumes it"
+      );
+   }
+
+   #[test]
    fn a_cached_flow_whose_image_postdates_the_socket_is_not_reused() {
       let mut attributor = Attributor::new();
       let flow = (
@@ -4063,6 +4364,228 @@ mod tests {
          attributor.cached_flow(flow, Some(1000), now, &[11, 4242]),
          Some((1234, 1000)),
          "a candidate list that still names the inode answers"
+      );
+   }
+
+   #[test]
+   fn the_index_answers_what_the_text_scan_answers() {
+      // One fixture per matching rule `inode_candidates` implements.
+      let header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+      let tcp = format!(
+         "{header}   0: 0100007F:1F90 0200007F:01BB 01 00000000:00000000 02:000004E4 00000000  1000        0 111\n\
+          \x20  1: 0100007F:2710 0200007F:01BB 06 00000000:00000000 03:000004E4 00000000     0        0 0\n\
+          \x20  2: 0100007F:2710 0200007F:01BB 01 00000000:00000000 02:000004E4 00000000  1000        0 222\n"
+      );
+      let index = SocketTable::from_text(&tcp, Family::V4, L4Proto::Tcp);
+      // exact row, first in table order
+      assert_eq!(
+         index.candidates(
+            v4([127, 0, 0, 1], 8080),
+            v4([127, 0, 0, 2], 443),
+            L4Proto::Tcp
+         ),
+         vec![111]
+      );
+      // a closed row (inode 0) that comes first keeps "already closed", and is never a candidate
+      let closed = index.candidates(
+         v4([127, 0, 0, 1], 10000),
+         v4([127, 0, 0, 2], 443),
+         L4Proto::Tcp,
+      );
+      assert!(
+         closed.is_empty(),
+         "a TIME_WAIT row is not a candidate"
+      );
+      assert_eq!(
+         index.exact(
+            v4([127, 0, 0, 1], 10000),
+            v4([127, 0, 0, 2], 443),
+            L4Proto::Tcp
+         ),
+         Some(0)
+      );
+      // the text scan must agree with the index, row for row
+      for (local, remote, proto) in [
+         (
+            v4([127, 0, 0, 1], 8080),
+            v4([127, 0, 0, 2], 443),
+            L4Proto::Tcp,
+         ),
+         (
+            v4([127, 0, 0, 1], 10000),
+            v4([127, 0, 0, 2], 443),
+            L4Proto::Tcp,
+         ),
+         (
+            v4([127, 0, 0, 1], 9999),
+            v4([127, 0, 0, 2], 443),
+            L4Proto::Tcp,
+         ),
+      ] {
+         assert_eq!(
+            index.candidates(local, remote, proto),
+            inode_candidates(&tcp, Family::V4, local, remote, proto)
+               .into_iter()
+               .filter_map(|inode| u32::try_from(inode).ok())
+               .collect::<Vec<_>>(),
+         );
+      }
+      // unconnected UDP: the row's local address is unspecified, the packet's is not
+      let udp = format!(
+         "{header}   0: 00000000:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 333\n"
+      );
+      let index = SocketTable::from_text(&udp, Family::V4, L4Proto::Udp);
+      assert_eq!(
+         index.candidates(
+            v4([192, 168, 1, 5], 53),
+            v4([1, 1, 1, 1], 53),
+            L4Proto::Udp
+         ),
+         vec![333]
+      );
+   }
+
+   #[test]
+   fn a_fd_snapshot_taken_after_the_packet_proves_a_negative() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      let snapshot = Instant::now();
+      attributor.pid_fds.insert(
+         pid,
+         FdCacheEntry {
+            sockets: vec![(123, None)],
+            uid,
+            at: snapshot,
+         },
+      );
+      // The packet arrived before the snapshot, so the snapshot can rule the socket out.
+      attributor.begin_batch(snapshot - StdDuration::from_millis(5));
+      let mut reads = 0u32;
+      let owner = attributor.scan_pids_for_inode(vec![pid], 987_654, Some(uid), |_| {
+         reads += 1;
+         Ok(vec![(123, None)])
+      });
+      assert_eq!(owner, None);
+      assert_eq!(
+         reads, 0,
+         "a snapshot taken after the packet must not be re-read"
+      );
+   }
+
+   #[test]
+   fn a_fd_snapshot_taken_before_the_packet_is_refreshed() {
+      let pid = std::process::id();
+      let uid = own_uid();
+      let mut attributor = Attributor::new();
+      let snapshot = Instant::now();
+      attributor.pid_fds.insert(
+         pid,
+         FdCacheEntry {
+            sockets: vec![(123, None)],
+            uid,
+            at: snapshot,
+         },
+      );
+      // The packet arrived after the snapshot, so the socket may have been opened since.
+      attributor.begin_batch(snapshot + StdDuration::from_millis(5));
+      let mut reads = 0u32;
+      let owner = attributor.scan_pids_for_inode(vec![pid], 987_654, Some(uid), |_| {
+         reads += 1;
+         Ok(vec![(987_654, None)])
+      });
+      assert_eq!(owner, Some((pid, uid, None)));
+      assert_eq!(
+         reads, 1,
+         "a snapshot taken before the packet must be refreshed"
+      );
+   }
+
+   #[test]
+   fn a_batch_reads_each_table_at_most_once() {
+      let mut attributor = Attributor::new();
+      attributor.begin_batch(Instant::now());
+      let local = v4([127, 0, 0, 1], 50_001);
+      let remote = v4([192, 0, 2, 1], 443);
+      let first = attributor.live_candidates(Family::V4, L4Proto::Tcp, local, remote);
+      let reads_after_first = attributor.stats.table_reads;
+      let second = attributor.live_candidates(Family::V4, L4Proto::Tcp, local, remote);
+      assert!(
+         first.is_some() && second.is_some(),
+         "the table is readable here"
+      );
+      assert_eq!(
+         attributor.stats.table_reads, reads_after_first,
+         "a second flow of the same batch must be answered from the snapshot"
+      );
+      assert_eq!(
+         reads_after_first, 1,
+         "the first flow reads the table once"
+      );
+      // A new batch is a new arrival time, so its snapshot is taken again.
+      attributor.begin_batch(Instant::now());
+      let _ = attributor.live_candidates(Family::V4, L4Proto::Tcp, local, remote);
+      assert_eq!(attributor.stats.table_reads, 2);
+   }
+
+   #[test]
+   fn a_batch_builds_the_pid_list_once() {
+      // A uid no process has, so the scan reads no descriptor directory at all: the only work left to
+      // observe is the pid list, which is what this test is about.
+      let nobody = Some(u32::MAX);
+      let mut attributor = Attributor::new();
+      attributor.begin_batch(Instant::now());
+      let first = attributor.scan_for_inode(4242, nobody);
+      let stamped = attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at);
+      assert!(
+         stamped.is_some(),
+         "the first lookup builds the list"
+      );
+      let second = attributor.scan_for_inode(4242, nobody);
+      assert_eq!(
+         first, second,
+         "the same question answers the same way"
+      );
+      assert_eq!(
+         attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at),
+         stamped,
+         "a second lookup in the same batch does not rebuild the list"
+      );
+      // A new batch is a new arrival time, so its list is built again.
+      attributor.begin_batch(Instant::now());
+      let _ = attributor.scan_for_inode(4242, nobody);
+      assert_ne!(
+         attributor.pid_order.as_ref().map(|(taken_at, _)| *taken_at),
+         stamped,
+         "a new batch rebuilds the list"
+      );
+   }
+
+   #[test]
+   fn the_summary_reports_an_interval_without_resetting_the_counters() {
+      let mut attributor = Attributor::new();
+      attributor.stats.hits = 3;
+      attributor.stats.misses = 1;
+      let start = Instant::now();
+      let line = attributor.perf_summary(start).expect("the first summary is due");
+      assert!(
+         line.contains("4 lookups in 30s"),
+         "line was: {line}"
+      );
+      assert_eq!(
+         attributor.stats.hits, 3,
+         "a summary must not reset the session counters"
+      );
+      assert_eq!(attributor.stats.misses, 1);
+      // Nothing happened in the next interval, so it says nothing at all.
+      assert!(attributor.perf_summary(start + PERF_SUMMARY_INTERVAL).is_none());
+      attributor.stats.hits = 10;
+      let line = attributor
+         .perf_summary(start + PERF_SUMMARY_INTERVAL * 2)
+         .expect("the third summary is due");
+      assert!(
+         line.contains("7 lookups in 30s"),
+         "the line reports the interval, not the session: {line}"
       );
    }
 }

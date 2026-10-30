@@ -67,6 +67,13 @@ const PROMPT_LIMIT_LOG_GAP: Duration = Duration::from_secs(60);
 /// How long a queue receive may block before the loop checks deadlines and signals.
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Most queued packets one iteration decides before it goes back to the control socket.
+///
+/// A burst is decided against one socket-table and one descriptor snapshot, so the snapshot cost is
+/// amortised over the batch. The cap keeps a permanently saturated queue from starving
+/// `drain_ipc`/`apply_mode`, which run at the top of the loop.
+const MAX_BATCH: usize = 512;
+
 /// Minimum gap between `dns: no name` debug lines for one address.
 const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
 
@@ -760,6 +767,7 @@ impl Daemon {
    /// because one datagram was malformed would turn a bad packet into an outage.
    fn tick_loop(&mut self) {
       let mut packets = Vec::new();
+      let mut batch: Vec<Packet> = Vec::new();
       loop {
          if SHUTDOWN.load(Ordering::SeqCst) {
             info!("shutdown signal received; stopping");
@@ -775,30 +783,54 @@ impl Daemon {
          self.drain_ipc();
          self.apply_mode();
 
-         match self.queue.recv(&mut packets) {
-            Ok(0) => {}
-            Ok(_) => {
-               let received = std::mem::take(&mut packets);
-               for packet in received {
-                  self.handle_packet(packet);
+         // Everything the kernel has already queued is one burst: decide it against one snapshot.
+         //
+         // The loop ends on `EAGAIN` (the socket is empty) or at the cap. It does not end on a datagram
+         // that carried no packet message (`Ok(0)`: an ACK, or a datagram the parser took nothing
+         // from) — that is not an empty socket.
+         batch.clear();
+         let mut failure = None;
+         loop {
+            match self.queue.recv(&mut packets) {
+               Ok(0) => continue,
+               Ok(_) => {
+                  batch.append(&mut packets);
+                  if batch.len() >= MAX_BATCH {
+                     break;
+                  }
                }
-               self.publish_status();
-            }
-            Err(NfqError::Io(err)) if would_block(&err) => {}
-            Err(err) => {
-               self.queue_drops = self.queue_drops.saturating_add(1);
-               if self.queue_warn.due(Instant::now()) {
-                  warn!(
-                     "NFQUEUE {} receive failed: {err} ({} failed receive(s) so far; a full queue drops \
-                      packets, see queue_drops)",
-                     self.config.queue_num, self.queue_drops
-                  );
+               Err(NfqError::Io(err)) if would_block(&err) => break,
+               Err(err) => {
+                  failure = Some(err);
+                  break;
                }
             }
+         }
+         if let Some(err) = failure {
+            self.queue_drops = self.queue_drops.saturating_add(1);
+            if self.queue_warn.due(Instant::now()) {
+               warn!(
+                  "NFQUEUE {} receive failed: {err} ({} failed receive(s) so far; a full queue drops \
+                   packets, see queue_drops)",
+                  self.config.queue_num, self.queue_drops
+               );
+            }
+         }
+         if !batch.is_empty() {
+            // The snapshot this batch is decided against is taken after every packet in it was
+            // received, so it contains the socket behind each one.
+            self.attributor.begin_batch(Instant::now());
+            for packet in batch.drain(..) {
+               self.handle_packet(packet);
+            }
+            self.publish_status();
          }
 
          let now = Instant::now();
          self.sweep(now);
+         if let Some(line) = self.attributor.perf_summary(now) {
+            info!("{line}");
+         }
          self.verify_table(now);
       }
    }
