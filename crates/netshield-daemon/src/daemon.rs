@@ -45,10 +45,24 @@ use crate::firewall::{self, FirewallError, Flow};
 use crate::ipc_server::{self, IpcError, IpcHandle, IpcServer};
 use crate::netlink::nfqueue::{NfQueue, NfqError, Packet, Verdict};
 use crate::netlink::proc_connector::{ProcConnector, ProcEvent};
-use crate::pending::{DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
+use crate::pending::{self, DestRemoval, Opened, PendingPrompts, PromptDest, PromptRecord};
 use crate::policy::{Applied, Decision, Policy};
 use crate::proc::{Attributor, FlowOwner, LiveFlow, Missing, ProcessCache, live_flows};
 use crate::store::RuleStore;
+
+/// How often the installed table is read back and re-verified.
+///
+/// A table can disappear or be rewritten by anything else on the machine (an operator, another
+/// firewall manager), and a daemon that never looks again keeps deciding packets while nothing
+/// enforces the verdicts. One `nft list` per 30 s is the price of noticing that; it never runs
+/// per packet.
+const TABLE_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum gap between `prompt limit reached` lines.
+///
+/// One line per packet would turn the very flood the cap exists for into a journal flood; the
+/// packet is still denied, only the line is rate-limited.
+const PROMPT_LIMIT_LOG_GAP: Duration = Duration::from_secs(60);
 
 /// How long a queue receive may block before the loop checks deadlines and signals.
 const RECV_TIMEOUT: Duration = Duration::from_millis(200);
@@ -76,8 +90,9 @@ const MAX_MULTICAST_APPS: usize = 64;
 
 /// How many prompts may be open before a single warning reports the storm.
 ///
-/// Not a cap: nothing silently denies a flow the user was never shown. A pathological burst is
-/// made visible instead, because every one of those prompts now has its own clock.
+/// Only a warning: the set itself is bounded by [`pending::MAX_PROMPTS`], and nothing silently
+/// denies a flow the user was never shown. A pathological burst is made visible instead,
+/// because every one of those prompts now has its own clock.
 const MAX_OPEN_PROMPTS: usize = 6;
 
 /// How long the proc connector receive may block before the shutdown flag is checked.
@@ -269,8 +284,10 @@ struct Daemon {
    queue_drops: u64,
    silent_warned: bool,
    table_verified: bool,
+   verify_schedule: VerifySchedule,
    dns_misses: MissLimiter,
    closed_flows: MissLimiter,
+   prompt_limit: MissLimiter,
    transport_denials: KeyLimiter<(u8, Option<u8>)>,
    multicast_logged: HashSet<String>,
 }
@@ -308,8 +325,10 @@ impl Daemon {
          queue_drops: 0,
          silent_warned: false,
          table_verified,
+         verify_schedule: VerifySchedule::new(Instant::now(), TABLE_VERIFY_INTERVAL),
          dns_misses: MissLimiter::new(),
          closed_flows: MissLimiter::new(),
+         prompt_limit: MissLimiter::with_gap(PROMPT_LIMIT_LOG_GAP),
          transport_denials: KeyLimiter::new(TRANSPORT_LOG_GAP, TRANSPORT_LOG_LIMIT),
          multicast_logged: HashSet::new(),
       }
@@ -739,7 +758,48 @@ impl Daemon {
             }
          }
 
-         self.sweep(Instant::now());
+         let now = Instant::now();
+         self.sweep(now);
+         self.verify_table(now);
+      }
+   }
+
+   /// Reads the installed table back on the schedule and publishes whether it still verifies.
+   ///
+   /// A table removed or rewritten by anything else would otherwise leave the daemon logging
+   /// decisions while nothing enforces them. The failure is logged once per transition, never
+   /// once per interval, and `StatusInfo::table_verified` carries the current state; the next
+   /// success restores it and says so once.
+   fn verify_table(&mut self, now: Instant) {
+      if !self.verify_schedule.due(now) {
+         return;
+      }
+      match firewall::verify(
+         self.config.table_name(),
+         self.config.queue_num,
+         self.config.dns_queue_num,
+      ) {
+         Ok(()) => {
+            if !self.table_verified {
+               self.table_verified = true;
+               info!(
+                  "table inet {} verifies again; enforcement resumed",
+                  self.config.table_name()
+               );
+               self.publish_status();
+            }
+         }
+         Err(err) => {
+            if self.table_verified {
+               self.table_verified = false;
+               error!(
+                  "table inet {} no longer verifies, so nothing is enforced until it does: \
+                   {err}",
+                  self.config.table_name()
+               );
+               self.publish_status();
+            }
+         }
       }
    }
 
@@ -1376,6 +1436,23 @@ impl Daemon {
          Instant::now(),
       );
       match opened {
+         // The set is at `MAX_PROMPTS`: the flood is denied rather than queued, and the line
+         // is rate-limited so the denial itself cannot become the flood. The prompt set is
+         // never grown past the cap and no prompt is opened for this packet.
+         Opened::Full => {
+            self.drop_packet(packet_id);
+            let remote = connection.remote.addr;
+            if self.prompt_limit.record(remote, Instant::now()) {
+               warn!(
+                  "prompt limit ({}) reached; denying {} -> {}:{}; existing prompts must be \
+                   answered first",
+                  pending::MAX_PROMPTS,
+                  connection.app_name(),
+                  connection.remote.addr,
+                  connection.remote.port
+               );
+            }
+         }
          Opened::Attached(id) => {
             // `prompt` already attached the packet above, so this is only reachable if the
             // two lookups ever disagree; the packet is answered with the prompt all the same.
@@ -1793,32 +1870,76 @@ impl<K: Eq + Hash> KeyLimiter<K> {
 /// A per-address one-line-per-gap log limiter.
 ///
 /// It keeps a repeated line cheap on a machine that touches many addresses the cache or a
-/// scan never saw, without changing the fact that the condition happened.
+/// scan never saw, without changing the fact that the condition happened. The gap is a
+/// field so the prompt-limit line can reuse the same shape at its own rate.
 struct MissLimiter {
    last: HashMap<IpAddr, Instant>,
+   gap: Duration,
 }
 
 impl MissLimiter {
    fn new() -> Self {
+      Self::with_gap(DNS_MISS_LOG_GAP)
+   }
+
+   /// A limiter that emits at most one line per address per `gap`.
+   fn with_gap(gap: Duration) -> Self {
       Self {
          last: HashMap::new(),
+         gap,
       }
    }
 
    /// Whether a miss for `addr` at `now` should be logged. The entry is added or refreshed
-   /// only when it is, so a repeatedly missing address costs one hash lookup per second.
+   /// only when it is, so a repeatedly missing address costs one hash lookup per gap.
    fn record(&mut self, addr: IpAddr, now: Instant) -> bool {
       if let Some(at) = self.last.get(&addr) {
-         if now.duration_since(*at) < DNS_MISS_LOG_GAP {
+         if now.duration_since(*at) < self.gap {
             return false;
          }
       } else if self.last.len() >= DNS_MISS_LIMIT {
-         self.last.retain(|_, at| now.duration_since(*at) < DNS_MISS_LOG_GAP);
+         self.last.retain(|_, at| now.duration_since(*at) < self.gap);
          if self.last.len() >= DNS_MISS_LIMIT {
             return false;
          }
       }
       self.last.insert(addr, now);
+      true
+   }
+}
+
+/// The clock a periodic table re-verify runs on.
+///
+/// It carries its own `Instant` and advances only when asked, so the decision is unit-testable
+/// without sleeping, without `nft` and without root. The first deadline is one interval after
+/// construction: the table was just verified at startup, so there is nothing to re-check yet.
+struct VerifySchedule {
+   /// The instant the next re-verify is due.
+   next: Instant,
+   /// How far `due` advances the deadline every time it fires.
+   interval: Duration,
+}
+
+impl VerifySchedule {
+   /// Schedules the first re-verify one `interval` after `now`.
+   fn new(now: Instant, interval: Duration) -> Self {
+      Self {
+         next: now.checked_add(interval).unwrap_or(now),
+         interval,
+      }
+   }
+
+   /// Whether a re-verify is due at `now`, advancing the deadline when it is.
+   ///
+   /// A late call advances by exactly one interval, never by zero: leaving the deadline at
+   /// `now` would make every later call fire, while jumping it past `now` would swallow the
+   /// intervals a stalled loop missed. A long stall therefore catches up one interval per
+   /// call, and a call on the same instant keeps advancing instead of spinning in place.
+   fn due(&mut self, now: Instant) -> bool {
+      if now < self.next {
+         return false;
+      }
+      self.next = self.next.checked_add(self.interval).unwrap_or(now);
       true
    }
 }
@@ -2366,6 +2487,60 @@ mod tests {
       assert!(
          limiter.record(addr, start + DNS_MISS_LOG_GAP),
          "a miss after the gap is emitted again"
+      );
+   }
+
+   #[test]
+   fn the_verify_schedule_fires_once_per_interval() {
+      let interval = Duration::from_secs(30);
+      let start = Instant::now();
+      let mut schedule = VerifySchedule::new(start, interval);
+
+      assert!(
+         !schedule.due(start),
+         "not due before the first deadline"
+      );
+      assert!(
+         !schedule.due(start + interval - Duration::from_millis(1)),
+         "still not due a millisecond early"
+      );
+      assert!(
+         schedule.due(start + interval),
+         "due at the first deadline"
+      );
+      assert!(
+         !schedule.due(start + interval),
+         "not due again on the same instant"
+      );
+      assert!(
+         !schedule.due(start + interval + Duration::from_millis(1)),
+         "not due immediately after"
+      );
+      assert!(
+         schedule.due(start + 2 * interval),
+         "due again a full interval later"
+      );
+
+      // A large jump advances by exactly one interval per call, never by zero: a loop that
+      // stalled for an hour catches up over its next iterations, one interval at a time.
+      let mut schedule = VerifySchedule::new(start, interval);
+      let stalled = start + Duration::from_secs(60 * 60);
+      let mut calls = 0u32;
+      while schedule.due(stalled) {
+         calls += 1;
+         assert_eq!(
+            schedule.next,
+            start + interval * (calls + 1),
+            "each catch-up call advances exactly one interval, never zero"
+         );
+      }
+      assert_eq!(
+         calls, 120,
+         "one call per missed interval, not one for the whole jump"
+      );
+      assert!(
+         !schedule.due(stalled),
+         "once caught up, the same instant is no longer due"
       );
    }
 

@@ -62,6 +62,15 @@ Four properties, each deliberate:
 - **`policy accept`** — the chain is an interception hook, not a filter. Packets that
   match no rule (established flows) continue normally.
 
+The daemon does not trust the table it installed for ever. Every 30 s it reads the table
+back with `nft list table` and re-runs the same check as startup: both chains, both queue
+numbers. A table removed or rewritten by anything else would otherwise leave the daemon
+logging decisions while nothing enforces them. The read-back is one process per interval
+and never per packet; a failure is logged once per transition and published through
+`StatusInfo::table_verified`, which returns to true — with one `info!` — on the next
+successful check. A stalled loop catches up one interval per check rather than running
+the missed probes back to back.
+
 Established flows are *not* re-examined. The first packet of a flow is the decision
 point; afterwards the kernel conntrack entry already exists, so the rest of the
 connection is not interrupted mid-stream by a GUI that has gone away.
@@ -340,6 +349,13 @@ Consequences worth stating plainly:
    because a browser can queue dozens of flows before the first answer; queued prompts a
    rule now covers are verdicted and never shown. The prompt being answered is never swept,
    and a queued prompt a rule does not cover keeps waiting without a deadline.
+8. The open prompt set is capped at 2000 (`PendingPrompts::MAX_PROMPTS`). An unbounded set
+   is a same-uid memory DoS: a process that opens distinct flows keeps every one of their
+   `Connection`s and packet ids alive until it is answered or times out. A flow that would
+   create a prompt at the cap is denied and logged once per 60 s, never queued silently;
+   a flow of an app whose prompt is already open still joins it at the cap, because that
+   only adds a destination or a packet id to a prompt that exists and capping it would
+   drop verdicts.
 
 The alert is modelled on Little Snitch's connection alert: app icon and name, "wants to
 connect to *host*", a duration selector, a scope radio group ("Any connection" / "Only
@@ -407,7 +423,11 @@ parser, the DNS message parser, the netlink socket plumbing. Each is a few hundr
 with unit tests, and each replaces a dependency (or a C library) that would otherwise
 dominate the tree. `nft` is invoked as a process with `nft -f -` (one atomic transaction
 per change) rather than linking `libnftables`; it is a required system tool, not a crate,
-and going native is a later optimisation.
+and going native is a later optimisation. The binary is resolved from a fixed list of
+absolute paths (`/usr/sbin/nft`, `/usr/bin/nft`, `/sbin/nft`, `/bin/nft`), never through
+`PATH`: the daemon runs as root, and a unit or a privileged shell that put a writable
+directory on `PATH` would otherwise choose which binary programs the firewall. If none of the
+four exists the result is `FirewallError::NftMissing`, which already says nftables is required.
 
 ## 11. Testing
 

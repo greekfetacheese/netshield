@@ -88,6 +88,14 @@ pub struct Resolved {
    pub record: PromptRecord,
 }
 
+/// How many prompts may be open at once.
+///
+/// An unbounded prompt set is a same-uid memory DoS: a process that opens distinct flows
+/// keeps every one of their `Connection`s and packet ids alive here until it is answered or
+/// times out, and nothing else bounds that. The cap is far above any interactive session,
+/// so only a flood can reach it; a flow past it is denied instead of queued for ever.
+pub const MAX_PROMPTS: usize = 2000;
+
 /// What [`PendingPrompts::open`] did with a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Opened {
@@ -97,13 +105,22 @@ pub enum Opened {
    Joined(u64),
    /// A new prompt `id` was opened.
    Created(u64),
+   /// The set is at [`MAX_PROMPTS`] and the flow would have opened a new prompt.
+   ///
+   /// The caller must deny the packet: the set never grows past the cap, and silently
+   /// accepting the flow would hide that the user was never asked.
+   Full,
 }
 
 impl Opened {
    /// The id of the prompt that owns the packet.
+   ///
+   /// [`Opened::Full`] owns no prompt and reports `0`, the protocol's "no prompt" marker;
+   /// callers must handle `Full` before asking for an id.
    pub fn id(self) -> u64 {
       match self {
          Self::Attached(id) | Self::Joined(id) | Self::Created(id) => id,
+         Self::Full => 0,
       }
    }
 }
@@ -166,7 +183,10 @@ impl PendingPrompts {
    ///
    /// A flow already in the set only grows its destination's packet list. A flow whose app
    /// has an open prompt joins it as a new destination; there is no queue within a group.
-   /// Every created prompt is given its own deadline from `now`.
+   /// Every created prompt is given its own deadline from `now`. At [`MAX_PROMPTS`] a flow
+   /// that already has a prompt still attaches or joins — those only add a packet id or a
+   /// destination to a prompt that exists — while a flow that would open a new one returns
+   /// [`Opened::Full`] and changes nothing.
    pub fn open(
       &mut self,
       connection: Connection,
@@ -194,6 +214,12 @@ impl PendingPrompts {
          }
          // A stale group index must not make a flow invisible; forget it and open normally.
          self.by_group.remove(group);
+      }
+
+      // Only a flow that would create a prompt is refused at the cap: the packet is denied
+      // by the caller rather than dropped from a prompt that already holds its verdict.
+      if self.by_id.len() >= MAX_PROMPTS {
+         return Opened::Full;
       }
 
       let id = self.next_id;
@@ -918,5 +944,90 @@ mod tests {
          0,
          "an unknown id reports nothing open"
       );
+   }
+
+   #[test]
+   fn a_capped_prompt_set_still_attaches_and_joins() {
+      // A flood of distinct apps and destinations fills the set exactly to the cap, and the
+      // next new flow is refused instead of growing it further.
+      let mut pending = PendingPrompts::new();
+      let start = Instant::now();
+      for index in 0..MAX_PROMPTS {
+         let app = format!("/usr/bin/app{index}");
+         let port = 10_000 + u16::try_from(index).expect("the cap fits in a port range");
+         let opened = pending.open(
+            app_conn(&app, port),
+            index as u32 + 1,
+            TIMEOUT,
+            start,
+         );
+         assert_eq!(opened, Opened::Created(opened.id()));
+      }
+      assert_eq!(pending.len(), MAX_PROMPTS);
+
+      let port = 10_000 + u16::try_from(MAX_PROMPTS).expect("the cap fits in a port range");
+      let refused = pending.open(
+         app_conn("/usr/bin/flood", port),
+         99_999,
+         TIMEOUT,
+         start,
+      );
+      assert_eq!(
+         refused,
+         Opened::Full,
+         "a new flow past the cap is refused"
+      );
+      assert_eq!(
+         pending.len(),
+         MAX_PROMPTS,
+         "the set never grows past the cap"
+      );
+
+      // Flows that already own a prompt keep working at exactly the cap: one attaches a
+      // packet to its own destination, one joins as a new destination of its app.
+      let first_app = "/usr/bin/app0";
+      let attached = pending.open(
+         app_conn(first_app, 10_000),
+         100_001,
+         TIMEOUT,
+         start + Duration::from_secs(1),
+      );
+      assert_eq!(
+         attached,
+         Opened::Attached(1),
+         "a retransmission still attaches"
+      );
+      let joined = pending.open(
+         app_conn(first_app, 20_000),
+         100_002,
+         TIMEOUT,
+         start + Duration::from_secs(1),
+      );
+      assert_eq!(
+         joined,
+         Opened::Joined(1),
+         "a new destination still joins"
+      );
+      assert_eq!(
+         pending.len(),
+         MAX_PROMPTS,
+         "neither one created a prompt"
+      );
+
+      let record = pending.get(1).expect("the first prompt is open");
+      assert_eq!(record.dests.len(), 2);
+      assert_eq!(record.dests[0].packet_ids, vec![1, 100_001]);
+      assert_eq!(record.dests[1].packet_ids, vec![100_002]);
+
+      // The cap does not freeze the set: answering one prompt makes room for one new flow.
+      assert!(pending.resolve(2).is_some());
+      let made_room = pending.open(
+         app_conn("/usr/bin/after-the-cap", port),
+         100_003,
+         TIMEOUT,
+         start,
+      );
+      assert_eq!(made_room, Opened::Created(MAX_PROMPTS as u64 + 1));
+      assert_eq!(pending.len(), MAX_PROMPTS);
    }
 }
