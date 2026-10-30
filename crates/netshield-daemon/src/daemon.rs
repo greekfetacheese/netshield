@@ -1380,17 +1380,17 @@ impl Daemon {
    /// Decides a queued packet the policy model cannot express a flow for.
    ///
    /// [`connection_for`](Self::connection_for) returns `None` for three unrelated reasons and
-   /// they must not share a verdict: an established TCP packet is not a policy question, a
-   /// transport without ports (and an ICMP echo) has no rule that could govern it, and a
-   /// family mismatch is a packet the model reads but cannot place. Only the middle case is
-   /// an accept the owner asked to close; the other two keep the historical accept.
+   /// they must not share a verdict: a TCP segment that is not an opening SYN is a queued packet
+   /// the model cannot place, a transport without ports (and an ICMP echo) has no rule that could
+   /// govern it, and a family mismatch is a packet the model reads but cannot place. Only the
+   /// middle case is an accept the owner asked to close; the other two keep their own verdicts.
    fn handle_unmodelled(&mut self, parsed: &ParsedPacket, packet: &Packet) {
       // The protocol number the kernel put on the wire. `L4Payload` carries no protocol
       // field, so it is read from the IP header the parser already validated.
       let protocol = packet_protocol(&packet.payload);
       match transport_verdict(&parsed.l4, &self.config) {
          TransportAction::Ignore => {
-            // Not a flow the policy governs (an established TCP segment, a family
+            // Not a flow the policy governs (an established UDP segment, a family
             // mismatch, or a packet whose header no longer carries a protocol). Accept
             // rather than invent a decision for a packet the model cannot express.
             self.accept(packet.id);
@@ -1399,6 +1399,19 @@ impl Daemon {
             self.drop_packet(packet.id);
             self.queue_drops = self.queue_drops.saturating_add(1);
             self.log_transport_denial(parsed, protocol, packet.uid);
+         }
+         TransportAction::DropStrayTcp => {
+            self.drop_packet(packet.id);
+            // Rate-limited on the same key space as the transport denials. Protocol 6 with no ICMP
+            // type is never the port-less-transport case, so the two lines cannot be confused.
+            if self.transport_denials.record((protocol.unwrap_or(0), None), Instant::now()) {
+               warn!(
+                  "dropped a queued TCP segment that is not an opening SYN ({:?}, protocol {}): \
+                   conntrack queued a flow its parser does not model",
+                  parsed.family,
+                  protocol.unwrap_or(0)
+               );
+            }
          }
          TransportAction::Allow => self.accept(packet.id),
       }
@@ -1866,11 +1879,15 @@ fn packet_protocol(payload: &[u8]) -> Option<u8> {
 /// What happens to a queued packet no [`Connection`] can be built for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransportAction {
-   /// Not a transport the policy model declines for a reason of its own: an established
-   /// TCP or UDP packet, or a family mismatch, keeps the historical accept.
+   /// Not a transport the policy model declines for a reason of its own: an established UDP
+   /// packet, or a family mismatch, keeps the historical accept.
    Ignore,
    /// An unmodelled transport or an ICMP echo the owner has not allowed.
    Drop,
+   /// A queued TCP segment that is not the opening SYN: conntrack and the output rule that
+   /// queued it disagree about this packet, so the model has no flow to judge and must not
+   /// pass it unexamined.
+   DropStrayTcp,
    /// An allowed ICMP echo, an allowed port-less transport, or an ICMP error.
    Allow,
 }
@@ -1903,9 +1920,12 @@ fn transport_verdict(l4: &L4Payload, config: &Config) -> TransportAction {
          UnmatchedTransport::Deny => TransportAction::Drop,
          UnmatchedTransport::Allow => TransportAction::Allow,
       },
-      // Only an opening TCP SYN reaches here as a `None` from `connection_for`; every
-      // other TCP segment, and a family the model cannot place, is not a policy question.
-      L4Payload::Tcp { .. } | L4Payload::Udp { .. } => TransportAction::Ignore,
+      // Only an opening TCP SYN reaches here as a `None` from `connection_for`; a segment that is
+      // not one means the kernel queued a packet this model cannot place, which is dropped rather
+      // than passed. A UDP payload never reaches here — `connection_for` always builds a flow for it
+      // — so it keeps the historical accept.
+      L4Payload::Tcp { .. } => TransportAction::DropStrayTcp,
+      L4Payload::Udp { .. } => TransportAction::Ignore,
    }
 }
 
@@ -3009,8 +3029,9 @@ mod tests {
    }
 
    /// A queued packet no flow can be built for: an ICMP echo and a port-less transport are
-   /// denied unless the owner allows them, while an ICMP error always passes and an
-   /// established TCP/UDP segment keeps the historical accept.
+   /// denied unless the owner allows them, while an ICMP error always passes, a TCP segment
+   /// that is not an opening SYN is dropped, and an established UDP segment keeps the
+   /// historical accept.
    #[test]
    fn the_transport_verdict_for_unmodelled_flows() {
       let icmp = |icmp_type: u8| L4Payload::Icmp {
@@ -3069,12 +3090,12 @@ mod tests {
          );
       }
 
-      // A TCP segment that is not an opening SYN never reaches this decision; if it did, the
-      // model has no new flow to judge and keeps the historical accept.
+      // A TCP segment that is not an opening SYN has no flow the model can judge, so it is dropped:
+      // an unmodelled packet must not become an unexamined accept.
       let established = parse(&tcp_packet(0x10)).expect("an ACK parses").l4;
       assert_eq!(
          transport_verdict(&established, &Config::default()),
-         TransportAction::Ignore
+         TransportAction::DropStrayTcp
       );
    }
 
