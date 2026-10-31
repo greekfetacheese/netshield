@@ -19,8 +19,8 @@ usage() {
    cat <<'EOF'
 Usage: packaging/install.sh [options]
 
-Installs the prebuilt netshieldd and netshield-gui from --bin-dir, the hardened
-systemd unit and the XDG autostart entry. It never builds anything.
+Installs the prebuilt netshieldd, netshield-gui and netshieldctl from --bin-dir, the
+hardened systemd unit and the XDG autostart entry. It never builds anything.
 
 Options:
   --prefix DIR     install binaries under DIR/bin and use them in the unit and
@@ -83,12 +83,15 @@ render() {
 install_binaries() {
    local daemon="$BIN_DIR/netshieldd"
    local gui="$BIN_DIR/netshield-gui"
+   local ctl="$BIN_DIR/netshieldctl"
    [ -x "$daemon" ] || fail "missing prebuilt binary: $daemon (pass --bin-dir DIR)"
    [ -x "$gui" ] || fail "missing prebuilt binary: $gui (pass --bin-dir DIR)"
+   [ -x "$ctl" ] || fail "missing prebuilt binary: $ctl (pass --bin-dir DIR)"
 
    run install -d -m 0755 "$PREFIX/bin"
    run install -m 0755 "$daemon" "$PREFIX/bin/netshieldd"
    run install -m 0755 "$gui" "$PREFIX/bin/netshield-gui"
+   run install -m 0755 "$ctl" "$PREFIX/bin/netshieldctl"
 }
 
 install_config() {
@@ -196,10 +199,10 @@ do_uninstall() {
    fi
 
    if [ "$DRY_RUN" -eq 1 ]; then
-      note "would remove $PREFIX/bin/netshieldd and $PREFIX/bin/netshield-gui"
+      note "would remove $PREFIX/bin/netshieldd, $PREFIX/bin/netshield-gui and $PREFIX/bin/netshieldctl"
       note "would remove $DESKTOP_DEST"
    else
-      rm -f "$PREFIX/bin/netshieldd" "$PREFIX/bin/netshield-gui"
+      rm -f "$PREFIX/bin/netshieldd" "$PREFIX/bin/netshield-gui" "$PREFIX/bin/netshieldctl"
       rm -f "$DESKTOP_DEST"
    fi
 
