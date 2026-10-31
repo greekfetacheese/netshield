@@ -480,8 +480,8 @@ fn handshake(stream: &mut UnixStream) -> Result<(), String> {
 
 /// Sends a mutation and accepts a silent timeout as success.
 ///
-/// The daemon answers `UpsertRule`, `SetRuleEnabled`, `DeleteRule` and `SetMode` only when
-/// it refuses, so an `Error` frame is an error and the timeout is the expected outcome.
+/// The daemon answers `UpsertRule`, `SetRuleEnabled` and `DeleteRule` only when it refuses, and never
+/// answers `SetMode` at all, so an `Error` frame is an error and the timeout is the expected outcome.
 fn mutate(stream: &mut UnixStream, request: &Request) -> Result<(), String> {
    set_read_timeout(stream, MUTATION_TIMEOUT)?;
    send(stream, request)?;
