@@ -2,11 +2,13 @@
 
 use std::cell::Cell;
 
-use egui::{Color32, RichText, Ui};
+use egui::{Align, Color32, Layout, Rect, RichText, Sense, Ui, UiBuilder, pos2, vec2};
 use egui_elements::{Button, ComboBox, Label, Modal};
 use elegance::Switch;
 use netshield_core::destlist::{dest_lines, parse_dest_lines};
 use netshield_core::rule::{Action, AppMatcher, DestMatcher, Duration, Rule, RuleId};
+
+use crate::ui::cells::{Cells, truncation_hint};
 
 /// Verdict colour for an enabled allow rule.
 const ALLOWED: Color32 = Color32::from_rgb(0x6C, 0xC0, 0x7A);
@@ -27,6 +29,45 @@ const HEADERS: [&str; 8] = [
    "Last matched",
    "",
 ];
+
+/// The uniform height of one rule row; `show_rows` paints a fixed-pitch window of them.
+const ROW_HEIGHT: f32 = 28.0;
+
+/// The header line, drawn once above the scroll area so it stays put while the rows move.
+const HEADER_HEIGHT: f32 = 20.0;
+
+/// White space between two columns. The first grid used 12 points, which read as one run of
+/// text once the table had the whole page's width to use.
+const COLUMN_GAP: f32 = 24.0;
+
+/// The gap the table falls back to when the window cannot fit the roomier one, so a small window
+/// narrows its text columns instead of pushing the table past the edge.
+const MIN_COLUMN_GAP: f32 = 8.0;
+
+/// Columns sized by the widest value they hold rather than by the page: the checkbox band, two
+/// verdicts, the three durations, a hit count and the two buttons.
+const ON_WIDTH: f32 = 28.0;
+const ACTION_WIDTH: f32 = 72.0;
+const DURATION_WIDTH: f32 = 104.0;
+const HITS_WIDTH: f32 = 56.0;
+const MATCHED_WIDTH: f32 = 92.0;
+const BUTTONS_WIDTH: f32 = 132.0;
+
+/// The share of the spare width the Application column takes; Destination takes the rest.
+const APP_SHARE: f32 = 0.45;
+
+/// The eight columns, in drawing order.
+const COLUMNS: usize = 8;
+
+/// Column indices, named so a cell is never addressed by a bare number.
+const COL_ON: usize = 0;
+const COL_APP: usize = 1;
+const COL_DEST: usize = 2;
+const COL_ACTION: usize = 3;
+const COL_DURATION: usize = 4;
+const COL_HITS: usize = 5;
+const COL_MATCHED: usize = 6;
+const COL_BUTTONS: usize = 7;
 
 /// Human-readable application scope: "any application", the exe basename, or "unknown".
 pub fn app_label(app: &AppMatcher) -> String {
@@ -494,6 +535,79 @@ fn scope_field(ui: &mut Ui, draft: &mut Draft) {
    });
 }
 
+/// Column left edges and widths, computed once per frame from the width the page has.
+///
+/// The six narrow columns are fixed and the two text columns share what is left after the gaps, so
+/// the table fills a wide window instead of ending in dead space. At a window too narrow for the
+/// fixed columns the gaps collapse to [`MIN_COLUMN_GAP`] first; below that the text columns reach
+/// zero, which is a row of clipped labels, never a table wider than the page.
+struct Columns {
+   x: [f32; COLUMNS],
+   width: [f32; COLUMNS],
+}
+
+impl Columns {
+   fn new(available: f32) -> Self {
+      let available = available.max(0.0);
+      let fixed =
+         ON_WIDTH + ACTION_WIDTH + DURATION_WIDTH + HITS_WIDTH + MATCHED_WIDTH + BUTTONS_WIDTH;
+      let gaps = (COLUMNS - 1) as f32;
+      let full = COLUMN_GAP * gaps;
+      let gap = if available >= fixed + full {
+         COLUMN_GAP
+      } else {
+         let shortfall = fixed + full - available;
+         let reducible = (COLUMN_GAP - MIN_COLUMN_GAP) * gaps;
+         COLUMN_GAP - shortfall.min(reducible) / gaps
+      };
+      let spare = (available - fixed - gap * gaps).max(0.0);
+      let width = [
+         ON_WIDTH,
+         spare * APP_SHARE,
+         spare * (1.0 - APP_SHARE),
+         ACTION_WIDTH,
+         DURATION_WIDTH,
+         HITS_WIDTH,
+         MATCHED_WIDTH,
+         BUTTONS_WIDTH,
+      ];
+      let mut x = [0.0; COLUMNS];
+      let mut at = 0.0;
+      for (index, width) in width.iter().enumerate() {
+         x[index] = at;
+         at += width + gap;
+      }
+      Self { x, width }
+   }
+
+   /// Where the last column ends. Rows are drawn this wide, not to the ui's own edge, so the
+   /// header and the rows agree without either of them measuring the scroll bar.
+   fn right(&self) -> f32 {
+      self.x[COLUMNS - 1] + self.width[COLUMNS - 1]
+   }
+}
+
+/// The rectangle of column `index` inside `row`.
+fn cell_rect(row: Rect, columns: &Columns, index: usize) -> Rect {
+   Rect::from_min_size(
+      pos2(row.left() + columns.x[index], row.top()),
+      vec2(columns.width[index], row.height()),
+   )
+}
+
+/// Runs `add` inside `rect`, left to right and centred vertically.
+///
+/// The child cannot move the parent's cursor: `rect` is already inside the row that
+/// `allocate_exact_size` reserved, and a child's `min_rect` that stays inside it leaves the
+/// cursor where the row ended. That is what keeps a virtualised list's row pitch fixed.
+fn cell<R>(ui: &mut Ui, rect: Rect, add: impl FnOnce(&mut Ui) -> R) -> R {
+   ui.scope_builder(
+      UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)),
+      add,
+   )
+   .inner
+}
+
 /// Draws the table; collects intents instead of sending them, so it stays testable and the
 /// caller owns the socket.
 pub fn show(ui: &mut Ui, rules: &[Rule], confirm: &mut Confirm) -> Actions {
@@ -517,82 +631,214 @@ pub fn show(ui: &mut Ui, rules: &[Rule], confirm: &mut Confirm) -> Actions {
       return actions;
    }
 
+   let columns = Columns::new(ui.available_width());
+   header_row(ui, &columns);
+
+   // `show_rows` reads the spacing before the closure runs, so zero it out here: every row is
+   // exactly `ROW_HEIGHT` tall and must not be pushed apart by the default gap.
+   ui.spacing_mut().item_spacing.y = 0.0;
+
    let mut delete_clicked = false;
-   let table = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-      let grid = egui::Grid::new("rules")
-         .num_columns(HEADERS.len())
-         .striped(true)
-         .spacing([12.0, 6.0])
-         .show(ui, |ui| {
-            for header in HEADERS {
-               ui.label(RichText::new(header).strong());
+   let table = egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+      ui,
+      ROW_HEIGHT,
+      rules.len(),
+      |ui, range| {
+         for index in range {
+            let rule = &rules[index];
+            let (rect, _) =
+               ui.allocate_exact_size(vec2(columns.right(), ROW_HEIGHT), Sense::hover());
+            if index % 2 == 1 {
+               ui.painter().rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
             }
-            ui.end_row();
-
-            for rule in rules {
-               let enabled = rule.enabled;
-               let base = if enabled {
-                  ui.visuals().text_color()
-               } else {
-                  ui.visuals().weak_text_color()
-               };
-
-               let mut checked = enabled;
-               if ui.add(egui::Checkbox::without_text(&mut checked)).changed() {
-                  actions.toggles.push((rule.id.clone(), checked));
-               }
-
-               application_cell(ui, rule, &base);
-
-               ui.label(RichText::new(dest_label(&rule.dest)).color(base));
-               ui.label(
-                  RichText::new(action_label(rule.action).to_uppercase())
-                     .color(action_colour(rule.action, enabled))
-                     .strong(),
-               );
-               ui.label(RichText::new(duration_label(rule.duration)).color(base));
-               ui.label(RichText::new(rule.hits.to_string()).color(base));
-               ui.label(RichText::new(matched_label(rule.last_matched)).monospace().color(base));
-
-               ui.horizontal(|ui| {
-                  if ui.add(Button::new("Edit").small()).clicked() {
-                     actions.edits.push(rule.clone());
-                  }
-                  let label = if confirm.is_armed(&rule.id) {
-                     "Confirm?"
-                  } else {
-                     "Delete"
-                  };
-                  if ui.add(Button::new(label).small()).clicked() {
-                     delete_clicked = true;
-                     if confirm.click(&rule.id) {
-                        actions.deletes.push(rule.id.clone());
-                     }
-                  }
-               });
-               ui.end_row();
-            }
-         });
-      grid.response.rect
-   });
+            row(
+               ui,
+               rect,
+               &columns,
+               rule,
+               &mut actions,
+               confirm,
+               &mut delete_clicked,
+            );
+         }
+      },
+   );
 
    // A click in the table that is not a Delete click disarms the pending confirmation,
    // so an armed row cannot be deleted later by a stray click on another cell.
    let clicked = ui.input(|input| input.pointer.primary_clicked());
    let position = ui.input(|input| input.pointer.interact_pos());
-   if clicked && !delete_clicked && position.is_some_and(|pos| table.inner.contains(pos)) {
+   if clicked && !delete_clicked && position.is_some_and(|pos| table.inner_rect.contains(pos)) {
       confirm.cancel();
    }
 
    actions
 }
 
-/// The application cell: only the process name, with the full path on hover for an `Exe`
-/// rule so the exact binary stays inspectable without costing a second line.
-fn application_cell(ui: &mut Ui, rule: &Rule, base: &Color32) {
-   let label = ui.label(RichText::new(app_label(&rule.app)).color(*base));
-   if let AppMatcher::Exe(path) = &rule.app {
-      label.on_hover_text(path.display().to_string());
+/// The eight column labels, drawn once above the scroll area so they stay while the rows move.
+fn header_row(ui: &mut Ui, columns: &Columns) {
+   let (rect, _) = ui.allocate_exact_size(
+      vec2(columns.right(), HEADER_HEIGHT),
+      Sense::hover(),
+   );
+   let cells = Cells {
+      painter: ui.painter(),
+      rect,
+   };
+   let font = egui::TextStyle::Body.resolve(ui.style());
+   let color = ui.visuals().strong_text_color();
+   for (index, header) in HEADERS.iter().enumerate() {
+      cells.text(
+         columns.x[index],
+         columns.width[index],
+         header,
+         &font,
+         color,
+         false,
+      );
+   }
+}
+
+/// One rule's row: eight cells at the geometry the header used.
+///
+/// The interactive cells allocate widgets first and the text is painted afterwards, because a
+/// `Cells` holds a borrow of the `Ui`'s painter: nothing may take `&mut ui` once it exists. Every
+/// cell is clipped to its column, so nothing a rule contains can widen the table or move a row.
+fn row(
+   ui: &mut Ui,
+   rect: Rect,
+   columns: &Columns,
+   rule: &Rule,
+   actions: &mut Actions,
+   confirm: &mut Confirm,
+   delete_clicked: &mut bool,
+) {
+   let enabled = rule.enabled;
+   let base = if enabled {
+      ui.visuals().text_color()
+   } else {
+      ui.visuals().weak_text_color()
+   };
+   let font = egui::TextStyle::Body.resolve(ui.style());
+   let mono = egui::TextStyle::Monospace.resolve(ui.style());
+
+   let mut checked = enabled;
+   cell(ui, cell_rect(rect, columns, COL_ON), |ui| {
+      if ui.add(egui::Checkbox::without_text(&mut checked)).changed() {
+         actions.toggles.push((rule.id.clone(), checked));
+      }
+   });
+
+   let app_response = ui.allocate_rect(cell_rect(rect, columns, COL_APP), Sense::hover());
+   let dest_response = ui.allocate_rect(cell_rect(rect, columns, COL_DEST), Sense::hover());
+
+   cell(ui, cell_rect(rect, columns, COL_BUTTONS), |ui| {
+      ui.spacing_mut().item_spacing.x = 6.0;
+      if ui.add(Button::new("Edit").small()).clicked() {
+         actions.edits.push(rule.clone());
+      }
+      let label = if confirm.is_armed(&rule.id) {
+         "Confirm?"
+      } else {
+         "Delete"
+      };
+      if ui.add(Button::new(label).small()).clicked() {
+         *delete_clicked = true;
+         if confirm.click(&rule.id) {
+            actions.deletes.push(rule.id.clone());
+         }
+      }
+   });
+
+   // Painting only from here on: `Cells` borrows the painter out of `ui`.
+   let cells = Cells {
+      painter: ui.painter(),
+      rect,
+   };
+
+   let name = app_label(&rule.app);
+   let clipped = cells.text(
+      columns.x[COL_APP],
+      columns.width[COL_APP],
+      &name,
+      &font,
+      base,
+      false,
+   );
+   if app_response.hovered()
+      && let Some(hint) = app_hint(&rule.app, &name, clipped)
+   {
+      app_response.on_hover_text(hint);
+   }
+
+   let dest = dest_label(&rule.dest);
+   let dest_clipped = cells.text(
+      columns.x[COL_DEST],
+      columns.width[COL_DEST],
+      &dest,
+      &font,
+      base,
+      false,
+   );
+   if dest_clipped {
+      truncation_hint(
+         &dest_response,
+         cells.painter,
+         columns.width[COL_DEST],
+         &dest,
+         &font,
+      );
+   }
+
+   cells.text(
+      columns.x[COL_ACTION],
+      columns.width[COL_ACTION],
+      &action_label(rule.action).to_uppercase(),
+      &font,
+      action_colour(rule.action, enabled),
+      false,
+   );
+   cells.text(
+      columns.x[COL_DURATION],
+      columns.width[COL_DURATION],
+      duration_label(rule.duration),
+      &font,
+      base,
+      false,
+   );
+   cells.text(
+      columns.x[COL_HITS],
+      columns.width[COL_HITS],
+      &rule.hits.to_string(),
+      &font,
+      base,
+      false,
+   );
+   cells.text(
+      columns.x[COL_MATCHED],
+      columns.width[COL_MATCHED],
+      &matched_label(rule.last_matched),
+      &mono,
+      base,
+      false,
+   );
+}
+
+/// What the Application cell's tooltip says, if anything.
+///
+/// A name earns a tooltip only when the column cut it, so a short name does not nag the pointer.
+/// An `Exe` rule always carries its binary path as well: the path is the rule's real identity, and
+/// two builds that share a basename are otherwise indistinguishable.
+fn app_hint(app: &AppMatcher, name: &str, clipped: bool) -> Option<String> {
+   let path = match app {
+      AppMatcher::Exe(path) => Some(path.display().to_string()),
+      AppMatcher::Any | AppMatcher::Unknown => None,
+   };
+   match (clipped, path) {
+      (true, Some(path)) => Some(format!("{name}\n{path}")),
+      (true, None) => Some(name.to_owned()),
+      (false, Some(path)) => Some(path),
+      (false, None) => None,
    }
 }
 
@@ -886,5 +1132,68 @@ mod tests {
       assert!(!confirm.click(&first));
       confirm.cancel();
       assert!(!confirm.is_armed(&first));
+   }
+
+   #[test]
+   fn the_columns_fill_the_width_and_never_start_beyond_it() {
+      for width in [640.0, 720.0, 900.0, 1280.0, 1920.0, 2400.0] {
+         let columns = Columns::new(width);
+         assert!(
+            columns.right() <= width,
+            "the table must not overflow {width}: it ended at {}",
+            columns.right()
+         );
+         assert!(
+            columns.width.iter().all(|width| *width >= 0.0),
+            "no column may be given a negative width"
+         );
+         let gap = columns.x[COL_DEST] - (columns.x[COL_APP] + columns.width[COL_APP]);
+         assert!(
+            gap >= MIN_COLUMN_GAP - 0.01,
+            "the gap may shrink to {MIN_COLUMN_GAP} but no further, got {gap}"
+         );
+      }
+   }
+
+   #[test]
+   fn the_spare_width_reaches_the_two_text_columns() {
+      let narrow = Columns::new(900.0);
+      let wide = Columns::new(1600.0);
+      assert!(
+         wide.width[COL_APP] > narrow.width[COL_APP]
+            && wide.width[COL_DEST] > narrow.width[COL_DEST],
+         "a wider page must widen Application and Destination, not just leave a gap"
+      );
+      assert_eq!(
+         wide.x[COL_ON], 0.0,
+         "the first column starts at the row's own left edge"
+      );
+      // The narrow columns keep their width, so only the text columns grow.
+      assert_eq!(wide.width[COL_ACTION], narrow.width[COL_ACTION]);
+      assert_eq!(wide.width[COL_BUTTONS], narrow.width[COL_BUTTONS]);
+   }
+
+   #[test]
+   fn an_exe_rule_always_shows_its_path_and_a_plain_one_only_when_cut() {
+      let exe = AppMatcher::Exe(std::path::PathBuf::from("/usr/bin/brave-browser"));
+      assert_eq!(
+         app_hint(&exe, "brave-browser", true),
+         Some("brave-browser\n/usr/bin/brave-browser".to_owned()),
+         "a name that was cut keeps its full text and gains the path"
+      );
+      assert_eq!(
+         app_hint(&exe, "brave-browser", false),
+         Some("/usr/bin/brave-browser".to_owned()),
+         "an exe rule names its binary even when the column did not cut it"
+      );
+      assert_eq!(
+         app_hint(&AppMatcher::Any, "any application", true),
+         Some("any application".to_owned())
+      );
+      assert_eq!(
+         app_hint(&AppMatcher::Any, "any application", false),
+         None,
+         "a value that fits must not produce a tooltip"
+      );
    }
 }
