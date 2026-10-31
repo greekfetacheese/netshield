@@ -424,8 +424,8 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
   `allowed_uid` stays read-only. `gui_path: null` means any process of `allowed_uid` may
   change state, and the daemon warns prominently about it at startup. A path that does not
   exist is not a config error: it is a runtime refusal of every write.
-  `dns_servers` (empty by default) lists the source addresses whose answers may teach the name cache;
-  empty keeps the historical acceptance of any sender and is reported at startup, never silently assumed.
+  The installers default `dns_servers` to the local resolver stub (`127.0.0.53`) when `/etc/resolv.conf`
+  points at systemd-resolved's stub and to empty otherwise, and empty means any sender may teach the cache.
 - `$XDG_CONFIG_HOME/netshield/gui.json` (`~/.config/netshield/gui.json`) — the GUI's own
   preferences: the Connections log's caps, `rows_per_app` (default 100, range 10–1000) and
   `max_apps` (default 32, range 1–128). Written atomically by the unprivileged GUI and never
