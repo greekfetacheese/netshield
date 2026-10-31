@@ -2310,37 +2310,12 @@ fn dest_matcher(connection: &Connection, scope: &ScopeChoice) -> DestMatcher {
          host: host.to_ascii_lowercase(),
          subdomains: *subdomains,
       },
-      ScopeChoice::Address => match single_host_net(connection.remote.addr) {
-         Some(net) => DestMatcher::Ip(net),
-         None => {
-            // Unreachable: the prefix is the family's own width. The alert only offers
-            // `AnyConnection` for an attributed app, so widening here cannot turn an
-            // unattributed answer into a rule for every unattributed flow.
-            warn!(
-               "could not build a single-host network for {}; scoping to any destination",
-               connection.remote.addr
-            );
-            DestMatcher::Any
-         }
-      },
+      ScopeChoice::Address => DestMatcher::Ip(IpNet::host(connection.remote.addr)),
       // `rules_for` expands this scope into one call per destination; a direct call scopes
       // to the destination itself.
       ScopeChoice::TheseDestinations => dest_matcher(connection, &group_scope(connection)),
    }
 }
-
-/// The network containing exactly `addr`: prefix 32 for IPv4, 128 for IPv6.
-///
-/// `None` means the prefix was wider than the address family, which cannot happen for the
-/// width chosen from the address itself; the caller handles it instead of unwrapping.
-fn single_host_net(addr: IpAddr) -> Option<IpNet> {
-   let prefix = match addr {
-      IpAddr::V4(_) => 32,
-      IpAddr::V6(_) => 128,
-   };
-   IpNet::new(addr, prefix).ok()
-}
-
 
 /// Spawns the proc connector reader: seed the identity cache, then apply every event.
 ///
