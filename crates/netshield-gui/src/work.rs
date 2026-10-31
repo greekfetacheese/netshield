@@ -21,6 +21,10 @@ use crate::ui::connections::{LinesJob, LinesReady, derive};
 /// it, exactly as `Writer` did for the pre-connect buffer: a wedged daemon must never block a paint.
 pub const FRAME_CAP: usize = 64;
 
+/// How many log records may wait for the file. A full queue drops the newest record and counts it:
+/// a logger must never block the thread that logged, nor grow without bound.
+pub const LOG_CAP: usize = 4096;
+
 /// One unit of work handed to the thread.
 #[derive(Debug)]
 pub enum Job {
@@ -30,6 +34,15 @@ pub enum Job {
    /// back: the file is the output, and an `fsync` on the paint thread is exactly what this
    /// job exists to avoid.
    SavePrefs(Prefs),
+}
+
+/// One formatted record waiting for the file.
+#[derive(Debug)]
+pub struct LogRecord {
+   /// The finished line, newline included.
+   pub line: String,
+   /// Whether a hand-started run should also see it on stderr: `warn` and above.
+   pub mirror: bool,
 }
 
 /// One finished derivation, tagged with the inputs it was built from.
@@ -44,21 +57,27 @@ enum Item {
    /// A frame for the daemon socket, served before every job.
    Frame(String),
    Job(Job),
+   Log(LogRecord),
 }
 
 /// What the one thread drains, and what could not be queued.
 ///
 /// Frames are served ahead of jobs because they are small and latency-critical, and they keep their
-/// own order: consecutive frames are inserted before the first job, never reversed. The accepted
-/// residual of one thread serving all three lanes is that an answer can wait behind a derivation or
-/// a preferences `fsync`.
+/// own order: consecutive frames are inserted before the first job, never reversed. Records sit in
+/// their own lane, drained only when no frame or job is waiting. The accepted residual of one
+/// thread serving all four lanes is that a log record waits behind an in-flight derivation or a
+/// preferences `fsync`, while a burst of records never delays a frame or a derivation.
 #[derive(Default)]
 struct Queue {
    items: VecDeque<Item>,
    /// How many leading items are frames, so the cap can be checked without walking the queue.
    frames: usize,
+   /// Formatted records, drained only when no frame or job is waiting.
+   logs: VecDeque<LogRecord>,
    /// Frames that found the queue full since the last report.
    dropped_frames: u64,
+   /// Records that found the queue full since the last report.
+   dropped_log: u64,
    /// Set when the `Worker` is dropped; the thread returns once the queue is empty.
    closed: bool,
 }
@@ -82,21 +101,38 @@ impl Queue {
       self.items.push_back(Item::Job(job));
    }
 
-   fn pop(&mut self) -> Option<Item> {
-      let item = self.items.pop_front()?;
-      if matches!(item, Item::Frame(_)) {
-         self.frames -= 1;
+   /// Adds a record behind every frame and job; `false` when the record cap is reached.
+   fn push_log(&mut self, record: LogRecord) -> bool {
+      if self.logs.len() >= LOG_CAP {
+         self.dropped_log += 1;
+         return false;
       }
-      Some(item)
+      self.logs.push_back(record);
+      true
+   }
+
+   fn pop(&mut self) -> Option<Item> {
+      if let Some(item) = self.items.pop_front() {
+         if matches!(item, Item::Frame(_)) {
+            self.frames -= 1;
+         }
+         return Some(item);
+      }
+      self.logs.pop_front().map(Item::Log)
    }
 
    fn is_empty(&self) -> bool {
-      self.items.is_empty()
+      self.items.is_empty() && self.logs.is_empty()
    }
 
    /// Takes the frames dropped since the last call, so the thread that owns the log reports them.
    fn take_dropped(&mut self) -> u64 {
       std::mem::take(&mut self.dropped_frames)
+   }
+
+   /// Records dropped since the last call, so the writer reports them once.
+   fn take_dropped_log(&mut self) -> u64 {
+      std::mem::take(&mut self.dropped_log)
    }
 }
 
@@ -203,6 +239,21 @@ impl Handle {
       self.shared.ready.notify_one();
       queued
    }
+
+   /// Queues one formatted record; `false` when it could not be queued.
+   ///
+   /// Never blocks and never writes: this is the only path a `log::` call has once the thread is
+   /// attached, so a slow or full disk cannot stall the caller.
+   pub fn log(&self, record: LogRecord) -> bool {
+      let mut queue = self.shared.lock();
+      if queue.closed {
+         return false;
+      }
+      let queued = queue.push_log(record);
+      drop(queue);
+      self.shared.ready.notify_one();
+      queued
+   }
 }
 
 /// Serves the queue forever; returns when the `Worker` is dropped and the queue is empty.
@@ -233,6 +284,7 @@ fn run(shared: Arc<Shared>, writer: Writer, waker: Waker, done: Sender<Done>) {
             }
             Job::SavePrefs(prefs) => prefs.save(),
          },
+         Some(Item::Log(record)) => crate::logging::write_record(&record),
          None => {}
       }
       // Reported from this thread because it owns the log write path; the count is taken so the
@@ -240,6 +292,10 @@ fn run(shared: Arc<Shared>, writer: Writer, waker: Waker, done: Sender<Done>) {
       let dropped = shared.lock().take_dropped();
       if dropped > 0 {
          log::warn!("{dropped} daemon frame(s) dropped: the write queue was full");
+      }
+      let dropped = shared.lock().take_dropped_log();
+      if dropped > 0 {
+         log::warn!("{dropped} log record(s) dropped: the log queue was full");
       }
    }
 }
@@ -289,5 +345,57 @@ mod tests {
          queue.frames, FRAME_CAP,
          "the queue never grows past the cap"
       );
+   }
+
+   #[test]
+   fn records_are_served_after_frames_and_jobs() {
+      let mut queue = Queue::default();
+      assert!(queue.push_log(LogRecord {
+         line: "info line".to_owned(),
+         mirror: false,
+      }));
+      queue.push_job(Job::SavePrefs(Prefs::default()));
+      assert!(queue.push_frame("status".to_owned()));
+
+      assert!(
+         matches!(queue.pop(), Some(Item::Frame(_))),
+         "the frame goes first"
+      );
+      assert!(
+         matches!(queue.pop(), Some(Item::Job(_))),
+         "then the job"
+      );
+      assert!(
+         matches!(queue.pop(), Some(Item::Log(record)) if record.line == "info line"),
+         "the record is served last"
+      );
+      assert!(queue.pop().is_none());
+   }
+
+   #[test]
+   fn a_full_log_queue_drops_the_newest_and_counts_it() {
+      let mut queue = Queue::default();
+      for n in 0..LOG_CAP {
+         assert!(
+            queue.push_log(LogRecord {
+               line: format!("line {n}"),
+               mirror: false,
+            }),
+            "slot {n} must fit"
+         );
+      }
+      assert!(
+         !queue.push_log(LogRecord {
+            line: "over the cap".to_owned(),
+            mirror: false,
+         }),
+         "the cap must refuse the record"
+      );
+      assert_eq!(
+         queue.take_dropped_log(),
+         1,
+         "the refusal is counted"
+      );
+      assert_eq!(queue.take_dropped_log(), 0, "and counted once");
    }
 }

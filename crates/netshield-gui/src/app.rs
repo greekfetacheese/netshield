@@ -17,6 +17,7 @@ use crate::{
    Cli,
    connlog::ConnectionLog,
    ipc::{self, Decider, IpcClient},
+   logging,
    prefs::Prefs,
    ruleset::Ruleset,
    work,
@@ -270,7 +271,8 @@ impl App {
       let writer = ipc::Writer::new();
       let work = work::Worker::spawn(work_waker, writer.clone());
       if let Some(handle) = work.as_ref().map(work::Worker::handle) {
-         writer.set_sink(Some(handle));
+         writer.set_sink(Some(handle.clone()));
+         logging::attach(handle);
       }
       let save_work = work.as_ref().map(work::Worker::handle);
       let ipc = if cli.mock {
