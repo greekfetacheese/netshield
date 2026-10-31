@@ -43,6 +43,12 @@ const PROMPT_REPAINT_EVERY: Duration = Duration::from_millis(500);
 /// Red used by the offline banner; loud on purpose.
 const BANNER_RED: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x1F, 0x1F);
 
+/// Amber used by the refusal banner: a refusal is not an outage, so it must not wear the red.
+const BANNER_AMBER: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x6d, 0x1f);
+
+/// How long a refusal stays on screen; it is an answer to one action, not a standing state.
+const REFUSAL_SECS: u64 = 8;
+
 /// The width of the navigation panel. Narrow on purpose: the Connections list is the page
 /// that needs the pixels, and the four labels are short.
 const NAV_WIDTH: f32 = 140.0;
@@ -61,6 +67,8 @@ pub struct App {
    ipc: Option<IpcClient>,
    socket: PathBuf,
    connected: bool,
+   /// The daemon's last refusal and when it arrived; shown for `REFUSAL_SECS`, then forgotten.
+   refusal: Option<(String, Instant)>,
    /// Whether the current connection state has been logged. The socket thread reports
    /// `Connected(false)` on every failed dial while it retries, and `connected` starts
    /// `false`, so comparing states alone would leave the first failure unrecorded -- the
@@ -269,6 +277,7 @@ impl App {
          ipc,
          socket: cli.socket,
          connected: false,
+         refusal: None,
          connection_logged: false,
          log: ConnectionLog::new(prefs.rows_per_app, prefs.max_apps),
          prefs,
@@ -475,6 +484,10 @@ impl App {
             Response::Prompt(prompt) => self.enqueue_prompt(prompt),
             Response::PromptClosed { id, .. } => self.remove_prompt(id),
             Response::Rules { rules } => self.rules.install(rules),
+            Response::Error { message } => {
+               log::warn!("the daemon refused a request: {message}");
+               self.refusal = Some((message, Instant::now()));
+            }
             _ => {}
          },
       }
@@ -789,6 +802,32 @@ impl App {
          });
    }
 
+   /// The daemon's last refusal, shown for [`REFUSAL_SECS`] above the page content.
+   ///
+   /// A refused request is not a lost connection: the daemon keeps the socket open and answers
+   /// with an error, and this banner is the only place the user ever sees that answer. It is
+   /// deliberately not cleared by `mock`: the refusal path is exercised there.
+   fn refusal_banner(&mut self, ui: &mut egui::Ui) {
+      let Some((message, at)) = self.refusal.clone() else {
+         return;
+      };
+      if at.elapsed() >= Duration::from_secs(REFUSAL_SECS) {
+         self.refusal = None;
+         return;
+      }
+      egui::Panel::top("refusal-banner")
+         .resizable(false)
+         .frame(
+            egui::Frame::NONE
+               .fill(BANNER_AMBER)
+               .inner_margin(egui::Margin::symmetric(12, 8)),
+         )
+         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(message).color(egui::Color32::WHITE).strong());
+         });
+   }
+
    /// The top bar: the product name, the mode switch and the daemon state.
    ///
    /// The switch collects an intent into a local because the panel closure borrows `self`;
@@ -830,13 +869,10 @@ impl App {
          });
       });
 
-      if let Some(mode) = requested {
-         if let Some(client) = &self.ipc {
-            client.send(&Request::SetMode { mode });
-         }
-         // Move the switch at once instead of waiting a round trip for the daemon.
-         self.mode = mode;
-         log::info!("operation mode -> {mode:?}");
+      if let Some(mode) = requested
+         && let Some(client) = &self.ipc
+      {
+         client.send(&Request::SetMode { mode });
       }
    }
 
@@ -976,6 +1012,7 @@ impl eframe::App for App {
 
       self.toolbar(ui);
       self.banner(ui);
+      self.refusal_banner(ui);
 
       egui::Panel::left("nav").exact_size(NAV_WIDTH).show(ui, |ui| {
          ui.add_space(6.0);
@@ -1376,6 +1413,18 @@ mod tests {
       assert!(app.connected);
       app.set_connected(false);
       assert!(!app.connected);
+   }
+
+   #[test]
+   fn a_refusal_from_the_daemon_is_surfaced() {
+      let mut app = app();
+      app.install(ipc::IpcEvent::Message(Box::new(
+         Response::Error {
+            message: "changing the mode requires root".to_owned(),
+         },
+      )));
+      let (message, _) = app.refusal.as_ref().expect("the refusal must be kept for the banner");
+      assert_eq!(message, "changing the mode requires root");
    }
 
    #[test]
