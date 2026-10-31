@@ -24,6 +24,65 @@ use crate::{ICON_RGBA, ICON_SIDE};
 /// The hover text and item title the desktop shows for the icon.
 const TITLE: &str = "NetShield";
 
+/// The desktop user whose session bus a root-started GUI should adopt.
+///
+/// `sudo` and `pkexec` reset the environment, so the tray cannot find the session bus of the
+/// desktop in front of the user and falls back to root's runtime dir, which has no bus. The
+/// invoker named by `SUDO_UID`/`PKEXEC_UID` is the owner of that session; root may connect to
+/// its bus, and the icon then registers on the panel the user is looking at.
+///
+/// `None` means "leave the environment alone": not root, a bus already named by the caller, no
+/// invoker to name, or an invoker whose bus socket is not there.
+fn adopted_session(
+   euid: u32,
+   bus_is_set: bool,
+   sudo_uid: Option<u32>,
+   pkexec_uid: Option<u32>,
+   bus_exists: impl Fn(u32) -> bool,
+) -> Option<u32> {
+   if euid != 0 || bus_is_set {
+      return None;
+   }
+   let uid = sudo_uid.or(pkexec_uid)?;
+   bus_exists(uid).then_some(uid)
+}
+
+/// Adopts the invoker's session bus when this process is a root-started GUI.
+///
+/// Must be called from the first lines of `main`, before any thread exists: `env::set_var` is
+/// unsafe because a concurrent reader of the environment is undefined behaviour, and this is the
+/// only place in the crate that needs it. The tray library resolves its bus from the environment
+/// alone, so the environment is the only lever.
+pub fn adopt_desktop_session() {
+   let uid = adopted_session(
+      effective_uid(),
+      std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some(),
+      std::env::var("SUDO_UID").ok().and_then(|value| value.parse().ok()),
+      std::env::var("PKEXEC_UID").ok().and_then(|value| value.parse().ok()),
+      |uid| std::path::Path::new(&format!("/run/user/{uid}/bus")).exists(),
+   );
+   let Some(uid) = uid else {
+      return;
+   };
+   let bus = format!("unix:path=/run/user/{uid}/bus");
+   let runtime = format!("/run/user/{uid}");
+   // SAFETY: `main` calls this before eframe, the IPC thread, or the tray thread exists, so
+   // nothing else can read the environment while it is replaced.
+   unsafe {
+      std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus);
+      std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+   }
+   log::info!("root start: using the desktop session bus at {bus} for the tray icon");
+}
+
+/// The effective uid, from the owner of `/proc/self/status`: procfs stamps that file with the
+/// process's effective uid, so no libc call is needed. An unreadable file is treated as
+/// "not root", which leaves the environment alone.
+fn effective_uid() -> u32 {
+   use std::os::unix::fs::MetadataExt;
+   std::fs::metadata("/proc/self/status").map_or(u32::MAX, |meta| meta.uid())
+}
+
 /// What a tray interaction asks the app to do.
 ///
 /// Callbacks cannot touch `&mut App`, so they queue one of these and the app applies it
@@ -179,4 +238,63 @@ pub fn show_window(ctx: &egui::Context) {
    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
    ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+   use super::adopted_session;
+
+   /// A bus socket that always exists, for the cases that are not about its absence.
+   fn bus_present(_uid: u32) -> bool {
+      true
+   }
+
+   #[test]
+   fn a_root_gui_adopts_the_invoking_users_bus() {
+      assert_eq!(
+         adopted_session(0, false, Some(1000), None, bus_present),
+         Some(1000)
+      );
+   }
+
+   #[test]
+   fn a_root_gui_without_an_invoker_leaves_the_environment_alone() {
+      assert_eq!(
+         adopted_session(0, false, None, None, bus_present),
+         None
+      );
+   }
+
+   #[test]
+   fn an_explicit_bus_address_is_respected() {
+      // The caller's environment wins: sudoers can pass one through and must not be overridden.
+      assert_eq!(
+         adopted_session(0, true, Some(1000), None, bus_present),
+         None
+      );
+   }
+
+   #[test]
+   fn an_unprivileged_gui_adopts_nothing() {
+      assert_eq!(
+         adopted_session(1000, false, Some(1000), None, bus_present),
+         None
+      );
+   }
+
+   #[test]
+   fn pkexec_names_the_invoker_too() {
+      assert_eq!(
+         adopted_session(0, false, None, Some(1001), bus_present),
+         Some(1001)
+      );
+   }
+
+   #[test]
+   fn a_missing_bus_socket_is_not_adopted() {
+      assert_eq!(
+         adopted_session(0, false, Some(1000), None, |_uid| false),
+         None
+      );
+   }
 }

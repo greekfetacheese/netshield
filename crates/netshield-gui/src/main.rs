@@ -133,6 +133,10 @@ fn main() -> eframe::Result {
       log::info!("logging to {}", path.display());
    }
 
+   // Before eframe, so the environment is still single-threaded: a root-started GUI has to name
+   // the desktop user's session bus or the tray icon has nowhere to register.
+   tray::adopt_desktop_session();
+
    // In `--alert` mode the root window is the prompt itself, so it opens at the panel's
    // fixed size and cannot be resized out of the layout. Normal mode keeps the shell.
    let viewport = if cli.alert {
