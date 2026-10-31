@@ -789,13 +789,10 @@ impl App {
          });
    }
 
-   /// The top bar: the product name, the mode switch and the daemon state.
+   /// The top bar: the product name, the mode indicator and the daemon state.
    ///
-   /// The switch collects an intent into a local because the panel closure borrows `self`;
-   /// the intent is applied after the closure, exactly as the Settings page used to.
+   /// The mode switch is disabled and shows the mode in force: changing it is a root action.
    fn toolbar(&mut self, ui: &mut egui::Ui) {
-      let mut requested: Option<Mode> = None;
-
       egui::Panel::top("toolbar").exact_size(42.0).show(ui, |ui| {
          ui.horizontal_centered(|ui| {
             ui.add_space(12.0);
@@ -809,9 +806,12 @@ impl App {
                   ui.add_space(12.0);
                   let mut ask = self.mode == Mode::Alert;
                   let switch = elegance::Switch::new(&mut ask, "Ask before connecting");
-                  if ui.add_enabled(!self.mock, switch).changed() {
-                     requested = Some(if ask { Mode::Alert } else { Mode::Silent });
-                  }
+                  // The mode is a root action (`sudo netshieldctl set-mode …`): the daemon refuses it
+                  // from any peer that is not root, so this shows the mode in force rather than
+                  // offering a control. `self.mode` follows the daemon's published status.
+                  ui.add_enabled(false, switch).on_disabled_hover_text(
+                     "changing the mode needs root: sudo netshieldctl set-mode alert|silent",
+                  );
                   ui.add_space(14.0);
                   let (state, label) = if self.connected {
                      (elegance::IndicatorState::On, "connected")
@@ -829,15 +829,6 @@ impl App {
             );
          });
       });
-
-      if let Some(mode) = requested {
-         if let Some(client) = &self.ipc {
-            client.send(&Request::SetMode { mode });
-         }
-         // Move the switch at once instead of waiting a round trip for the daemon.
-         self.mode = mode;
-         log::info!("operation mode -> {mode:?}");
-      }
    }
 
    /// Sidebar footer: connection state and queued prompts.
