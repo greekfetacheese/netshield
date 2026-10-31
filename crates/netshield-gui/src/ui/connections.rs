@@ -17,6 +17,7 @@ use netshield_core::rule::{Rule, RuleId};
 
 use crate::connlog::{ConnectionLog, Row, clock};
 use crate::ruleset::Ruleset;
+use crate::ui::cells::{Cells, truncation_hint};
 use crate::ui::rules::{action_label, dest_label};
 use crate::work::{Done, Job, Worker};
 
@@ -609,54 +610,10 @@ impl Columns {
    }
 }
 
-/// Paints one row's cells, clipped to their columns and centred vertically.
-///
-/// Column offsets are relative to the row's left edge, so the header and the rows share
-/// one geometry.
-struct Cells<'a> {
-   painter: &'a egui::Painter,
-   rect: Rect,
-}
-
-impl Cells<'_> {
-   fn text(&self, x: f32, width: f32, text: &str, font: &FontId, color: Color32, italics: bool) {
-      let format = TextFormat {
-         italics,
-         ..TextFormat::simple(font.clone(), color)
-      };
-      let mut job = LayoutJob::single_section(text.to_owned(), format);
-      job.wrap = TextWrapping::truncate_at_width(width.max(0.0));
-      let galley = self.painter.layout_job(job);
-      let y = self.rect.center().y - galley.size().y / 2.0;
-      self.painter.galley(pos2(self.rect.left() + x, y), galley, color);
-   }
-}
-
 /// The width a group line's `<name> <count>` galley may use, i.e. the Connection column
 /// less the name's start and the room the verdict indicator needs.
 fn name_width_limit(columns: &Columns, name_x: f32) -> f32 {
    (columns.connection - name_x - DOT_SPACE).max(0.0)
-}
-
-/// Shows `text` while `response` is hovered, but only when it did not fit in `width`.
-///
-/// Every column truncates with an ellipsis, so the full value has to live somewhere: the
-/// hint is drawn only when the row is hovered *and* the text is genuinely clipped, which
-/// keeps a value that fits from nagging the pointer.
-fn truncation_hint(
-   response: &Response,
-   painter: &egui::Painter,
-   width: f32,
-   text: &str,
-   font: &FontId,
-) {
-   if !response.hovered() {
-      return;
-   }
-   let needed = painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
-   if needed > width {
-      response.clone().on_hover_text(text.to_owned());
-   }
 }
 
 /// The verdict indicator's rectangle on a group line.
