@@ -17,10 +17,28 @@ usage() {
    cat <<'EOF'
 Usage: merge-config.sh [--dry-run] CONFIG_FILE PREFIX
        merge-config.sh --self-test
+       merge-config.sh --print-dns-servers  print the default dns_servers JSON and exit
 
 Adds the config keys this NetShield version needs, preserving every existing key and
 value. --dry-run prints what would be added without writing anything.
 EOF
+}
+
+# The DNS answer sources this box should trust.
+#
+# An empty list means any sender may teach the name cache, which lets a peer that answers a
+# query name its own address — so a domain rule can be made to match it. systemd-resolved's
+# stub is the tight answer on a box that uses it: applications consume the stub's answers, so
+# domain rules keep working, and a loopback source cannot be forged from the network.
+# `NETSHIELD_RESOLV_CONF` exists so the self-test can point at a fixture.
+dns_servers_default() {
+   local resolv="${NETSHIELD_RESOLV_CONF:-/etc/resolv.conf}"
+   if grep -qE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.53([[:space:]]|$)' "$resolv" 2>/dev/null; then
+      printf '["127.0.0.53"]'
+      return
+   fi
+   printf 'note: no local resolver stub in %s; dns_servers stays empty and any sender may name its own address — set it to your resolver addresses\n' "$resolv" >&2
+   printf '[]'
 }
 
 merge_file() {
@@ -34,16 +52,21 @@ merge_file() {
    fi
 
    if ! command -v python3 >/dev/null 2>&1; then
-      fail "python3 is required to merge $config safely; add these keys by hand instead: table, unattributable_closed_flow, unmatched_transport, icmp_echo, gui_path=$prefix/bin/netshield-gui, dns_servers=[]"
+      fail "python3 is required to merge $config safely; add these keys by hand instead: table, unattributable_closed_flow, unmatched_transport, icmp_echo, gui_path=$prefix/bin/netshield-gui, dns_servers=[...]"
    fi
 
-   python3 - "$config" "$prefix" "$dry_run" <<'PY'
+   local dns_servers
+   dns_servers="$(dns_servers_default)"
+   python3 - "$config" "$prefix" "$dry_run" "$dns_servers" <<'PY'
 import json
 import os
 import sys
 import tempfile
 
-config_path, prefix, dry_run = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+config_path, prefix, dry_run, dns_servers_json = (
+    sys.argv[1], sys.argv[2], sys.argv[3] == "1", sys.argv[4]
+)
+dns_servers = json.loads(dns_servers_json)
 
 try:
     with open(config_path, "r", encoding="utf-8") as handle:
@@ -71,7 +94,7 @@ wanted = [
     ("unmatched_transport", "deny"),
     ("icmp_echo", "deny"),
     ("gui_path", f"{prefix}/bin/netshield-gui"),
-    ("dns_servers", []),
+    ("dns_servers", dns_servers),
 ]
 missing = [(key, value) for key, value in wanted if key not in existing]
 
@@ -114,11 +137,11 @@ PY
 }
 
 selftest_pass() {
-   printf 'self-test: %s/5 ok\n' "$1"
+   printf 'self-test: %s/7 ok\n' "$1"
 }
 
 selftest_fail() {
-   printf 'self-test: %s/5 failed: %s\n' "$1" "$2" >&2
+   printf 'self-test: %s/7 failed: %s\n' "$1" "$2" >&2
    exit 1
 }
 
@@ -240,6 +263,46 @@ PY
       selftest_fail 5 "the merged file mode is not 0640"
    fi
    selftest_pass 5
+
+   # The default must follow the box's resolver: the stub when it is there, empty when it is not.
+   local stub_resolv="$tmp/resolv.stub"
+   local plain_resolv="$tmp/resolv.plain"
+   printf 'nameserver 127.0.0.53\n' > "$stub_resolv"
+   printf 'nameserver 192.0.2.53\n' > "$plain_resolv"
+
+   cp "$before" "$tmp/stub.json"
+   if ! NETSHIELD_RESOLV_CONF="$stub_resolv" "$self" "$tmp/stub.json" "$prefix" >/dev/null; then
+      selftest_fail 6 "merge with a resolver stub failed"
+   fi
+   if ! python3 - "$tmp/stub.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)
+sys.exit(0 if config["dns_servers"] == ["127.0.0.53"] else f"dns_servers is {config['dns_servers']!r}")
+PY
+   then
+      selftest_fail 6 "the stub was not used as the dns_servers default"
+   fi
+   selftest_pass 6
+
+   cp "$before" "$tmp/plain.json"
+   if ! NETSHIELD_RESOLV_CONF="$plain_resolv" "$self" "$tmp/plain.json" "$prefix" >/dev/null; then
+      selftest_fail 7 "merge without a resolver stub failed"
+   fi
+   if ! python3 - "$tmp/plain.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)
+sys.exit(0 if config["dns_servers"] == [] else f"dns_servers is {config['dns_servers']!r}")
+PY
+   then
+      selftest_fail 7 "an empty default was not kept without a stub"
+   fi
+   selftest_pass 7
 }
 
 DRY_RUN=0
@@ -247,6 +310,11 @@ SELF_TEST=0
 
 while [ "$#" -gt 0 ]; do
    case "$1" in
+      --print-dns-servers)
+         dns_servers_default
+         printf '\n'
+         exit 0
+         ;;
       --dry-run)
          DRY_RUN=1
          shift

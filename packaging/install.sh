@@ -118,6 +118,11 @@ install_config() {
       return
    fi
 
+   local dns_servers
+   dns_servers="$("$SCRIPT_DIR/merge-config.sh" --print-dns-servers)" \
+      || fail "could not read the default dns_servers from merge-config.sh"
+   [ -n "$dns_servers" ] || fail "merge-config.sh printed no default dns_servers"
+
    cat > "$CONFIG_FILE" <<EOF
 {
   "queue_num": 0,
@@ -127,7 +132,7 @@ install_config() {
   "unattributable_closed_flow": "drop",
   "allowed_uid": $allowed_uid,
   "gui_path": "$PREFIX/bin/netshield-gui",
-  "dns_servers": [],
+  "dns_servers": $dns_servers,
   "log_level": "info",
   "socket_path": "$SOCKET_PATH",
   "rules_path": "/etc/netshield/rules.db"
