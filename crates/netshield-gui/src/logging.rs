@@ -53,6 +53,9 @@ struct FileLogger {
    settings: Settings,
    /// Whether the first failed write has already been reported to stderr.
    reported_write_error: AtomicBool,
+   /// Where records go once the work thread exists. `None` before `attach`, so the startup records
+   /// are still written in place: `main` logs before any thread is spawned.
+   sink: Mutex<Option<crate::work::Handle>>,
 }
 
 /// The open log and the state a mid-run rotation needs.
@@ -122,11 +125,19 @@ pub fn init() -> Option<PathBuf> {
       })),
       settings,
       reported_write_error: AtomicBool::new(false),
+      sink: Mutex::new(None),
    });
    if log::set_logger(logger).is_ok() {
       log::set_max_level(settings.level);
    }
    Some(path)
+}
+
+/// Routes records to the work thread's queue. Called once, as soon as the thread exists.
+pub fn attach(sink: crate::work::Handle) {
+   if let Some(logger) = LOGGER.get() {
+      *logger.sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+   }
 }
 
 /// Parses `NETSHIELD_LOG`; unset or unknown falls back to `info`.
@@ -299,6 +310,29 @@ impl FileLogger {
          eprintln!("netshield-gui: cannot write to the log file: {err}");
       }
    }
+
+   /// Appends one record and mirrors it when asked, in that order.
+   fn write_record(&self, record: &crate::work::LogRecord) {
+      self.write_line(&record.line);
+      if !record.mirror {
+         return;
+      }
+      // The file is the record of truth for an autostarted GUI, but a hand-started run watches
+      // the terminal, and a warning that never reaches it is the reason this module exists.
+      let mut stderr = std::io::stderr().lock();
+      let _ = stderr.write_all(record.line.as_bytes());
+   }
+}
+
+/// Writes one record's line, and mirrors it to stderr when the caller asked for that.
+///
+/// The direct path: the work thread calls this from `work::run`, and the startup records before
+/// `attach` go through it on the main thread. It is never reached from a paint.
+pub(crate) fn write_record(record: &crate::work::LogRecord) {
+   let Some(logger) = LOGGER.get() else {
+      return;
+   };
+   logger.write_record(record);
 }
 
 impl OpenLog {
@@ -358,14 +392,16 @@ impl Log for FileLogger {
          &message,
          SystemTime::now(),
       );
-      self.write_line(&line);
-      // The file is the record of truth for an autostarted GUI, but a hand-started run
-      // watches the terminal, and a warning that never reaches it is the reason this
-      // module exists.
-      if record.level() <= Level::Warn {
-         let mut stderr = std::io::stderr().lock();
-         let _ = stderr.write_all(line.as_bytes());
+      let mirror = record.level() <= Level::Warn;
+      if let Some(sink) =
+         self.sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+      {
+         // A full queue drops the record and counts it; the work thread reports the count. Writing
+         // it here instead would put the file back on this thread, which is the whole point.
+         sink.log(crate::work::LogRecord { line, mirror });
+         return;
       }
+      self.write_record(&crate::work::LogRecord { line, mirror });
    }
 
    fn flush(&self) {
@@ -381,7 +417,8 @@ impl Log for FileLogger {
 ///
 /// Installed before the logger so a panic raised while the file is being opened is still
 /// recorded; when no logger is installed this is a no-op and the default hook is all the
-/// process has, which is what it had before.
+/// process has, which is what it had before. It calls [`FileLogger::write_line`] directly, never
+/// the queue, because it must not depend on a thread that may be gone.
 fn install_panic_hook() {
    static INSTALLED: OnceLock<()> = OnceLock::new();
    if INSTALLED.set(()).is_err() {

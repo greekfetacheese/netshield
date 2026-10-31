@@ -1,8 +1,8 @@
 //! The GUI's half of the daemon protocol: one socket thread, a queue and a drain.
 //!
-//! `send` writes a frame straight to the socket, from whichever thread produced it, and
-//! `poll` only drains. All reading sits on a connection thread that retries a missing daemon
-//! instead of handing the UI an error to handle.
+//! `send` hands a frame to the work thread, which owns the socket write, and `poll` only
+//! drains. All reading sits on a connection thread that retries a missing daemon instead of
+//! handing the UI an error to handle.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -177,6 +177,9 @@ pub struct IpcClient {
 #[derive(Clone)]
 pub struct Writer {
    shared: Arc<Mutex<WriterState>>,
+   /// Where frames go once a work thread exists; `None` in `--mock` and in the tests, which write
+   /// from the calling thread.
+   sink: Arc<Mutex<Option<crate::work::Handle>>>,
 }
 
 struct WriterState {
@@ -195,25 +198,46 @@ impl Writer {
       Self::new()
    }
 
-   fn new() -> Self {
+   pub(crate) fn new() -> Self {
       Self {
          shared: Arc::new(Mutex::new(WriterState {
             socket: None,
             pending: VecDeque::new(),
          })),
+         sink: Arc::new(Mutex::new(None)),
       }
    }
 
-   /// Encodes one request and writes it, or queues it until there is a socket.
+   /// Routes frames to the work thread's queue. Called once, after the worker is spawned.
+   pub fn set_sink(&self, sink: Option<crate::work::Handle>) {
+      *self.sink.lock().unwrap_or_else(PoisonError::into_inner) = sink;
+   }
+
+   /// Encodes one request and hands it to the work thread, or writes it here when there is none.
    ///
-   /// `false` means the request never left: it could not be encoded, or the socket rejected
-   /// the write. A frame that merely queues returns `true`, exactly as the channel-backed
-   /// queue did.
+   /// `false` means the request never left this process: it could not be encoded, the queue was
+   /// full, or the socket rejected the write. A frame that merely queues returns `true`, exactly as
+   /// the channel-backed queue did.
    pub fn send(&self, request: &Request) -> bool {
       let Some(line) = frame(request) else {
          log::debug!("cannot encode an ipc request");
          return false;
       };
+      if let Some(handle) = self.sink.lock().unwrap_or_else(PoisonError::into_inner).clone() {
+         if handle.frame(line) {
+            return true;
+         }
+         log::debug!("dropping an ipc frame: the write queue is full");
+         return false;
+      }
+      self.write_frame(&line)
+   }
+
+   /// Writes one encoded frame from whichever thread holds it, or queues it until there is a socket.
+   ///
+   /// Public to the crate because the work thread is the production caller; the calling thread here
+   /// is the work thread, never a paint.
+   pub(crate) fn write_frame(&self, line: &str) -> bool {
       let mut state = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
       match state.socket.as_mut() {
          Some(socket) => match socket.write_all(line.as_bytes()) {
@@ -229,7 +253,7 @@ impl Writer {
             if state.pending.len() >= PENDING_CAP && state.pending.pop_front().is_some() {
                log::debug!("dropping an ipc request queued while the daemon was away");
             }
-            state.pending.push_back(line);
+            state.pending.push_back(line.to_owned());
             true
          }
       }
@@ -271,8 +295,8 @@ impl IpcClient {
       waker: Waker,
       on_prompt: PromptHook,
       on_connection: ConnectionSink,
+      writer: Writer,
    ) -> Self {
-      let writer = Writer::new();
       let (events, events_rx) = mpsc::channel();
       let attend = Arc::new(Attend::new());
       let thread_events = events.clone();
@@ -631,7 +655,19 @@ mod tests {
 
    /// The client most tests need: no prompt handling and no connection sink.
    fn spawn_plain(path: PathBuf, waker: Waker) -> IpcClient {
-      IpcClient::spawn(path, waker, Arc::new(|_| {}), Arc::new(|_| {}))
+      IpcClient::spawn(
+         path,
+         waker,
+         Arc::new(|_| {}),
+         Arc::new(|_| {}),
+         writer(),
+      )
+   }
+
+   /// A sink-less writer: frames are written by the calling thread, exactly as before the work
+   /// thread existed.
+   fn writer() -> Writer {
+      Writer::new()
    }
 
    /// A prompt closure event; `id` is what the backlog keeps or drops.
@@ -786,7 +822,13 @@ mod tests {
          when.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
          recorded.lock().expect("lock the hook").push(prompt.id);
       });
-      let client = IpcClient::spawn(path.clone(), waker, hook, Arc::new(|_| {}));
+      let client = IpcClient::spawn(
+         path.clone(),
+         waker,
+         hook,
+         Arc::new(|_| {}),
+         writer(),
+      );
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -830,7 +872,13 @@ mod tests {
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
       let (sink, seen) = recording_sink();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
+      let client = IpcClient::spawn(
+         path.clone(),
+         waker,
+         Arc::new(|_| {}),
+         sink,
+         writer(),
+      );
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -990,7 +1038,13 @@ mod tests {
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
       let (sink, seen) = recording_sink();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
+      let client = IpcClient::spawn(
+         path.clone(),
+         waker,
+         Arc::new(|_| {}),
+         sink,
+         writer(),
+      );
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -1039,7 +1093,13 @@ mod tests {
             log.lock().expect("apply the flow").push(event);
          })
       };
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
+      let client = IpcClient::spawn(
+         path.clone(),
+         waker,
+         Arc::new(|_| {}),
+         sink,
+         writer(),
+      );
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -1161,6 +1221,42 @@ mod tests {
       assert_eq!(
          decode_line::<Request>(line.as_bytes()).expect("decodable listrules"),
          Request::ListRules
+      );
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn a_frame_sent_through_the_worker_reaches_the_daemon() {
+      let path = socket_path("worker-frame");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, _woken) = counted();
+      let sink_writer = Writer::new();
+      let work = crate::work::Worker::spawn(waker.clone(), sink_writer.clone())
+         .expect("start the work thread");
+      sink_writer.set_sink(Some(work.handle()));
+
+      let client = IpcClient::spawn(
+         path.clone(),
+         waker,
+         Arc::new(|_| {}),
+         Arc::new(|_| {}),
+         sink_writer.clone(),
+      );
+      let (mut reader, _writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+
+      assert!(
+         sink_writer.send(&Request::Status),
+         "the frame must be accepted"
+      );
+      reader.get_ref().set_read_timeout(Some(WAIT)).expect("set the read timeout");
+      let mut line = String::new();
+      reader.read_line(&mut line).expect("read the status");
+      assert_eq!(
+         decode_line::<Request>(line.as_bytes()).expect("decodable status"),
+         Request::Status,
+         "the work thread is what wrote the frame"
       );
 
       fs::remove_file(&path).expect("remove the socket");
