@@ -1950,6 +1950,8 @@ enum CandidateOwner {
 /// Tries candidates in order until one yields an owner that agrees with `uid`.
 ///
 /// `owner_of` is injected so this selection logic can be exercised without a live `/proc`.
+/// Two candidates of the same uid are ambiguous, because the uid is the same identity for
+/// every process it polices.
 fn candidate_owner(
    candidates: &[u64],
    uid: Option<u32>,
@@ -1960,6 +1962,7 @@ fn candidate_owner(
       // to pick one, and a wrong application in a firewall prompt is worse than Unknown.
       return CandidateOwner::Ambiguous;
    }
+   let mut matches = Vec::new();
    let mut mismatch = None;
    for &candidate in candidates {
       let Ok(inode) = u32::try_from(candidate) else {
@@ -1974,21 +1977,27 @@ fn candidate_owner(
          mismatch.get_or_insert((inode, pid, wanted, owner_uid));
          continue;
       }
-      return CandidateOwner::Found {
-         inode,
-         pid,
-         uid: owner_uid,
-         created,
-      };
+      matches.push((inode, pid, owner_uid, created));
    }
-   match mismatch {
-      Some((inode, pid, packet_uid, owner_uid)) => CandidateOwner::Mismatch {
-         inode,
-         pid,
-         packet_uid,
-         owner_uid,
+   match matches.as_slice() {
+      [(inode, pid, owner_uid, created)] => CandidateOwner::Found {
+         inode: *inode,
+         pid: *pid,
+         uid: *owner_uid,
+         created: *created,
       },
-      None => CandidateOwner::Missing,
+      // Two live sockets of the packet's own uid are not evidence for either of them: the
+      // uid cannot separate them, so the flow must go to the prompt path, not to a guess.
+      [] => match mismatch {
+         Some((inode, pid, packet_uid, owner_uid)) => CandidateOwner::Mismatch {
+            inode,
+            pid,
+            packet_uid,
+            owner_uid,
+         },
+         None => CandidateOwner::Missing,
+      },
+      _ => CandidateOwner::Ambiguous,
    }
 }
 
@@ -3042,6 +3051,21 @@ mod tests {
             packet_uid: 7,
             owner_uid: 991,
          }
+      );
+   }
+
+   #[test]
+   fn two_candidates_owned_by_the_same_uid_are_ambiguous() {
+      let candidates = [11u64, 22];
+      let owner_of = |inode: u32| match inode {
+         11 => Some((100, 1000, Some(at(5)))),
+         22 => Some((200, 1000, None)),
+         _ => None,
+      };
+      assert_eq!(
+         candidate_owner(&candidates, Some(1000), owner_of),
+         CandidateOwner::Ambiguous,
+         "the uid cannot separate two live sockets, so neither may win by table order"
       );
    }
 
