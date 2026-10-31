@@ -25,7 +25,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +39,7 @@ use netshield_core::ipc::{
    MAX_FRAME_LEN, Mode, PROTOCOL_VERSION, Request, Response, StatusInfo, decode_line, encode_line,
    frame_len_ok,
 };
-use netshield_core::rule::socket_rule_refusal;
+use netshield_core::rule::{Action, Duration, socket_rule_refusal};
 
 use crate::netlink::socket::peer_creds;
 
@@ -180,6 +180,8 @@ pub struct GuiPolicy {
 /// `gui_path` the executable must equal it; a different path, an unreadable link or pid 0
 /// is a refusal. Without one the historical uid-only rule stands, which [`IpcServer::bind`]
 /// warns about because any process of that uid then qualifies.
+/// This is one half of the gate: [`provenance_refusal`] then decides whether the process
+/// behind that path can be trusted to run the code it appears to.
 fn peer_may_mutate(policy: &GuiPolicy, peer: &Peer, exe: Option<&Path>) -> bool {
    match policy.gui_path.as_deref() {
       Some(gui_path) => peer.pid != 0 && exe == Some(gui_path),
@@ -219,6 +221,271 @@ fn is_read_only(request: &Request) -> bool {
       request,
       Request::Hello { .. } | Request::Subscribe | Request::ListRules | Request::Status
    )
+}
+
+/// Variables that make a dynamic loader load code the peer chose.
+///
+/// `LD_PRELOAD` and `LD_AUDIT` inject a library unconditionally; the rest steer glibc's
+/// module/locale search or the Vulkan/GL loaders, which is the same capability without
+/// `LD_PRELOAD`. `LD_LIBRARY_PATH` is deliberately **not** here: it is set by ordinary build
+/// tooling (cargo sets it for test binaries) and only matters if something from a writable
+/// directory actually gets loaded, which `provenance_refusal` decides on evidence.
+const LOADER_VARIABLE_NAMES: [&str; 6] = [
+   "LD_PRELOAD",
+   "LD_AUDIT",
+   "GLIBC_TUNABLES",
+   "GCONV_PATH",
+   "NLSPATH",
+   "LOCPATH",
+];
+
+/// Prefixes with the same effect the exact names have (Vulkan drivers/layers, Mesa, GLX, GBM).
+const LOADER_VARIABLE_PREFIXES: [&str; 4] = ["VK_", "MESA_", "__GLX_", "GBM_"];
+
+/// One executable mapping from the peer's `/proc/<pid>/maps`, with the property that decides
+/// whether it could have been planted: its directory is writable by the peer's own uid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutableMapping {
+   path: PathBuf,
+   /// The file's parent directory is writable by the uid that owns the process.
+   writable_directory: bool,
+}
+
+/// Extracts `TracerPid` from a peer's `/proc/<pid>/status`.
+///
+/// A missing or unparsable field is `None`, which [`provenance_refusal`] treats as a refusal:
+/// a trace the daemon cannot rule out is a trace it cannot allow.
+fn parse_tracer_pid(status: &str) -> Option<u32> {
+   status
+      .lines()
+      .find_map(|line| line.strip_prefix("TracerPid:"))
+      .and_then(|fields| fields.split_whitespace().next())
+      .and_then(|pid| pid.parse().ok())
+}
+
+/// Whether a peer may change firewall state, judged on evidence about the running process.
+///
+/// Every input is `Option` because a read that failed is a refusal: a gate that cannot see the
+/// evidence must not answer "allowed". `own_exe` is the peer's already-resolved
+/// `/proc/<pid>/exe` — the one mapping allowed to come from a writable directory, because a
+/// development build of the GUI legitimately lives in `target/`.
+fn provenance_refusal(
+   tracer_pid: Option<u32>,
+   environment: Option<&[Vec<u8>]>,
+   mappings: Option<&[ExecutableMapping]>,
+   own_exe: Option<&Path>,
+) -> Option<String> {
+   match tracer_pid {
+      None => return Some("cannot read the peer's tracer from /proc/<pid>/status".to_owned()),
+      Some(0) => {}
+      Some(pid) => {
+         return Some(format!(
+            "the peer is being traced (TracerPid {pid}), so the code running in it is not the executable it appears to be"
+         ));
+      }
+   }
+
+   let environment = match environment {
+      Some(environment) => environment,
+      None => return Some("cannot read the peer's environment".to_owned()),
+   };
+   for entry in environment {
+      let name = match entry.iter().position(|byte| *byte == b'=') {
+         Some(index) => &entry[..index],
+         None => entry.as_slice(),
+      };
+      let denied = LOADER_VARIABLE_NAMES.iter().any(|denied| denied.as_bytes() == name)
+         || LOADER_VARIABLE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_bytes()));
+      if denied {
+         return Some(format!(
+            "the peer was started with {} set, so its loader can load code the owner did not approve",
+            String::from_utf8_lossy(name)
+         ));
+      }
+   }
+
+   let mappings = match mappings {
+      Some(mappings) => mappings,
+      None => return Some("cannot read the peer's executable mappings".to_owned()),
+   };
+   for mapping in mappings {
+      if mapping.writable_directory && own_exe != Some(mapping.path.as_path()) {
+         return Some(format!(
+            "the peer has executable code mapped from {}, a directory its own user can write",
+            mapping.path.display()
+         ));
+      }
+   }
+
+   None
+}
+
+/// Whether `directory` can be written by `uid` or by anyone.
+///
+/// A directory that cannot be inspected is reported as not writable: it cannot be proven
+/// plantable, and the environment check still covers the direct loader vectors.
+fn directory_is_writable(directory: &Path, uid: u32) -> bool {
+   match fs::metadata(directory) {
+      Ok(meta) => (meta.uid() == uid && meta.mode() & 0o200 != 0) || meta.mode() & 0o002 != 0,
+      Err(_) => false,
+   }
+}
+
+/// Parses the executable mappings out of a peer's `/proc/<pid>/maps`.
+///
+/// Each line is `start-end perms offset dev inode path`; only rows with `x` in `perms` and a
+/// real path survive, because those are the ones whose code can have been planted. The parent
+/// directory of each distinct path is inspected once, so a library with many segments costs a
+/// single `stat`.
+fn executable_mappings(maps: &[u8], uid: u32) -> Vec<ExecutableMapping> {
+   let mut mappings = Vec::new();
+   let mut directories: HashMap<PathBuf, bool> = HashMap::new();
+   for line in maps.split(|byte| *byte == b'\n') {
+      let mut fields = line.splitn(6, |byte| *byte == b' ');
+      let _range = fields.next();
+      match fields.next() {
+         Some(perms) if perms.contains(&b'x') => {}
+         _ => continue,
+      }
+      let _offset = fields.next();
+      let _device = fields.next();
+      let _inode = fields.next();
+      let path = match fields.next() {
+         Some(path) if !path.is_empty() && path[0] != b'[' => path,
+         _ => continue,
+      };
+      let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+      let path = PathBuf::from(OsStr::from_bytes(path));
+      let writable_directory = match path.parent() {
+         Some(directory) => {
+            if let Some(known) = directories.get(directory) {
+               *known
+            } else {
+               let writable = directory_is_writable(directory, uid);
+               directories.insert(directory.to_path_buf(), writable);
+               writable
+            }
+         }
+         None => false,
+      };
+      mappings.push(ExecutableMapping {
+         path,
+         writable_directory,
+      });
+   }
+   mappings
+}
+
+/// Reads the evidence [`provenance_refusal`] decides on, or says which read failed.
+///
+/// The peer's own uid is needed to judge writability, because a directory the peer's user
+/// owns and may write is as plantable as a world-writable one.
+fn peer_provenance(pid: u32, uid: u32, own_exe: Option<&Path>) -> Result<(), String> {
+   let tracer = fs::read_to_string(format!("/proc/{pid}/status"))
+      .ok()
+      .and_then(|status| parse_tracer_pid(&status));
+
+   let environment = fs::read(format!("/proc/{pid}/environ")).ok().map(|raw| {
+      raw.split(|byte| *byte == 0)
+         .filter(|entry| !entry.is_empty())
+         .map(<[u8]>::to_vec)
+         .collect::<Vec<Vec<u8>>>()
+   });
+
+   let mappings = fs::read(format!("/proc/{pid}/maps"))
+      .ok()
+      .map(|raw| executable_mappings(&raw, uid));
+
+   provenance_refusal(
+      tracer,
+      environment.as_deref(),
+      mappings.as_deref(),
+      own_exe,
+   )
+   .map_or(Ok(()), Err)
+}
+
+/// Why a request needs root, or `None` when the desktop user may make it.
+///
+/// Three requests change what the firewall permits in a way that outlives the click or the
+/// session: turning enforcement off (`SetMode`), making a rule permanent (`Forever`), and
+/// withdrawing a denial. On a desktop where any process of the user's uid can start the GUI
+/// with its own loader, or click its window, none of them is evidence of the owner's intent —
+/// so they are made from a root shell (`netshieldctl`), which an unprivileged process cannot
+/// forge. Everything else stays available to the GUI: answering a prompt, a session rule, an
+/// edit that keeps an existing permanent rule permanent, and deleting an allow.
+///
+/// `existing` is the rule set the daemon is serving, used for the two cases that depend on
+/// what is already stored. The toggle is gated in both widening directions — a denial switched
+/// off and an allow switched back on — because the daemon writes it to the store, so either
+/// survives a restart.
+fn persistence_refusal(peer_uid: u32, request: &Request, existing: &[Rule]) -> Option<String> {
+   const PERMANENT: &str = "a permanent rule requires root: `sudo netshieldctl allow --exe <path> --dest <scope> --duration forever`";
+
+   if peer_uid == 0 {
+      return None;
+   }
+
+   match request {
+      Request::SetMode { .. } => Some(
+         "changing the mode requires root: `sudo netshieldctl set-mode alert|silent`".to_owned(),
+      ),
+      Request::Decide(decide) if decide.duration == Duration::Forever => Some(PERMANENT.to_owned()),
+      Request::UpsertRule { rule } if rule.duration == Duration::Forever => {
+         let unchanged = existing.iter().any(|stored| {
+            stored.id == rule.id
+               && stored.app == rule.app
+               && stored.dest == rule.dest
+               && stored.duration == Duration::Forever
+               // Switching a disabled rule on is the same grant `SetRuleEnabled` refuses.
+               && (stored.enabled || !rule.enabled)
+         });
+         if unchanged {
+            None
+         } else {
+            Some(PERMANENT.to_owned())
+         }
+      }
+      Request::DeleteRule { id } => match existing.iter().find(|rule| rule.id == *id) {
+         // A missing entry is not evidence that the rule is harmless: the snapshot can lag the
+         // policy, and a delete of a denial is a grant.
+         None => Some(
+            "this rule is not in the daemon's published rule set yet; try again in a moment"
+               .to_owned(),
+         ),
+         Some(rule) if rule.action == Action::Deny => Some(
+            "withdrawing a denial requires root: `sudo netshieldctl delete <rule-id>`".to_owned(),
+         ),
+         Some(_) => None,
+      },
+      Request::SetRuleEnabled { id, enabled } => {
+         let Some(stored) = existing.iter().find(|rule| rule.id == *id) else {
+            return Some(
+               "this rule is not in the daemon's published rule set yet; try again in a moment"
+                  .to_owned(),
+            );
+         };
+         if stored.enabled == *enabled {
+            return None;
+         }
+         match (stored.action, *enabled) {
+            // A denial that stops applying is a grant, and the toggle is written to the store.
+            (Action::Deny, false) => Some(
+               "switching a denial off requires root: `sudo netshieldctl disable <rule-id>`"
+                  .to_owned(),
+            ),
+            // A rule that stops applying stops allowing; switching it back on re-grants it.
+            (Action::Allow, true) => Some(
+               "switching a rule back on requires root: `sudo netshieldctl enable <rule-id>`"
+                  .to_owned(),
+            ),
+            _ => None,
+         }
+      }
+      _ => None,
+   }
 }
 
 /// The ownership the control socket gets after bind: uid, gid and mode.
@@ -897,10 +1164,30 @@ fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer
          shared.send(id, &Response::Error { message });
          return false;
       }
+      if let Err(reason) = peer_provenance(peer.pid, peer.uid, exe.as_deref()) {
+         warn!(
+            "refusing a policy change from client {id} (pid {}, exe {exe:?}): {reason}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message: reason });
+         return false;
+      }
       info!(
          "control client {id} (pid {}, exe {exe:?}) {request:?}",
          peer.pid
       );
+   }
+
+   if !is_read_only(&request) {
+      let existing: Vec<Rule> = shared.state.lock().expect("ipc state").rules.clone();
+      if let Some(reason) = persistence_refusal(peer.uid, &request, &existing) {
+         warn!(
+            "refusing a policy change from client {id} (pid {}): {reason}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message: reason });
+         return false;
+      }
    }
 
    // A rule the socket may not express is answered with an error instead of being forwarded: the
@@ -1564,14 +1851,24 @@ mod tests {
       client
          .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
          .expect("send");
-      client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
 
+      // A non-root peer cannot turn enforcement off (`persistence_refusal`): the answer is an Error
+      // naming the root path, and the published mode is untouched. The mode is published through the
+      // handle, which the assertions above and `publishing_a_status_does_not_undo_a_newer_set_mode`
+      // cover.
       let mut buffered = Vec::new();
       match read_response(&mut client, &mut buffered) {
-         Response::Status(status) => assert_eq!(status.mode, Mode::Silent),
-         other => panic!("expected Status, got {other:?}"),
+         Response::Error { message } => assert!(
+            message.contains("netshieldctl set-mode"),
+            "the refusal must say how root makes the change, got: {message}"
+         ),
+         other => panic!("expected the SetMode refusal, got {other:?}"),
       }
-      assert_eq!(handle.mode(), Mode::Silent);
+      assert_eq!(
+         handle.mode(),
+         Mode::Alert,
+         "a refused SetMode must not change the published mode"
+      );
 
       drop(client);
       reader.join().expect("reader thread");
@@ -1827,19 +2124,33 @@ mod tests {
       let reader = thread::spawn(move || serve(server, shared, gui));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
-      client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
-         .expect("send");
+      // A session-scoped rule is what a click may still make; the mode switch and a permanent rule
+      // are root actions (`persistence_refusal`) and have their own tests.
+      // A narrow Session rule: `rule()` is Any/Any, which `socket_rule_refusal` refuses, and a
+      // permanent one is a root action. This is the shape a click may still produce.
+      let session = Request::UpsertRule {
+         rule: Rule {
+            app: AppMatcher::Exe(std::path::PathBuf::from("/usr/bin/git")),
+            dest: DestMatcher::Port(443),
+            duration: Duration::Session,
+            ..rule()
+         },
+      };
+      client.write_all(&encode_line(&session).expect("upsert")).expect("send");
 
-      let mut changed = false;
+      let mut forwarded = false;
       for _ in 0..100 {
-         if handle.mode() == Mode::Silent {
-            changed = true;
+         if let Some((_, Request::UpsertRule { rule })) = handle.try_recv() {
+            assert_eq!(rule.duration, Duration::Session);
+            forwarded = true;
             break;
          }
          thread::sleep(StdDuration::from_millis(10));
       }
-      assert!(changed, "the configured GUI's SetMode must apply");
+      assert!(
+         forwarded,
+         "the configured GUI's session rule must reach the daemon loop"
+      );
 
       // The connection stayed open and no Error frame was queued: the next request is a
       // read that the same session must be able to serve.
@@ -1868,20 +2179,31 @@ mod tests {
       let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
-      client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
-         .expect("send");
+      // A session-scoped rule is what a click may still make; the mode switch and a permanent rule
+      // are root actions (`persistence_refusal`) and have their own tests.
+      // A narrow Session rule: `rule()` is Any/Any, which `socket_rule_refusal` refuses, and a
+      // permanent one is a root action. This is the shape a click may still produce.
+      let session = Request::UpsertRule {
+         rule: Rule {
+            app: AppMatcher::Exe(std::path::PathBuf::from("/usr/bin/git")),
+            dest: DestMatcher::Port(443),
+            duration: Duration::Session,
+            ..rule()
+         },
+      };
+      client.write_all(&encode_line(&session).expect("upsert")).expect("send");
 
-      let mut changed = false;
+      let mut forwarded = false;
       for _ in 0..100 {
-         if handle.mode() == Mode::Silent {
-            changed = true;
+         if let Some((_, Request::UpsertRule { rule })) = handle.try_recv() {
+            assert_eq!(rule.duration, Duration::Session);
+            forwarded = true;
             break;
          }
          thread::sleep(StdDuration::from_millis(10));
       }
       assert!(
-         changed,
+         forwarded,
          "without gui_path the allowed uid keeps the old write permission"
       );
 
@@ -1908,6 +2230,9 @@ mod tests {
       let mut broad = rule();
       broad.app = AppMatcher::Any;
       broad.dest = DestMatcher::Any;
+      // A permanent rule would be refused by the persistence gate before this one; this test is
+      // about `socket_rule_refusal`, so the rule is session-scoped.
+      broad.duration = Duration::Session;
       client
          .write_all(&encode_line(&Request::UpsertRule { rule: broad }).expect("upsert"))
          .expect("send");
@@ -1927,5 +2252,383 @@ mod tests {
 
       drop(client);
       reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_traced_peer_may_not_change_policy() {
+      let message = provenance_refusal(Some(4242), Some(&[]), Some(&[]), None)
+         .expect("a traced peer must be refused");
+      assert!(
+         message.contains("4242") && message.contains("traced"),
+         "the refusal must name the tracer, got: {message}"
+      );
+   }
+
+   #[test]
+   fn a_preloaded_peer_is_refused() {
+      let environment = [b"DISPLAY=:0".to_vec(), b"LD_PRELOAD=/tmp/x.so".to_vec()];
+      let message = provenance_refusal(Some(0), Some(&environment), Some(&[]), None)
+         .expect("a preloaded peer must be refused");
+      assert!(
+         message.contains("LD_PRELOAD"),
+         "the refusal must name the variable, got: {message}"
+      );
+   }
+
+   #[test]
+   fn a_vulkan_loader_variable_is_refused_too() {
+      let environment = [b"VK_ICD_FILENAMES=/tmp/evil.json".to_vec()];
+      let message = provenance_refusal(Some(0), Some(&environment), Some(&[]), None)
+         .expect("a steered Vulkan loader must be refused");
+      assert!(
+         message.contains("VK_ICD_FILENAMES"),
+         "the refusal must name the variable, got: {message}"
+      );
+   }
+
+   #[test]
+   fn an_ordinary_desktop_environment_is_allowed() {
+      let environment = [
+         b"DISPLAY=:0".to_vec(),
+         b"WAYLAND_DISPLAY=wayland-0".to_vec(),
+         b"HOME=/home/user".to_vec(),
+         b"PATH=/usr/bin".to_vec(),
+         b"LANG=en_GB.UTF-8".to_vec(),
+         b"XDG_RUNTIME_DIR=/run/user/1000".to_vec(),
+         b"LD_LIBRARY_PATH=/usr/lib".to_vec(),
+      ];
+      assert_eq!(
+         provenance_refusal(
+            Some(0),
+            Some(&environment),
+            Some(&[]),
+            Some(Path::new("/usr/local/bin/netshield-gui")),
+         ),
+         None,
+         "LD_LIBRARY_PATH is ordinary build tooling, not a loader injection"
+      );
+   }
+
+   #[test]
+   fn a_code_mapping_from_a_writable_directory_is_refused() {
+      let mappings = [ExecutableMapping {
+         path: "/tmp/evil/libX11.so.6".into(),
+         writable_directory: true,
+      }];
+      let message = provenance_refusal(
+         Some(0),
+         Some(&[]),
+         Some(&mappings),
+         Some(Path::new("/usr/local/bin/netshield-gui")),
+      )
+      .expect("code from a plantable directory must be refused");
+      assert!(
+         message.contains("/tmp/evil/libX11.so.6"),
+         "the refusal must name the mapping, got: {message}"
+      );
+   }
+
+   #[test]
+   fn the_peer_s_own_executable_may_come_from_a_writable_directory() {
+      let mappings = [ExecutableMapping {
+         path: "/home/u/netshield/target/debug/netshield-gui".into(),
+         writable_directory: true,
+      }];
+      assert_eq!(
+         provenance_refusal(
+            Some(0),
+            Some(&[]),
+            Some(&mappings),
+            Some(Path::new(
+               "/home/u/netshield/target/debug/netshield-gui"
+            )),
+         ),
+         None,
+         "a development build under target/ is the peer's own executable"
+      );
+   }
+
+   #[test]
+   fn the_mode_switch_needs_root() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetMode { mode: Mode::Silent },
+         &[],
+      )
+      .expect("a desktop peer must not turn enforcement off");
+      assert!(
+         refusal.contains("netshieldctl set-mode"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn a_permanent_rule_from_a_desktop_peer_is_refused() {
+      let permanent = rule();
+      let refusal = persistence_refusal(
+         1000,
+         &Request::UpsertRule { rule: permanent },
+         &[],
+      )
+      .expect("a desktop peer must not make a rule permanent");
+      assert!(
+         refusal.contains("permanent"),
+         "the refusal must say the rule is permanent, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn a_session_rule_from_a_desktop_peer_is_allowed() {
+      let session = Rule {
+         duration: Duration::Session,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(1000, &Request::UpsertRule { rule: session }, &[]),
+         None,
+         "a rule that dies with the session stays clickable"
+      );
+   }
+
+   #[test]
+   fn an_edit_that_keeps_an_existing_permanent_rule_is_allowed() {
+      let stored = rule();
+      let edited = Rule {
+         note: Some("edited".to_owned()),
+         ..stored.clone()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule { rule: edited },
+            &[stored]
+         ),
+         None,
+         "editing the note of a permanent rule keeps it permanent"
+      );
+   }
+
+   #[test]
+   fn an_edit_that_widens_an_existing_permanent_rule_needs_root() {
+      let stored = Rule {
+         dest: DestMatcher::Port(443),
+         ..rule()
+      };
+      let widened = Rule {
+         dest: DestMatcher::Any,
+         ..stored.clone()
+      };
+      assert!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule { rule: widened },
+            &[stored]
+         )
+         .is_some(),
+         "widening a permanent rule changes what outlives the session"
+      );
+   }
+
+   #[test]
+   fn deleting_a_rule_the_snapshot_does_not_carry_is_refused() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::DeleteRule {
+            id: RuleId::new_unique(),
+         },
+         &[],
+      )
+      .expect("a delete the snapshot cannot judge must be refused, not applied ungated");
+      assert!(
+         refusal.contains("published rule set"),
+         "the refusal must say the snapshot is behind, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn switching_a_rule_the_snapshot_does_not_carry_is_refused() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: RuleId::new_unique(),
+            enabled: false,
+         },
+         &[],
+      )
+      .expect("a switch the snapshot cannot judge must be refused, not applied ungated");
+      assert!(
+         refusal.contains("published rule set"),
+         "the refusal must say the snapshot is behind, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn re_enabling_a_disabled_permanent_rule_by_editing_it_needs_root() {
+      let stored = Rule {
+         enabled: false,
+         ..rule()
+      };
+      let re_enabled = Rule {
+         enabled: true,
+         ..stored.clone()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::UpsertRule { rule: re_enabled },
+         std::slice::from_ref(&stored),
+      )
+      .expect("switching a disabled permanent rule on by editing it is the same grant");
+      assert!(
+         refusal.contains("permanent"),
+         "the refusal must say the rule is permanent, got: {refusal}"
+      );
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule {
+               rule: stored.clone()
+            },
+            std::slice::from_ref(&stored)
+         ),
+         None,
+         "an edit that leaves a disabled permanent rule off is not a grant"
+      );
+   }
+
+   #[test]
+   fn deleting_a_deny_rule_needs_root() {
+      let deny = Rule {
+         action: Action::Deny,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::DeleteRule {
+            id: deny.id.clone(),
+         },
+         &[deny],
+      )
+      .expect("a desktop peer must not withdraw a denial");
+      assert!(
+         refusal.contains("withdrawing a denial"),
+         "the refusal must say what is being withdrawn, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn deleting_an_allow_rule_is_not_a_grant() {
+      let allow = Rule {
+         action: Action::Allow,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::DeleteRule {
+               id: allow.id.clone()
+            },
+            &[allow],
+         ),
+         None,
+         "deleting an allow only narrows what is permitted"
+      );
+   }
+
+   #[test]
+   fn withdrawing_a_denial_by_switching_it_off_needs_root() {
+      let deny = Rule {
+         action: Action::Deny,
+         enabled: true,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: deny.id.clone(),
+            enabled: false,
+         },
+         &[deny],
+      )
+      .expect("a desktop peer must not withdraw a denial by switching it off");
+      assert!(
+         refusal.contains("netshieldctl disable"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn switching_an_allow_off_only_narrows() {
+      let allow = Rule {
+         action: Action::Allow,
+         enabled: true,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::SetRuleEnabled {
+               id: allow.id.clone(),
+               enabled: false,
+            },
+            &[allow],
+         ),
+         None,
+         "switching an allow off only narrows what is permitted"
+      );
+   }
+
+   #[test]
+   fn switching_an_allow_back_on_needs_root() {
+      let allow = Rule {
+         action: Action::Allow,
+         enabled: false,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: allow.id.clone(),
+            enabled: true,
+         },
+         &[allow],
+      )
+      .expect("a desktop peer must not re-grant an allow by switching it back on");
+      assert!(
+         refusal.contains("netshieldctl enable"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn root_may_do_all_of_it() {
+      let stored = Rule {
+         action: Action::Deny,
+         ..rule()
+      };
+      let permanent = Rule {
+         duration: Duration::Forever,
+         ..stored.clone()
+      };
+      assert_eq!(
+         persistence_refusal(0, &Request::SetMode { mode: Mode::Silent }, &[]),
+         None,
+         "root may switch the mode"
+      );
+      assert_eq!(
+         persistence_refusal(0, &Request::UpsertRule { rule: permanent }, &[]),
+         None,
+         "root may make a rule permanent"
+      );
+      assert_eq!(
+         persistence_refusal(
+            0,
+            &Request::DeleteRule {
+               id: stored.id.clone()
+            },
+            &[stored],
+         ),
+         None,
+         "root may withdraw a denial"
+      );
    }
 }
