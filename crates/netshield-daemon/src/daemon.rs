@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -2177,9 +2178,12 @@ fn rules_for(record: &PromptRecord, decide: &DecideRequest, now: u64) -> Vec<Rul
    // `DestMatcher::Any` would allow every unattributed flow on the machine. The alert does not
    // offer that row, but this request is the only thing between a bug (or a hostile client) and
    // that rule, so the daemon narrows it too.
-   let decide = narrow_unattributed_scope(
+   let decide = narrow_eval_scope(
       record,
-      &narrow_unknown_domain_scope(record, decide),
+      &narrow_unattributed_scope(
+         record,
+         &narrow_unknown_domain_scope(record, decide),
+      ),
    );
    match &decide.scope {
       ScopeChoice::TheseDestinations => record
@@ -2269,6 +2273,72 @@ fn narrow_unknown_domain_scope(record: &PromptRecord, decide: &DecideRequest) ->
       scope: ScopeChoice::Address,
       ..decide.clone()
    }
+}
+
+/// Narrows an app-wide answer for an executable that would hand egress to any program.
+///
+/// An app-wide rule for an interpreter, or for a binary in a directory its own user can write,
+/// is an app-wide rule for *any* binary that user can run: the interpreter runs whatever it is
+/// handed, and a writable binary can be replaced. Both are answered at the destinations the
+/// prompt listed instead — the click still applies to everything the user was looking at, and
+/// nothing wider. A flow with no executable keeps the narrowing `narrow_unattributed_scope`
+/// already applied, so this runs after it and rewrites `AnyConnection` only.
+fn narrow_eval_scope(record: &PromptRecord, decide: &DecideRequest) -> DecideRequest {
+   if decide.scope != ScopeChoice::AnyConnection {
+      return decide.clone();
+   }
+   let Some(first) = record.first() else {
+      return decide.clone();
+   };
+   if app_is_unknown(&first.connection) {
+      return decide.clone();
+   }
+   let Some((exe, uid)) = app_exe_and_uid(&first.connection) else {
+      return decide.clone();
+   };
+   let interpreter = netshield_core::rule::exe_is_interpreter(&exe);
+   let writable = exe_directory_writable(&exe, uid);
+   if !interpreter && !writable {
+      return decide.clone();
+   }
+   warn!(
+      "prompt {}: an app-wide rule for {} would allow any program the user can run ({}); \
+       narrowing the answer to the {} destination(s) the prompt listed",
+      record.id,
+      exe.display(),
+      if interpreter {
+         "an interpreter"
+      } else {
+         "a user-writable executable"
+      },
+      record.dests.len()
+   );
+   DecideRequest {
+      scope: ScopeChoice::TheseDestinations,
+      ..decide.clone()
+   }
+}
+
+/// The prompted flow's executable and owner uid, when it has both.
+fn app_exe_and_uid(connection: &Connection) -> Option<(std::path::PathBuf, u32)> {
+   match &connection.process {
+      Attribution::Process(process) => process.exe.clone().map(|exe| (exe, process.uid)),
+      Attribution::Unknown => None,
+   }
+}
+
+/// Whether `exe` sits in a directory `uid` can write.
+///
+/// A path whose directory cannot be read is not writable: it cannot be shown plantable, and
+/// guessing in the narrow direction would refuse answers for absent binaries.
+fn exe_directory_writable(exe: &std::path::Path, uid: u32) -> bool {
+   let Some(parent) = exe.parent() else {
+      return false;
+   };
+   let Ok(meta) = std::fs::metadata(parent) else {
+      return false;
+   };
+   netshield_core::rule::directory_writable_by(meta.uid(), meta.mode(), uid)
 }
 
 /// The scope one destination of a `TheseDestinations` answer uses: its learned domain when
@@ -4012,6 +4082,73 @@ mod tests {
       }
       let record = pending.resolve(id).expect("open").record;
       (id, record)
+   }
+
+   /// A one-destination prompt for `connection`, and the `AnyConnection` allow a user would send
+   /// from its alert.
+   fn one_destination_decision(connection: Connection) -> (PromptRecord, DecideRequest) {
+      let start = Instant::now();
+      let mut pending = PendingPrompts::new();
+      let id = pending.open(connection, 10, Duration::from_secs(30), start).id();
+      let record = pending.resolve(id).expect("open").record;
+      let decide = DecideRequest {
+         prompt_id: id,
+         action: Action::Allow,
+         duration: RuleDuration::Session,
+         scope: ScopeChoice::AnyConnection,
+      };
+      (record, decide)
+   }
+
+   /// An app-wide allow for an interpreter is an allow for every program that uid can run.
+   #[test]
+   fn an_app_wide_answer_for_an_interpreter_narrows_to_the_destinations() {
+      let (record, decide) =
+         one_destination_decision(app_conn("/usr/bin/python3", "198.51.100.20", 443));
+
+      let narrowed = narrow_eval_scope(&record, &decide);
+
+      assert_eq!(
+         narrowed.scope,
+         ScopeChoice::TheseDestinations,
+         "an interpreter must not get an app-wide rule"
+      );
+   }
+
+   /// A binary in a directory its own uid can write can be replaced with anything.
+   #[test]
+   fn an_app_wide_answer_for_a_user_writable_executable_narrows() {
+      let (record, decide) = one_destination_decision(app_conn(
+         "/tmp/netshield-probe-app",
+         "198.51.100.20",
+         443,
+      ));
+
+      let narrowed = narrow_eval_scope(&record, &decide);
+
+      assert_eq!(
+         narrowed.scope,
+         ScopeChoice::TheseDestinations,
+         "a user-writable executable must not get an app-wide rule"
+      );
+   }
+
+   /// A plain application's app-wide answer is what the user asked for: keep it.
+   #[test]
+   fn an_app_wide_answer_for_a_plain_application_is_kept() {
+      let (record, decide) = one_destination_decision(app_conn(
+         "/usr/lib/firefox/firefox",
+         "198.51.100.20",
+         443,
+      ));
+
+      let narrowed = narrow_eval_scope(&record, &decide);
+
+      assert_eq!(
+         narrowed.scope,
+         ScopeChoice::AnyConnection,
+         "an ordinary application keeps its app-wide answer"
+      );
    }
 
    /// `AnyConnection` on a group is the user asking for this app on any destination: exactly

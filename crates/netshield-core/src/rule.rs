@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -321,6 +321,35 @@ fn covers_every_destination(dest: &DestMatcher) -> bool {
       DestMatcher::Set(entries) => entries.iter().any(covers_every_destination),
       DestMatcher::Domain { .. } | DestMatcher::Port(_) => false,
    }
+}
+
+/// Names that run whatever code they are handed, so an app-wide allow for one of them is an
+/// allow for every program the user can run.
+///
+/// Exact basenames, plus a `python` prefix so `python3`, `python3.14` and `python2.7` are all
+/// covered. The list is deliberately narrow: `curl`, `wget` and `ssh` are general egress
+/// tools, not interpreters, and a rule the user wrote for them means what it says.
+const INTERPRETER_NAMES: [&str; 21] = [
+   "sh", "bash", "dash", "zsh", "ksh", "fish", "node", "deno", "bun", "perl", "ruby", "php",
+   "java", "lua", "tclsh", "busybox", "env", "socat", "nc", "ncat", "telnet",
+];
+
+/// Whether `exe` names an interpreter, judged on the file name alone: the decision must not
+/// depend on the filesystem, and a root-owned `/usr/bin/python3` is an interpreter too.
+pub fn exe_is_interpreter(exe: &Path) -> bool {
+   let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+      return false;
+   };
+   let name = name.to_ascii_lowercase();
+   name.starts_with("python") || INTERPRETER_NAMES.contains(&name.as_str())
+}
+
+/// Whether a directory with this owner and mode can be written by `uid`.
+///
+/// Owner-write or other-write: the group case needs `/etc/group` and buys nothing here, because
+/// the writer we are worried about is the app's own uid.
+pub fn directory_writable_by(dir_uid: u32, dir_mode: u32, uid: u32) -> bool {
+   (dir_uid == uid && dir_mode & 0o200 != 0) || dir_mode & 0o002 != 0
 }
 
 /// Why a raw hostname could not be normalized.
@@ -946,5 +975,52 @@ mod tests {
             "a short slice is never an id ({bad})"
          );
       }
+   }
+
+   #[test]
+   fn interpreter_names_are_recognised() {
+      for exe in [
+         "/usr/bin/python3",
+         "/usr/bin/python3.14",
+         "/bin/sh",
+         "/usr/bin/node",
+         "/opt/busybox",
+      ] {
+         assert!(
+            exe_is_interpreter(Path::new(exe)),
+            "{exe} runs arbitrary code and is an interpreter"
+         );
+      }
+      for exe in [
+         "/usr/lib/firefox/firefox",
+         "/usr/bin/git",
+         "/usr/bin/curl",
+         "/usr/bin/wget",
+      ] {
+         assert!(
+            !exe_is_interpreter(Path::new(exe)),
+            "{exe} is an application, not an interpreter"
+         );
+      }
+   }
+
+   #[test]
+   fn a_directory_is_writable_by_its_owner_or_by_anyone() {
+      assert!(
+         directory_writable_by(1000, 0o040755, 1000),
+         "the owning uid may write its own 0755 directory"
+      );
+      assert!(
+         !directory_writable_by(0, 0o040755, 1000),
+         "a root-owned 0755 directory is not writable by uid 1000"
+      );
+      assert!(
+         directory_writable_by(0, 0o041777, 1000),
+         "a sticky world-writable directory is writable by anyone"
+      );
+      assert!(
+         !directory_writable_by(1000, 0o040555, 1000),
+         "a read-only directory is not writable even by its owner"
+      );
    }
 }
