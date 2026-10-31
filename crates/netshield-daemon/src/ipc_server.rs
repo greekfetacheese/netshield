@@ -25,7 +25,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +180,8 @@ pub struct GuiPolicy {
 /// `gui_path` the executable must equal it; a different path, an unreadable link or pid 0
 /// is a refusal. Without one the historical uid-only rule stands, which [`IpcServer::bind`]
 /// warns about because any process of that uid then qualifies.
+/// This is one half of the gate: [`provenance_refusal`] then decides whether the process
+/// behind that path can be trusted to run the code it appears to.
 fn peer_may_mutate(policy: &GuiPolicy, peer: &Peer, exe: Option<&Path>) -> bool {
    match policy.gui_path.as_deref() {
       Some(gui_path) => peer.pid != 0 && exe == Some(gui_path),
@@ -219,6 +221,190 @@ fn is_read_only(request: &Request) -> bool {
       request,
       Request::Hello { .. } | Request::Subscribe | Request::ListRules | Request::Status
    )
+}
+
+/// Variables that make a dynamic loader load code the peer chose.
+///
+/// `LD_PRELOAD` and `LD_AUDIT` inject a library unconditionally; the rest steer glibc's
+/// module/locale search or the Vulkan/GL loaders, which is the same capability without
+/// `LD_PRELOAD`. `LD_LIBRARY_PATH` is deliberately **not** here: it is set by ordinary build
+/// tooling (cargo sets it for test binaries) and only matters if something from a writable
+/// directory actually gets loaded, which `provenance_refusal` decides on evidence.
+const LOADER_VARIABLE_NAMES: [&str; 6] = [
+   "LD_PRELOAD",
+   "LD_AUDIT",
+   "GLIBC_TUNABLES",
+   "GCONV_PATH",
+   "NLSPATH",
+   "LOCPATH",
+];
+
+/// Prefixes with the same effect the exact names have (Vulkan drivers/layers, Mesa, GLX, GBM).
+const LOADER_VARIABLE_PREFIXES: [&str; 4] = ["VK_", "MESA_", "__GLX_", "GBM_"];
+
+/// One executable mapping from the peer's `/proc/<pid>/maps`, with the property that decides
+/// whether it could have been planted: its directory is writable by the peer's own uid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutableMapping {
+   path: PathBuf,
+   /// The file's parent directory is writable by the uid that owns the process.
+   writable_directory: bool,
+}
+
+/// Extracts `TracerPid` from a peer's `/proc/<pid>/status`.
+///
+/// A missing or unparsable field is `None`, which [`provenance_refusal`] treats as a refusal:
+/// a trace the daemon cannot rule out is a trace it cannot allow.
+fn parse_tracer_pid(status: &str) -> Option<u32> {
+   status
+      .lines()
+      .find_map(|line| line.strip_prefix("TracerPid:"))
+      .and_then(|fields| fields.split_whitespace().next())
+      .and_then(|pid| pid.parse().ok())
+}
+
+/// Whether a peer may change firewall state, judged on evidence about the running process.
+///
+/// Every input is `Option` because a read that failed is a refusal: a gate that cannot see the
+/// evidence must not answer "allowed". `own_exe` is the peer's already-resolved
+/// `/proc/<pid>/exe` — the one mapping allowed to come from a writable directory, because a
+/// development build of the GUI legitimately lives in `target/`.
+fn provenance_refusal(
+   tracer_pid: Option<u32>,
+   environment: Option<&[Vec<u8>]>,
+   mappings: Option<&[ExecutableMapping]>,
+   own_exe: Option<&Path>,
+) -> Option<String> {
+   match tracer_pid {
+      None => return Some("cannot read the peer's tracer from /proc/<pid>/status".to_owned()),
+      Some(0) => {}
+      Some(pid) => {
+         return Some(format!(
+            "the peer is being traced (TracerPid {pid}), so the code running in it is not the executable it appears to be"
+         ));
+      }
+   }
+
+   let environment = match environment {
+      Some(environment) => environment,
+      None => return Some("cannot read the peer's environment".to_owned()),
+   };
+   for entry in environment {
+      let name = match entry.iter().position(|byte| *byte == b'=') {
+         Some(index) => &entry[..index],
+         None => entry.as_slice(),
+      };
+      let denied = LOADER_VARIABLE_NAMES.iter().any(|denied| denied.as_bytes() == name)
+         || LOADER_VARIABLE_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix.as_bytes()));
+      if denied {
+         return Some(format!(
+            "the peer was started with {} set, so its loader can load code the owner did not approve",
+            String::from_utf8_lossy(name)
+         ));
+      }
+   }
+
+   let mappings = match mappings {
+      Some(mappings) => mappings,
+      None => return Some("cannot read the peer's executable mappings".to_owned()),
+   };
+   for mapping in mappings {
+      if mapping.writable_directory && own_exe != Some(mapping.path.as_path()) {
+         return Some(format!(
+            "the peer has executable code mapped from {}, a directory its own user can write",
+            mapping.path.display()
+         ));
+      }
+   }
+
+   None
+}
+
+/// Whether `directory` can be written by `uid` or by anyone.
+///
+/// A directory that cannot be inspected is reported as not writable: it cannot be proven
+/// plantable, and the environment check still covers the direct loader vectors.
+fn directory_is_writable(directory: &Path, uid: u32) -> bool {
+   match fs::metadata(directory) {
+      Ok(meta) => (meta.uid() == uid && meta.mode() & 0o200 != 0) || meta.mode() & 0o002 != 0,
+      Err(_) => false,
+   }
+}
+
+/// Parses the executable mappings out of a peer's `/proc/<pid>/maps`.
+///
+/// Each line is `start-end perms offset dev inode path`; only rows with `x` in `perms` and a
+/// real path survive, because those are the ones whose code can have been planted. The parent
+/// directory of each distinct path is inspected once, so a library with many segments costs a
+/// single `stat`.
+fn executable_mappings(maps: &[u8], uid: u32) -> Vec<ExecutableMapping> {
+   let mut mappings = Vec::new();
+   let mut directories: HashMap<PathBuf, bool> = HashMap::new();
+   for line in maps.split(|byte| *byte == b'\n') {
+      let mut fields = line.splitn(6, |byte| *byte == b' ');
+      let _range = fields.next();
+      match fields.next() {
+         Some(perms) if perms.contains(&b'x') => {}
+         _ => continue,
+      }
+      let _offset = fields.next();
+      let _device = fields.next();
+      let _inode = fields.next();
+      let path = match fields.next() {
+         Some(path) if !path.is_empty() && path[0] != b'[' => path,
+         _ => continue,
+      };
+      let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+      let path = PathBuf::from(OsStr::from_bytes(path));
+      let writable_directory = match path.parent() {
+         Some(directory) => {
+            if let Some(known) = directories.get(directory) {
+               *known
+            } else {
+               let writable = directory_is_writable(directory, uid);
+               directories.insert(directory.to_path_buf(), writable);
+               writable
+            }
+         }
+         None => false,
+      };
+      mappings.push(ExecutableMapping {
+         path,
+         writable_directory,
+      });
+   }
+   mappings
+}
+
+/// Reads the evidence [`provenance_refusal`] decides on, or says which read failed.
+///
+/// The peer's own uid is needed to judge writability, because a directory the peer's user
+/// owns and may write is as plantable as a world-writable one.
+fn peer_provenance(pid: u32, uid: u32, own_exe: Option<&Path>) -> Result<(), String> {
+   let tracer = fs::read_to_string(format!("/proc/{pid}/status"))
+      .ok()
+      .and_then(|status| parse_tracer_pid(&status));
+
+   let environment = fs::read(format!("/proc/{pid}/environ")).ok().map(|raw| {
+      raw.split(|byte| *byte == 0)
+         .filter(|entry| !entry.is_empty())
+         .map(<[u8]>::to_vec)
+         .collect::<Vec<Vec<u8>>>()
+   });
+
+   let mappings = fs::read(format!("/proc/{pid}/maps"))
+      .ok()
+      .map(|raw| executable_mappings(&raw, uid));
+
+   provenance_refusal(
+      tracer,
+      environment.as_deref(),
+      mappings.as_deref(),
+      own_exe,
+   )
+   .map_or(Ok(()), Err)
 }
 
 /// The ownership the control socket gets after bind: uid, gid and mode.
@@ -895,6 +1081,14 @@ fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer
             peer.pid
          );
          shared.send(id, &Response::Error { message });
+         return false;
+      }
+      if let Err(reason) = peer_provenance(peer.pid, peer.uid, exe.as_deref()) {
+         warn!(
+            "refusing a policy change from client {id} (pid {}, exe {exe:?}): {reason}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message: reason });
          return false;
       }
       info!(
@@ -1927,5 +2121,99 @@ mod tests {
 
       drop(client);
       reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_traced_peer_may_not_change_policy() {
+      let message = provenance_refusal(Some(4242), Some(&[]), Some(&[]), None)
+         .expect("a traced peer must be refused");
+      assert!(
+         message.contains("4242") && message.contains("traced"),
+         "the refusal must name the tracer, got: {message}"
+      );
+   }
+
+   #[test]
+   fn a_preloaded_peer_is_refused() {
+      let environment = [b"DISPLAY=:0".to_vec(), b"LD_PRELOAD=/tmp/x.so".to_vec()];
+      let message = provenance_refusal(Some(0), Some(&environment), Some(&[]), None)
+         .expect("a preloaded peer must be refused");
+      assert!(
+         message.contains("LD_PRELOAD"),
+         "the refusal must name the variable, got: {message}"
+      );
+   }
+
+   #[test]
+   fn a_vulkan_loader_variable_is_refused_too() {
+      let environment = [b"VK_ICD_FILENAMES=/tmp/evil.json".to_vec()];
+      let message = provenance_refusal(Some(0), Some(&environment), Some(&[]), None)
+         .expect("a steered Vulkan loader must be refused");
+      assert!(
+         message.contains("VK_ICD_FILENAMES"),
+         "the refusal must name the variable, got: {message}"
+      );
+   }
+
+   #[test]
+   fn an_ordinary_desktop_environment_is_allowed() {
+      let environment = [
+         b"DISPLAY=:0".to_vec(),
+         b"WAYLAND_DISPLAY=wayland-0".to_vec(),
+         b"HOME=/home/user".to_vec(),
+         b"PATH=/usr/bin".to_vec(),
+         b"LANG=en_GB.UTF-8".to_vec(),
+         b"XDG_RUNTIME_DIR=/run/user/1000".to_vec(),
+         b"LD_LIBRARY_PATH=/usr/lib".to_vec(),
+      ];
+      assert_eq!(
+         provenance_refusal(
+            Some(0),
+            Some(&environment),
+            Some(&[]),
+            Some(Path::new("/usr/local/bin/netshield-gui")),
+         ),
+         None,
+         "LD_LIBRARY_PATH is ordinary build tooling, not a loader injection"
+      );
+   }
+
+   #[test]
+   fn a_code_mapping_from_a_writable_directory_is_refused() {
+      let mappings = [ExecutableMapping {
+         path: "/tmp/evil/libX11.so.6".into(),
+         writable_directory: true,
+      }];
+      let message = provenance_refusal(
+         Some(0),
+         Some(&[]),
+         Some(&mappings),
+         Some(Path::new("/usr/local/bin/netshield-gui")),
+      )
+      .expect("code from a plantable directory must be refused");
+      assert!(
+         message.contains("/tmp/evil/libX11.so.6"),
+         "the refusal must name the mapping, got: {message}"
+      );
+   }
+
+   #[test]
+   fn the_peer_s_own_executable_may_come_from_a_writable_directory() {
+      let mappings = [ExecutableMapping {
+         path: "/home/u/netshield/target/debug/netshield-gui".into(),
+         writable_directory: true,
+      }];
+      assert_eq!(
+         provenance_refusal(
+            Some(0),
+            Some(&[]),
+            Some(&mappings),
+            Some(Path::new(
+               "/home/u/netshield/target/debug/netshield-gui"
+            )),
+         ),
+         None,
+         "a development build under target/ is the peer's own executable"
+      );
    }
 }
