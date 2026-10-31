@@ -267,7 +267,11 @@ impl App {
             }
          })
       };
-      let work = work::Worker::spawn(work_waker);
+      let writer = ipc::Writer::new();
+      let work = work::Worker::spawn(work_waker, writer.clone());
+      if let Some(handle) = work.as_ref().map(work::Worker::handle) {
+         writer.set_sink(Some(handle));
+      }
       let save_work = work.as_ref().map(work::Worker::handle);
       let ipc = if cli.mock {
          None
@@ -285,6 +289,7 @@ impl App {
             waker,
             on_prompt,
             on_connection,
+            writer,
          );
          client.send(&Request::Subscribe);
          client.send(&Request::Status);
