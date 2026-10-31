@@ -409,17 +409,17 @@ fn peer_provenance(pid: u32, uid: u32, own_exe: Option<&Path>) -> Result<(), Str
 
 /// Why a request needs root, or `None` when the desktop user may make it.
 ///
-/// Two requests change what the firewall permits in a way that outlives the click or the session,
-/// and neither is anchored to a prompt the user was looking at: turning enforcement off (`SetMode`)
-/// and writing a rule by hand (`UpsertRule` with `Forever`). On a desktop where any process of the
-/// user's uid can start the GUI with its own loader, or click its window, neither is evidence of the
-/// owner's intent — so they are made from a root shell (`netshieldctl`), which an unprivileged
-/// process cannot forge.
+/// One kind of request changes what the firewall permits in a way that outlives the click or the
+/// session *and* is anchored to nothing the user was looking at: a rule written by hand (`UpsertRule`
+/// with `Forever`), withdrawing a denial, and switching a rule back on. Those are made from a root
+/// shell (`netshieldctl`), which an unprivileged process cannot forge.
 ///
-/// A prompt answer may be permanent. The peer is already provenance-checked before this runs, and
-/// the permanence it creates is the one the user asked for at that prompt, so `Decide` is not gated
-/// here — including `Decide` with `Duration::Forever`. What is gated is the same rule written without
-/// a prompt in front of anyone.
+/// Everything the GUI itself offers is open to it: answering a prompt, including permanently, and
+/// turning enforcement on or off. `SetMode` is deliberately *not* gated — the owner's call, taken
+/// knowing the cost, because running a whole GUI as root is the larger risk. Any process of the
+/// desktop uid can synthesise the click that sends it; what cannot happen is a process that is *not*
+/// the configured executable, or one whose loader was steered, getting this far at all
+/// (`peer_may_mutate` and `provenance_refusal` run above).
 ///
 /// `existing` is the rule set the daemon is serving, used for the two cases that depend on what is
 /// already stored. The toggle is gated in both widening directions — a denial switched off and an
@@ -432,9 +432,6 @@ fn persistence_refusal(peer_uid: u32, request: &Request, existing: &[Rule]) -> O
    }
 
    match request {
-      Request::SetMode { .. } => Some(
-         "changing the mode requires root: `sudo netshieldctl set-mode alert|silent`".to_owned(),
-      ),
       Request::UpsertRule { rule } if rule.duration == Duration::Forever => {
          let unchanged = existing.iter().any(|stored| {
             stored.id == rule.id
@@ -1857,22 +1854,22 @@ mod tests {
          .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
          .expect("send");
 
-      // A non-root peer cannot turn enforcement off (`persistence_refusal`): the answer is an Error
-      // naming the root path, and the published mode is untouched. The mode is published through the
-      // handle, which the assertions above and `publishing_a_status_does_not_undo_a_newer_set_mode`
-      // cover.
+      // `SetMode` is applied by the server thread and answered with nothing, so the state is read
+      // back the way a client does: ask for `Status`.
+      client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
       let mut buffered = Vec::new();
       match read_response(&mut client, &mut buffered) {
-         Response::Error { message } => assert!(
-            message.contains("netshieldctl set-mode"),
-            "the refusal must say how root makes the change, got: {message}"
+         Response::Status(status) => assert_eq!(
+            status.mode,
+            Mode::Silent,
+            "the configured GUI may turn enforcement off"
          ),
-         other => panic!("expected the SetMode refusal, got {other:?}"),
+         other => panic!("expected Status after SetMode, got {other:?}"),
       }
       assert_eq!(
          handle.mode(),
-         Mode::Alert,
-         "a refused SetMode must not change the published mode"
+         Mode::Silent,
+         "the server's mode followed the configured GUI's request"
       );
 
       drop(client);
@@ -1893,17 +1890,25 @@ mod tests {
       let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      // A permanent rule written by hand is still a root action, so it is the request that exercises
+      // the refusal path now that the mode switch is open to the GUI.
+      let permanent = Rule {
+         app: AppMatcher::Exe(PathBuf::from("/usr/bin/git")),
+         dest: DestMatcher::Port(443),
+         duration: Duration::Forever,
+         ..rule()
+      };
       client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .write_all(&encode_line(&Request::UpsertRule { rule: permanent }).expect("upsert"))
          .expect("send");
 
       let mut buffered = Vec::new();
       match read_response(&mut client, &mut buffered) {
          Response::Error { message } => assert!(
-            message.contains("netshieldctl set-mode"),
+            message.contains("permanent"),
             "the refusal must say how root makes the change, got: {message}"
          ),
-         other => panic!("expected the SetMode refusal, got {other:?}"),
+         other => panic!("expected the permanent-rule refusal, got {other:?}"),
       }
 
       // The same socket, after the refusal: a refusal is of the request, not of the peer, so the
@@ -1916,7 +1921,7 @@ mod tests {
          Response::Status(status) => assert_eq!(
             status.mode,
             Mode::Alert,
-            "a refused SetMode must not change the published mode"
+            "a refused upsert must not change the published mode"
          ),
          other => {
             panic!("the connection must survive the refusal; read {other:?} instead of a status")
@@ -2402,16 +2407,16 @@ mod tests {
    }
 
    #[test]
-   fn the_mode_switch_needs_root() {
-      let refusal = persistence_refusal(
-         1000,
-         &Request::SetMode { mode: Mode::Silent },
-         &[],
-      )
-      .expect("a desktop peer must not turn enforcement off");
-      assert!(
-         refusal.contains("netshieldctl set-mode"),
-         "the refusal must name the command, got: {refusal}"
+   fn the_mode_switch_is_open_to_the_configured_gui() {
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::SetMode { mode: Mode::Silent },
+            &[]
+         ),
+         None,
+         "the GUI may turn enforcement off: what guards it is being the configured executable, not \
+          the peer's uid"
       );
    }
 
