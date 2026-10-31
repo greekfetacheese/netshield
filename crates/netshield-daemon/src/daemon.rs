@@ -172,6 +172,14 @@ fn upsert_revoke(rule: &Rule) -> Revoke {
    }
 }
 
+/// Whether a rule the control socket upserted belongs in the store.
+///
+/// Only a permanent rule does: `Once` and `Session` are memory-only, and a stored copy would
+/// return after a restart as a grant the user never made permanent.
+fn upsert_persists(rule: &Rule) -> bool {
+   rule.duration == RuleDuration::Forever
+}
+
 /// Why the daemon or `--check` could not run.
 #[derive(Debug)]
 pub enum DaemonError {
@@ -999,8 +1007,18 @@ impl Daemon {
             rule.updated_at = now_secs();
             // The rule's app has to be read before the change, and only a deny revokes.
             let revoke = upsert_revoke(&rule);
+            let persist = upsert_persists(&rule);
             self.policy.upsert_rule(rule.clone());
-            if let Err(err) = self.store.upsert(rule) {
+            // A `Session` or `Once` rule is memory-only by the model's own definition. Writing one to
+            // the store would bring it back after a restart as a permanent grant, which is the one
+            // thing its duration promises it is not — and the store may still hold an earlier
+            // permanent copy of the same rule, which has to go for the same reason.
+            let stored = if persist {
+               self.store.upsert(rule)
+            } else {
+               self.store.remove(&rule.id).map(|_| ())
+            };
+            if let Err(err) = stored {
                error!("could not persist a rule from the control socket: {err}");
             }
             self.publish_rules();
@@ -2735,6 +2753,37 @@ mod tests {
          !accepts_dns_source(&[trusted], other),
          "a configured list excludes everything else"
       );
+   }
+
+   #[test]
+   fn only_a_permanent_rule_reaches_the_store() {
+      let permanent = Rule {
+         id: RuleId::new_unique(),
+         enabled: true,
+         app: AppMatcher::Any,
+         dest: DestMatcher::Any,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         note: None,
+         created_at: 1,
+         updated_at: 1,
+         last_matched: None,
+         hits: 0,
+      };
+      assert!(
+         upsert_persists(&permanent),
+         "a permanent rule belongs in the store"
+      );
+      for duration in [RuleDuration::Session, RuleDuration::Once] {
+         let temporary = Rule {
+            duration,
+            ..permanent.clone()
+         };
+         assert!(
+            !upsert_persists(&temporary),
+            "{duration:?} is memory-only and must not reach the store"
+         );
+      }
    }
 
    #[test]

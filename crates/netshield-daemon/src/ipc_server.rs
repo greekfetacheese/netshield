@@ -39,7 +39,7 @@ use netshield_core::ipc::{
    MAX_FRAME_LEN, Mode, PROTOCOL_VERSION, Request, Response, StatusInfo, decode_line, encode_line,
    frame_len_ok,
 };
-use netshield_core::rule::socket_rule_refusal;
+use netshield_core::rule::{Action, Duration, socket_rule_refusal};
 
 use crate::netlink::socket::peer_creds;
 
@@ -405,6 +405,87 @@ fn peer_provenance(pid: u32, uid: u32, own_exe: Option<&Path>) -> Result<(), Str
       own_exe,
    )
    .map_or(Ok(()), Err)
+}
+
+/// Why a request needs root, or `None` when the desktop user may make it.
+///
+/// Three requests change what the firewall permits in a way that outlives the click or the
+/// session: turning enforcement off (`SetMode`), making a rule permanent (`Forever`), and
+/// withdrawing a denial. On a desktop where any process of the user's uid can start the GUI
+/// with its own loader, or click its window, none of them is evidence of the owner's intent —
+/// so they are made from a root shell (`netshieldctl`), which an unprivileged process cannot
+/// forge. Everything else stays available to the GUI: answering a prompt, a session rule, an
+/// edit that keeps an existing permanent rule permanent, and deleting an allow.
+///
+/// `existing` is the rule set the daemon is serving, used for the two cases that depend on
+/// what is already stored. The toggle is gated in both widening directions — a denial switched
+/// off and an allow switched back on — because the daemon writes it to the store, so either
+/// survives a restart.
+fn persistence_refusal(peer_uid: u32, request: &Request, existing: &[Rule]) -> Option<String> {
+   const PERMANENT: &str = "a permanent rule requires root: `sudo netshieldctl allow --exe <path> --dest <scope> --duration forever`";
+
+   if peer_uid == 0 {
+      return None;
+   }
+
+   match request {
+      Request::SetMode { .. } => Some(
+         "changing the mode requires root: `sudo netshieldctl set-mode alert|silent`".to_owned(),
+      ),
+      Request::Decide(decide) if decide.duration == Duration::Forever => Some(PERMANENT.to_owned()),
+      Request::UpsertRule { rule } if rule.duration == Duration::Forever => {
+         let unchanged = existing.iter().any(|stored| {
+            stored.id == rule.id
+               && stored.app == rule.app
+               && stored.dest == rule.dest
+               && stored.duration == Duration::Forever
+               // Switching a disabled rule on is the same grant `SetRuleEnabled` refuses.
+               && (stored.enabled || !rule.enabled)
+         });
+         if unchanged {
+            None
+         } else {
+            Some(PERMANENT.to_owned())
+         }
+      }
+      Request::DeleteRule { id } => match existing.iter().find(|rule| rule.id == *id) {
+         // A missing entry is not evidence that the rule is harmless: the snapshot can lag the
+         // policy, and a delete of a denial is a grant.
+         None => Some(
+            "this rule is not in the daemon's published rule set yet; try again in a moment"
+               .to_owned(),
+         ),
+         Some(rule) if rule.action == Action::Deny => Some(
+            "withdrawing a denial requires root: `sudo netshieldctl delete <rule-id>`".to_owned(),
+         ),
+         Some(_) => None,
+      },
+      Request::SetRuleEnabled { id, enabled } => {
+         let Some(stored) = existing.iter().find(|rule| rule.id == *id) else {
+            return Some(
+               "this rule is not in the daemon's published rule set yet; try again in a moment"
+                  .to_owned(),
+            );
+         };
+         if stored.enabled == *enabled {
+            return None;
+         }
+         match (stored.action, *enabled) {
+            // A denial that stops applying is a grant, and the toggle is written to the store.
+            (Action::Deny, false) => Some(
+               "switching a denial off requires root: `sudo netshieldctl disable <rule-id>`"
+                  .to_owned(),
+            ),
+            // A rule that stops applying stops allowing; switching it back on re-grants it.
+            (Action::Allow, true) => Some(
+               "switching a rule back on requires root: `sudo netshieldctl enable <rule-id>`"
+                  .to_owned(),
+            ),
+            _ => None,
+         }
+      }
+      _ => None,
+   }
 }
 
 /// The ownership the control socket gets after bind: uid, gid and mode.
@@ -1097,6 +1178,18 @@ fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer
       );
    }
 
+   if !is_read_only(&request) {
+      let existing: Vec<Rule> = shared.state.lock().expect("ipc state").rules.clone();
+      if let Some(reason) = persistence_refusal(peer.uid, &request, &existing) {
+         warn!(
+            "refusing a policy change from client {id} (pid {}): {reason}",
+            peer.pid
+         );
+         shared.send(id, &Response::Error { message: reason });
+         return false;
+      }
+   }
+
    // A rule the socket may not express is answered with an error instead of being forwarded: the
    // daemon loop applies whatever reaches it verbatim, and one request must not be a silent
    // allow-all on disk. The connection stays open — this is a refusal of the request, not of the
@@ -1758,14 +1851,24 @@ mod tests {
       client
          .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
          .expect("send");
-      client.write_all(&encode_line(&Request::Status).expect("status")).expect("send");
 
+      // A non-root peer cannot turn enforcement off (`persistence_refusal`): the answer is an Error
+      // naming the root path, and the published mode is untouched. The mode is published through the
+      // handle, which the assertions above and `publishing_a_status_does_not_undo_a_newer_set_mode`
+      // cover.
       let mut buffered = Vec::new();
       match read_response(&mut client, &mut buffered) {
-         Response::Status(status) => assert_eq!(status.mode, Mode::Silent),
-         other => panic!("expected Status, got {other:?}"),
+         Response::Error { message } => assert!(
+            message.contains("netshieldctl set-mode"),
+            "the refusal must say how root makes the change, got: {message}"
+         ),
+         other => panic!("expected the SetMode refusal, got {other:?}"),
       }
-      assert_eq!(handle.mode(), Mode::Silent);
+      assert_eq!(
+         handle.mode(),
+         Mode::Alert,
+         "a refused SetMode must not change the published mode"
+      );
 
       drop(client);
       reader.join().expect("reader thread");
@@ -2021,19 +2124,33 @@ mod tests {
       let reader = thread::spawn(move || serve(server, shared, gui));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
-      client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
-         .expect("send");
+      // A session-scoped rule is what a click may still make; the mode switch and a permanent rule
+      // are root actions (`persistence_refusal`) and have their own tests.
+      // A narrow Session rule: `rule()` is Any/Any, which `socket_rule_refusal` refuses, and a
+      // permanent one is a root action. This is the shape a click may still produce.
+      let session = Request::UpsertRule {
+         rule: Rule {
+            app: AppMatcher::Exe(std::path::PathBuf::from("/usr/bin/git")),
+            dest: DestMatcher::Port(443),
+            duration: Duration::Session,
+            ..rule()
+         },
+      };
+      client.write_all(&encode_line(&session).expect("upsert")).expect("send");
 
-      let mut changed = false;
+      let mut forwarded = false;
       for _ in 0..100 {
-         if handle.mode() == Mode::Silent {
-            changed = true;
+         if let Some((_, Request::UpsertRule { rule })) = handle.try_recv() {
+            assert_eq!(rule.duration, Duration::Session);
+            forwarded = true;
             break;
          }
          thread::sleep(StdDuration::from_millis(10));
       }
-      assert!(changed, "the configured GUI's SetMode must apply");
+      assert!(
+         forwarded,
+         "the configured GUI's session rule must reach the daemon loop"
+      );
 
       // The connection stayed open and no Error frame was queued: the next request is a
       // read that the same session must be able to serve.
@@ -2062,20 +2179,31 @@ mod tests {
       let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
 
       client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
-      client
-         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
-         .expect("send");
+      // A session-scoped rule is what a click may still make; the mode switch and a permanent rule
+      // are root actions (`persistence_refusal`) and have their own tests.
+      // A narrow Session rule: `rule()` is Any/Any, which `socket_rule_refusal` refuses, and a
+      // permanent one is a root action. This is the shape a click may still produce.
+      let session = Request::UpsertRule {
+         rule: Rule {
+            app: AppMatcher::Exe(std::path::PathBuf::from("/usr/bin/git")),
+            dest: DestMatcher::Port(443),
+            duration: Duration::Session,
+            ..rule()
+         },
+      };
+      client.write_all(&encode_line(&session).expect("upsert")).expect("send");
 
-      let mut changed = false;
+      let mut forwarded = false;
       for _ in 0..100 {
-         if handle.mode() == Mode::Silent {
-            changed = true;
+         if let Some((_, Request::UpsertRule { rule })) = handle.try_recv() {
+            assert_eq!(rule.duration, Duration::Session);
+            forwarded = true;
             break;
          }
          thread::sleep(StdDuration::from_millis(10));
       }
       assert!(
-         changed,
+         forwarded,
          "without gui_path the allowed uid keeps the old write permission"
       );
 
@@ -2102,6 +2230,9 @@ mod tests {
       let mut broad = rule();
       broad.app = AppMatcher::Any;
       broad.dest = DestMatcher::Any;
+      // A permanent rule would be refused by the persistence gate before this one; this test is
+      // about `socket_rule_refusal`, so the rule is session-scoped.
+      broad.duration = Duration::Session;
       client
          .write_all(&encode_line(&Request::UpsertRule { rule: broad }).expect("upsert"))
          .expect("send");
@@ -2214,6 +2345,290 @@ mod tests {
          ),
          None,
          "a development build under target/ is the peer's own executable"
+      );
+   }
+
+   #[test]
+   fn the_mode_switch_needs_root() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetMode { mode: Mode::Silent },
+         &[],
+      )
+      .expect("a desktop peer must not turn enforcement off");
+      assert!(
+         refusal.contains("netshieldctl set-mode"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn a_permanent_rule_from_a_desktop_peer_is_refused() {
+      let permanent = rule();
+      let refusal = persistence_refusal(
+         1000,
+         &Request::UpsertRule { rule: permanent },
+         &[],
+      )
+      .expect("a desktop peer must not make a rule permanent");
+      assert!(
+         refusal.contains("permanent"),
+         "the refusal must say the rule is permanent, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn a_session_rule_from_a_desktop_peer_is_allowed() {
+      let session = Rule {
+         duration: Duration::Session,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(1000, &Request::UpsertRule { rule: session }, &[]),
+         None,
+         "a rule that dies with the session stays clickable"
+      );
+   }
+
+   #[test]
+   fn an_edit_that_keeps_an_existing_permanent_rule_is_allowed() {
+      let stored = rule();
+      let edited = Rule {
+         note: Some("edited".to_owned()),
+         ..stored.clone()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule { rule: edited },
+            &[stored]
+         ),
+         None,
+         "editing the note of a permanent rule keeps it permanent"
+      );
+   }
+
+   #[test]
+   fn an_edit_that_widens_an_existing_permanent_rule_needs_root() {
+      let stored = Rule {
+         dest: DestMatcher::Port(443),
+         ..rule()
+      };
+      let widened = Rule {
+         dest: DestMatcher::Any,
+         ..stored.clone()
+      };
+      assert!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule { rule: widened },
+            &[stored]
+         )
+         .is_some(),
+         "widening a permanent rule changes what outlives the session"
+      );
+   }
+
+   #[test]
+   fn deleting_a_rule_the_snapshot_does_not_carry_is_refused() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::DeleteRule {
+            id: RuleId::new_unique(),
+         },
+         &[],
+      )
+      .expect("a delete the snapshot cannot judge must be refused, not applied ungated");
+      assert!(
+         refusal.contains("published rule set"),
+         "the refusal must say the snapshot is behind, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn switching_a_rule_the_snapshot_does_not_carry_is_refused() {
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: RuleId::new_unique(),
+            enabled: false,
+         },
+         &[],
+      )
+      .expect("a switch the snapshot cannot judge must be refused, not applied ungated");
+      assert!(
+         refusal.contains("published rule set"),
+         "the refusal must say the snapshot is behind, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn re_enabling_a_disabled_permanent_rule_by_editing_it_needs_root() {
+      let stored = Rule {
+         enabled: false,
+         ..rule()
+      };
+      let re_enabled = Rule {
+         enabled: true,
+         ..stored.clone()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::UpsertRule { rule: re_enabled },
+         std::slice::from_ref(&stored),
+      )
+      .expect("switching a disabled permanent rule on by editing it is the same grant");
+      assert!(
+         refusal.contains("permanent"),
+         "the refusal must say the rule is permanent, got: {refusal}"
+      );
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::UpsertRule {
+               rule: stored.clone()
+            },
+            std::slice::from_ref(&stored)
+         ),
+         None,
+         "an edit that leaves a disabled permanent rule off is not a grant"
+      );
+   }
+
+   #[test]
+   fn deleting_a_deny_rule_needs_root() {
+      let deny = Rule {
+         action: Action::Deny,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::DeleteRule {
+            id: deny.id.clone(),
+         },
+         &[deny],
+      )
+      .expect("a desktop peer must not withdraw a denial");
+      assert!(
+         refusal.contains("withdrawing a denial"),
+         "the refusal must say what is being withdrawn, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn deleting_an_allow_rule_is_not_a_grant() {
+      let allow = Rule {
+         action: Action::Allow,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::DeleteRule {
+               id: allow.id.clone()
+            },
+            &[allow],
+         ),
+         None,
+         "deleting an allow only narrows what is permitted"
+      );
+   }
+
+   #[test]
+   fn withdrawing_a_denial_by_switching_it_off_needs_root() {
+      let deny = Rule {
+         action: Action::Deny,
+         enabled: true,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: deny.id.clone(),
+            enabled: false,
+         },
+         &[deny],
+      )
+      .expect("a desktop peer must not withdraw a denial by switching it off");
+      assert!(
+         refusal.contains("netshieldctl disable"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn switching_an_allow_off_only_narrows() {
+      let allow = Rule {
+         action: Action::Allow,
+         enabled: true,
+         ..rule()
+      };
+      assert_eq!(
+         persistence_refusal(
+            1000,
+            &Request::SetRuleEnabled {
+               id: allow.id.clone(),
+               enabled: false,
+            },
+            &[allow],
+         ),
+         None,
+         "switching an allow off only narrows what is permitted"
+      );
+   }
+
+   #[test]
+   fn switching_an_allow_back_on_needs_root() {
+      let allow = Rule {
+         action: Action::Allow,
+         enabled: false,
+         ..rule()
+      };
+      let refusal = persistence_refusal(
+         1000,
+         &Request::SetRuleEnabled {
+            id: allow.id.clone(),
+            enabled: true,
+         },
+         &[allow],
+      )
+      .expect("a desktop peer must not re-grant an allow by switching it back on");
+      assert!(
+         refusal.contains("netshieldctl enable"),
+         "the refusal must name the command, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn root_may_do_all_of_it() {
+      let stored = Rule {
+         action: Action::Deny,
+         ..rule()
+      };
+      let permanent = Rule {
+         duration: Duration::Forever,
+         ..stored.clone()
+      };
+      assert_eq!(
+         persistence_refusal(0, &Request::SetMode { mode: Mode::Silent }, &[]),
+         None,
+         "root may switch the mode"
+      );
+      assert_eq!(
+         persistence_refusal(0, &Request::UpsertRule { rule: permanent }, &[]),
+         None,
+         "root may make a rule permanent"
+      );
+      assert_eq!(
+         persistence_refusal(
+            0,
+            &Request::DeleteRule {
+               id: stored.id.clone()
+            },
+            &[stored],
+         ),
+         None,
+         "root may withdraw a denial"
       );
    }
 }
