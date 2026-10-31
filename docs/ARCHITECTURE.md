@@ -273,11 +273,12 @@ per-packet reads were ~14 ms of work for every new flow.
 An attributed pid is not automatically the image that opened the socket. A process can `connect()`
 and then `execve()` an allowed binary; the socket survives the exec, so `/proc` still names that pid
 while the code that sends is the new image. The daemon therefore compares the socket's creation time
-(the `/proc/<pid>/fd` link's `mtime`) with the moment the running image started, taken from the proc
+(a real `STATX_BTIME` only) with the moment the running image started, taken from the proc
 connector's `exec` event — stamped by the kernel inside the event, not by the thread that handles it,
 so the check is not paying for scheduling lag. A flow is refused only when the exec demonstrably
 followed the socket; 1 ms of slack covers reading the two clocks as a pair. A refused flow is
-`Unknown`, never the allowed binary's rules.
+`Unknown`, never the allowed binary's rules. On a kernel whose `/proc/<pid>/fd` link reports no
+`STATX_BTIME` (e.g. 7.0.x here) the refusal does not fire and the daemon logs that gap at startup.
 
 Root-owned sockets are excluded when the PID resolves to the daemon itself.
 

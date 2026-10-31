@@ -2013,11 +2013,9 @@ fn socket_inodes(pid: u32) -> Result<Vec<SocketInode>, ScanError> {
 /// be exercised on a directory the test controls instead of a live `/proc`.
 ///
 /// Each inode travels with its descriptor number, and the creation time is left `None`: it is
-/// read with `lstat` by [`socket_created_at`], for the one descriptor a scan matches. On this
-/// kernel (`statx` reports no `STATX_BTIME` on a procfs descriptor link, and `lstat` returns the
-/// descriptor's `st_mtim` at creation) the link's `mtime` *is* the socket's creation time; when
-/// `created()` is unsupported the `modified()` fallback is the socket's birth, not the file's, so
-/// it is the same observation.
+/// read with `lstat` by [`socket_created_at`], for the one descriptor a scan matches. Only a real
+/// `STATX_BTIME` counts as that time; on this kernel the procfs descriptor link reports none, so
+/// the descriptor's age stays unknown rather than borrowing the descriptor directory's `st_mtim`.
 fn read_fd_dir(path: PathBuf) -> Result<Vec<SocketInode>, ScanError> {
    let directory = fs::read_dir(&path).map_err(|_| ScanError::Unreadable)?;
    let mut names = Vec::new();
@@ -2077,13 +2075,20 @@ fn read_fd_dir(path: PathBuf) -> Result<Vec<SocketInode>, ScanError> {
 /// Reads when a socket descriptor was created from its link's own metadata.
 ///
 /// The link, not its target: `socket:[<inode>]` does not exist on disk, and following it
-/// would fail. The kernel stamps a procfs descriptor link when the descriptor is installed,
-/// so this is the socket's creation time, which is exactly what an exec-after-connect check
-/// needs. `None` (an unreadable link, or a platform that reports neither time) must keep
-/// the flow attributable rather than turn a missing observation into an accusation.
+/// would fail. Only `created()` (STATX_BTIME) can claim to be the socket's own birth. A
+/// `modified()` fallback used to sit here and is gone on purpose: on a kernel whose procfs
+/// descriptor link reports no btime, `st_mtim` is the descriptor directory's time rather
+/// than the socket's. `None` is the honest answer and keeps the flow attributable instead
+/// of turning a missing observation into an accusation.
 fn socket_created(link: &Path) -> Option<SystemTime> {
-   let meta = fs::symlink_metadata(link).ok()?;
-   meta.created().or_else(|_| meta.modified()).ok()
+   // `created()` is STATX_BTIME: the only thing on a descriptor link that can claim to be the
+   // socket's own birth. The `modified()` fallback that used to sit here is gone on purpose: on
+   // this kernel a `/proc/<pid>/fd` link reports no btime at all, and `st_mtim` there is the
+   // descriptor directory's time — two sockets created a second apart report one identical
+   // value — so it fed the exec-after-connect comparison a timestamp that cannot be the
+   // socket's. Unknown is the honest answer, and `None` makes the caller keep today's
+   // attribution instead of refusing (or allowing) on a number nobody measured.
+   fs::symlink_metadata(link).ok()?.created().ok()
 }
 
 /// Reads when one socket descriptor was created, for the descriptor a scan actually matched.
@@ -2092,6 +2097,16 @@ fn socket_created(link: &Path) -> Option<SystemTime> {
 /// descriptor: this is called with an inode and a descriptor number the scan has already matched.
 fn socket_created_at(pid: u32, fd: u32) -> Option<SystemTime> {
    socket_created(&Path::new(PROC).join(pid.to_string()).join("fd").join(fd.to_string()))
+}
+
+/// Whether this platform reports a socket descriptor's own creation time.
+///
+/// Every `/proc/<pid>/fd/<n>` link lives on the same filesystem, so the answer for
+/// `/proc/self/fd/0` is the answer for a socket link. The exec-after-connect refusal is the only
+/// consumer of that time, so a platform without it enforces nothing there and the daemon says so
+/// once at startup rather than looking like it checks.
+pub fn socket_birth_available() -> bool {
+   fs::symlink_metadata("/proc/self/fd/0").is_ok_and(|meta| meta.created().is_ok())
 }
 
 /// Returns a directory entry's own modification time, without following a symlink.
@@ -3725,6 +3740,32 @@ mod tests {
       );
 
       let _ = fs::remove_dir_all(&dir);
+   }
+
+   /// A descriptor link must never report one shared birth time for two different sockets.
+   ///
+   /// `Some` means the platform reports a real per-socket creation time, and then two sockets
+   /// created 20 ms apart cannot carry the same instant. Two equal values are one timestamp for
+   /// the whole descriptor directory — exactly what the removed `st_mtim` fallback returned, and
+   /// what made the exec-after-connect refusal meaningless. `None` on both is honest on a platform
+   /// that reports no btime, which is today's kernel.
+   #[test]
+   fn a_descriptor_link_does_not_report_one_shared_birth_time() {
+      use std::os::fd::AsRawFd;
+
+      let first = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a probe socket");
+      std::thread::sleep(StdDuration::from_millis(20));
+      let second = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a second probe socket");
+      let pid = std::process::id();
+      let a = socket_created_at(pid, first.as_raw_fd() as u32);
+      let b = socket_created_at(pid, second.as_raw_fd() as u32);
+      if let (Some(a), Some(b)) = (a, b) {
+         assert_ne!(
+            a, b,
+            "one timestamp for two sockets 20 ms apart is the descriptor directory's time, not a \
+             socket's birth"
+         );
+      }
    }
 
    /// Creates a descriptor directory holding `MAX_FDS + 10` entries where the only socket

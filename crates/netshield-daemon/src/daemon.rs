@@ -716,6 +716,13 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
          daemon.config.dns_servers
       );
    }
+   if !crate::proc::socket_birth_available() {
+      error!(
+         "exec-after-connect is NOT detected on this platform: /proc/<pid>/fd reports no per-socket \
+          creation time, so a socket inherited across execve() is judged as the image now running \
+          (an allowed interpreter such as python3 or sh can send on a socket another image opened)"
+      );
+   }
    info!(
       "netshieldd running: queue {} for flows, queue {} for DNS, control {}",
       daemon.config.queue_num,
