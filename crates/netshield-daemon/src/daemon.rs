@@ -298,6 +298,7 @@ struct Daemon {
    prompt_limit: MissLimiter,
    transport_denials: KeyLimiter<(u8, Option<u8>)>,
    multicast_logged: HashSet<String>,
+   last_swept_second: Option<u64>,
 }
 
 impl Daemon {
@@ -340,6 +341,7 @@ impl Daemon {
          prompt_limit: MissLimiter::with_gap(PROMPT_LIMIT_LOG_GAP),
          transport_denials: KeyLimiter::new(TRANSPORT_LOG_GAP, TRANSPORT_LOG_LIMIT),
          multicast_logged: HashSet::new(),
+         last_swept_second: None,
       }
    }
 
@@ -597,6 +599,18 @@ fn now_secs() -> u64 {
    SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Reports whether `epoch` is the first call inside its second, remembering it.
+///
+/// A cache-wide expiry that runs on every loop iteration costs the size of the cache on every packet
+/// batch; its granularity is whole seconds, so the second is the right gate.
+fn first_in_second(last: &mut Option<u64>, epoch: u64) -> bool {
+   if *last == Some(epoch) {
+      return false;
+   }
+   *last = Some(epoch);
+   true
 }
 
 /// Runs the daemon until SIGTERM/SIGINT.
@@ -1699,14 +1713,18 @@ impl Daemon {
       }
 
       let epoch = now_secs();
-      let removed = self.policy.expire_grants(epoch);
-      if removed > 0 {
-         debug!("expired {removed} flow grant(s)");
+      // Both expiries below walk a whole cache and their granularity is whole seconds, while this loop
+      // runs once per batch: run them when the second changes, never per iteration.
+      if first_in_second(&mut self.last_swept_second, epoch) {
+         let removed = self.policy.expire_grants(epoch);
+         if removed > 0 {
+            debug!("expired {removed} flow grant(s)");
+         }
+         // A panic while the cache was held must not take the packet path with it: the poison flag is
+         // evidence of a bug, not a reason to stop enforcing — and a panic here leaves the table
+         // installed with no queue bound, which the kernel accepts.
+         self.dns_cache.lock().unwrap_or_else(PoisonError::into_inner).expire(epoch);
       }
-      // A panic while the cache was held must not take the packet path with it: the poison flag is
-      // evidence of a bug, not a reason to stop enforcing — and a panic here leaves the table
-      // installed with no queue bound, which the kernel accepts.
-      self.dns_cache.lock().unwrap_or_else(PoisonError::into_inner).expire(epoch);
    }
 
    /// Builds the [`Connection`] for a parsed packet and, when it has no owner, why — or
@@ -2730,6 +2748,23 @@ mod tests {
       assert!(would_block(&timed_out));
       assert!(would_block(&again));
       assert!(!would_block(&denied));
+   }
+
+   #[test]
+   fn the_cache_sweep_runs_once_per_second() {
+      let mut last = None;
+      assert!(
+         first_in_second(&mut last, 100),
+         "the first call in a second runs"
+      );
+      assert!(
+         !first_in_second(&mut last, 100),
+         "a later batch inside the same second is skipped"
+      );
+      assert!(
+         first_in_second(&mut last, 101),
+         "the next second runs again"
+      );
    }
 
    #[test]
