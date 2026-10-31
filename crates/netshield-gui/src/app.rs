@@ -76,7 +76,8 @@ pub struct App {
    connection_logged: bool,
    /// The Connections history; its caps come from `prefs` and change live from the
    /// Settings page.
-   log: ConnectionLog,
+   /// Shared with the socket thread, which applies every decided flow to it while the window is hidden.
+   log: Arc<Mutex<ConnectionLog>>,
    /// The GUI's own preferences: the log's caps, loaded from the user's config file at
    /// startup and written back when a slider moves.
    prefs: Prefs,
@@ -200,6 +201,10 @@ impl App {
    /// Builds the app and, outside mock mode, starts talking to the daemon.
    pub fn new(cli: Cli) -> Self {
       let prefs = Prefs::load();
+      let log: Arc<Mutex<ConnectionLog>> = Arc::new(Mutex::new(ConnectionLog::new(
+         prefs.rows_per_app,
+         prefs.max_apps,
+      )));
       let ui_waker: UiWaker = Arc::new(Mutex::new(None));
       let alert_model: Arc<Mutex<AlertModel>> = Arc::new(Mutex::new(AlertModel::new()));
       let alert_height: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
@@ -242,6 +247,16 @@ impl App {
             ctx.request_repaint();
          }
       });
+      // Every decided flow lands in the shared log from the socket thread, so a hidden window
+      // keeps the log's per-application history instead of a queue's.
+      let on_connection: ipc::ConnectionSink = {
+         let log = Arc::clone(&log);
+         Arc::new(
+            move |event: &netshield_core::ipc::ConnectionEvent| {
+               log.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(event);
+            },
+         )
+      };
       // The derivation thread wakes the UI exactly as the socket thread does: a finished rebuild
       // has to reach a frame even when no input does.
       let work_waker: ipc::Waker = {
@@ -265,7 +280,12 @@ impl App {
                ctx.request_repaint();
             }
          });
-         let client = IpcClient::spawn(cli.socket.clone(), waker, on_prompt);
+         let client = IpcClient::spawn(
+            cli.socket.clone(),
+            waker,
+            on_prompt,
+            on_connection,
+         );
          client.send(&Request::Subscribe);
          client.send(&Request::Status);
          client.send(&Request::ListRules);
@@ -282,7 +302,7 @@ impl App {
          connected: false,
          refusal: None,
          connection_logged: false,
-         log: ConnectionLog::new(prefs.rows_per_app, prefs.max_apps),
+         log,
          prefs,
          prefs_save_at: None,
          work: save_work,
@@ -395,7 +415,7 @@ impl App {
          if attended {
             let (buffered, dropped) = client.take_backlog();
             if !buffered.is_empty() || dropped > 0 {
-               log::debug!(
+               log::info!(
                   "installed {} event(s) buffered while the window was not on screen ({dropped} older ones dropped)",
                   buffered.len()
                );
@@ -418,8 +438,9 @@ impl App {
                MockEvent::Closed(id) => self.remove_prompt(id),
             }
          }
+         let mut log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
          for event in self.mock_stream.connections(now) {
-            self.log.push(&event);
+            log.push(&event);
          }
       }
 
@@ -481,7 +502,6 @@ impl App {
       match event {
          ipc::IpcEvent::Connected(state) => self.set_connected(state),
          ipc::IpcEvent::Message(response) => match *response {
-            Response::Connection(event) => self.log.push(&event),
             Response::Status(status) => {
                self.mode = status.mode;
                // The daemon's mode is the truth, so a pending click has now been answered.
@@ -950,15 +970,20 @@ impl App {
    /// The selected page, or a placeholder for the slices that follow.
    fn page_content(&mut self, ui: &mut egui::Ui) {
       match self.page {
-         Page::Connections => ui::connections::show(
-            ui,
-            &self.log,
-            &self.rules,
-            &mut self.connections_expanded,
-            &mut self.connections_showing_all,
-            &mut self.connections_cache,
-            &mut self.connections_selection,
-         ),
+         Page::Connections => {
+            // Locked for the draw: the socket thread pushes flows into this log, and while the
+            // window is hidden nothing paints, so it never contends there.
+            let log = self.log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            ui::connections::show(
+               ui,
+               &log,
+               &self.rules,
+               &mut self.connections_expanded,
+               &mut self.connections_showing_all,
+               &mut self.connections_cache,
+               &mut self.connections_selection,
+            );
+         }
          Page::Rules => {
             let actions = ui::rules::show(ui, self.rules.as_slice(), &mut self.confirm);
             self.apply_actions(actions);
@@ -973,7 +998,11 @@ impl App {
          Page::Settings => {
             if ui::settings::show(ui, self.mode, &mut self.prefs) {
                // Live: the log keeps what still fits instead of waiting for a restart.
-               self.log.set_caps(self.prefs.rows_per_app, self.prefs.max_apps);
+               self
+                  .log
+                  .lock()
+                  .unwrap_or_else(std::sync::PoisonError::into_inner)
+                  .set_caps(self.prefs.rows_per_app, self.prefs.max_apps);
                self.prefs_save_at = Some(Instant::now() + PREFS_SAVE_DELAY);
                ui.ctx().request_repaint_after(PREFS_SAVE_DELAY);
             }

@@ -16,8 +16,8 @@ use std::thread;
 use std::time::Duration;
 
 use netshield_core::ipc::{
-   ClientKind, MAX_FRAME_LEN, PROTOCOL_VERSION, PromptRequest, Request, Response, decode_line,
-   encode_line,
+   ClientKind, ConnectionEvent, MAX_FRAME_LEN, PROTOCOL_VERSION, PromptRequest, Request, Response,
+   decode_line, encode_line,
 };
 
 /// How long one request write may block. Only a daemon that stopped reading fills the socket
@@ -43,6 +43,14 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// Called from the socket thread as soon as a prompt is decoded, before the UI is woken.
 pub type PromptHook = Arc<dyn Fn(&PromptRequest) + Send + Sync>;
 
+/// Called from the socket thread for every decided flow, attended or not.
+///
+/// The app applies these to the shared connection log here instead of queueing them for a
+/// frame. A window nobody is looking at paints nothing, and a queue would let one chatty
+/// process evict a quiet one's history before the window came back: the log's per-application
+/// rings are the retention policy, so they have to see every event.
+pub type ConnectionSink = Arc<dyn Fn(&ConnectionEvent) + Send + Sync>;
+
 /// What the connection thread tells the UI.
 #[derive(Debug)]
 pub enum IpcEvent {
@@ -54,16 +62,14 @@ pub enum IpcEvent {
 
 /// How many events the socket thread keeps for a window nobody is looking at.
 ///
-/// The connection history keeps 500 rows and drops the oldest, so a backlog of the same
-/// order loses nothing the live log would have kept. A snapshot of one kind is replaced
-/// rather than queued: only its newest copy is ever read.
+/// Only prompt closures pile up here, one per prompt id, and a snapshot of one kind replaces its
+/// predecessor. Connections are not queued at all: they go straight into the shared log, whose
+/// per-application rings are what keep or drop them (`ConnectionSink`).
 const HIDDEN_BACKLOG: usize = 512;
 
 /// What a kept event collapses on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
-   /// Rows pile up: every flow is a log entry.
-   Connection,
    /// Rows also pile up: only the id matters, and each is a different prompt.
    PromptClosed,
    Status,
@@ -79,7 +85,6 @@ fn kind(event: &IpcEvent) -> Kind {
    match event {
       IpcEvent::Connected(_) => Kind::Connected,
       IpcEvent::Message(response) => match &**response {
-         Response::Connection(_) => Kind::Connection,
          Response::PromptClosed { .. } => Kind::PromptClosed,
          Response::Status(_) => Kind::Status,
          Response::Rules { .. } => Kind::Rules,
@@ -124,7 +129,7 @@ impl Attend {
    fn stash(&self, event: IpcEvent) {
       let mut backlog = self.backlog.lock().unwrap_or_else(PoisonError::into_inner);
       let new_kind = kind(&event);
-      if matches!(new_kind, Kind::Connection | Kind::PromptClosed) {
+      if new_kind == Kind::PromptClosed {
          if backlog.len() >= HIDDEN_BACKLOG && backlog.pop_front().is_some() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
          }
@@ -261,13 +266,19 @@ impl IpcClient {
    ///
    /// Every queued event is followed by a `waker` call, because a hidden or minimised
    /// root window schedules no frame on its own and would otherwise not drain the queue.
-   pub fn spawn(socket_path: PathBuf, waker: Waker, on_prompt: PromptHook) -> Self {
+   pub fn spawn(
+      socket_path: PathBuf,
+      waker: Waker,
+      on_prompt: PromptHook,
+      on_connection: ConnectionSink,
+   ) -> Self {
       let writer = Writer::new();
       let (events, events_rx) = mpsc::channel();
       let attend = Arc::new(Attend::new());
       let thread_events = events.clone();
       let thread_waker = Arc::clone(&waker);
       let thread_prompt = Arc::clone(&on_prompt);
+      let thread_connection = Arc::clone(&on_connection);
       let thread_attend = Arc::clone(&attend);
       let thread_writer = writer.clone();
       let spawned = thread::Builder::new().name("netshield-ipc".to_owned()).spawn(move || {
@@ -277,6 +288,7 @@ impl IpcClient {
             &thread_events,
             &thread_waker,
             &thread_prompt,
+            &thread_connection,
             &thread_attend,
          )
       });
@@ -354,6 +366,7 @@ fn run(
    events: &Sender<IpcEvent>,
    waker: &Waker,
    on_prompt: &PromptHook,
+   on_connection: &ConnectionSink,
    attend: &Attend,
 ) {
    // A missing daemon is normal, so the path is named on the first failure only.
@@ -364,7 +377,15 @@ fn run(
             if !deliver(events, waker, attend, IpcEvent::Connected(true)) {
                return;
             }
-            let flow = converse(stream, writer, events, waker, on_prompt, attend);
+            let flow = converse(
+               stream,
+               writer,
+               events,
+               waker,
+               on_prompt,
+               on_connection,
+               attend,
+            );
             writer.detach();
             if flow == Flow::Stop {
                return;
@@ -396,6 +417,7 @@ fn converse(
    events: &Sender<IpcEvent>,
    waker: &Waker,
    on_prompt: &PromptHook,
+   on_connection: &ConnectionSink,
    attend: &Attend,
 ) -> Flow {
    let mut out = match stream.try_clone() {
@@ -440,7 +462,14 @@ fn converse(
          return Flow::Reconnect;
       }
       if buf.last() == Some(&b'\n') {
-         let flow = dispatch(&buf, events, waker, on_prompt, attend);
+         let flow = dispatch(
+            &buf,
+            events,
+            waker,
+            on_prompt,
+            on_connection,
+            attend,
+         );
          buf.clear();
          if flow != Flow::Continue {
             return flow;
@@ -455,6 +484,7 @@ fn dispatch(
    events: &Sender<IpcEvent>,
    waker: &Waker,
    on_prompt: &PromptHook,
+   on_connection: &ConnectionSink,
    attend: &Attend,
 ) -> Flow {
    let body = frame.strip_suffix(b"\n").unwrap_or(frame);
@@ -463,15 +493,27 @@ fn dispatch(
    }
    match decode_line::<Response>(body) {
       Ok(response) => {
-         if let Response::Prompt(prompt) = &response {
-            log::info!(
-               "prompt {} received for {} -> {} ({})",
-               prompt.id,
-               prompt.connection.app_name,
-               prompt.connection.domain.as_deref().unwrap_or("?"),
-               prompt.connection.remote_ip
-            );
-            on_prompt(prompt);
+         match &response {
+            Response::Prompt(prompt) => {
+               log::info!(
+                  "prompt {} received for {} -> {} ({})",
+                  prompt.id,
+                  prompt.connection.app_name,
+                  prompt.connection.domain.as_deref().unwrap_or("?"),
+                  prompt.connection.remote_ip
+               );
+               on_prompt(prompt);
+            }
+            Response::Connection(event) => {
+               // Applied on this thread: the log owns the retention policy. Only a window that
+               // is on screen needs the frame the wake schedules.
+               on_connection(event);
+               if attend.is_attended() {
+                  waker();
+               }
+               return Flow::Continue;
+            }
+            _ => {}
          }
          let event = IpcEvent::Message(Box::new(response));
          if deliver(events, waker, attend, event) {
@@ -490,8 +532,9 @@ fn dispatch(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::connlog::ConnectionLog;
    use netshield_core::connection::{Family, L4Proto};
-   use netshield_core::ipc::{ConnectionEvent, ConnectionView, Mode, StatusInfo};
+   use netshield_core::ipc::{ConnectionEvent, ConnectionView, Mode, Resolution, StatusInfo};
    use std::fs;
    use std::net::{IpAddr, Ipv4Addr};
    use std::os::unix::net::UnixListener;
@@ -553,11 +596,12 @@ mod tests {
       }
    }
 
-   fn connection(port: u16) -> Response {
+   /// A connection event for one named application, on a distinct port.
+   fn connection_for(app: &str, port: u16) -> Response {
       Response::Connection(ConnectionEvent {
          at: 1_700_000_000,
          connection: ConnectionView {
-            app_name: "brave-browser".to_owned(),
+            app_name: app.to_owned(),
             exe: None,
             pid: Some(4242),
             uid: Some(1000),
@@ -573,6 +617,29 @@ mod tests {
          matched_rule: None,
          via_prompt: false,
       })
+   }
+
+   /// A sink that records every event it is handed, so a test can see what the log received.
+   fn recording_sink() -> (ConnectionSink, Arc<Mutex<Vec<ConnectionEvent>>>) {
+      let seen: Arc<Mutex<Vec<ConnectionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+      let recording = Arc::clone(&seen);
+      let sink: ConnectionSink = Arc::new(move |event: &ConnectionEvent| {
+         recording.lock().expect("record the connection").push(event.clone());
+      });
+      (sink, seen)
+   }
+
+   /// The client most tests need: no prompt handling and no connection sink.
+   fn spawn_plain(path: PathBuf, waker: Waker) -> IpcClient {
+      IpcClient::spawn(path, waker, Arc::new(|_| {}), Arc::new(|_| {}))
+   }
+
+   /// A prompt closure event; `id` is what the backlog keeps or drops.
+   fn closed(id: u64) -> Response {
+      Response::PromptClosed {
+         id,
+         resolution: Resolution::SilentAutoAllowed,
+      }
    }
 
    fn status(rule_count: usize) -> Response {
@@ -646,7 +713,7 @@ mod tests {
       let path = socket_path("handshake");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (mut reader, mut writer) = accept_hello(&listener);
 
       let hello = hello();
@@ -673,7 +740,7 @@ mod tests {
    fn retries_until_the_daemon_appears() {
       let path = socket_path("retry");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
 
       wait_connected(&client, false);
 
@@ -689,7 +756,7 @@ mod tests {
       let path = socket_path("bad-frame");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
 
       writer.write_all(b"not json\n").expect("write the garbage");
@@ -719,7 +786,7 @@ mod tests {
          when.store(count.load(Ordering::SeqCst), Ordering::SeqCst);
          recorded.lock().expect("lock the hook").push(prompt.id);
       });
-      let client = IpcClient::spawn(path.clone(), waker, hook);
+      let client = IpcClient::spawn(path.clone(), waker, hook, Arc::new(|_| {}));
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -758,64 +825,55 @@ mod tests {
    }
 
    #[test]
-   fn events_are_kept_while_nobody_is_looking() {
-      let path = socket_path("hidden-backlog");
+   fn a_connection_is_applied_while_nobody_is_looking() {
+      let path = socket_path("hidden-sink");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let (sink, seen) = recording_sink();
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
       client.attend(false);
       let wakes = woken.load(Ordering::SeqCst);
       for port in 1..=3 {
-         let frame = connection(port);
+         let frame = connection_for("brave-browser", port);
          writer
             .write_all(&encode_line(&frame).expect("encode the connection"))
             .expect("write the connection");
       }
 
       let deadline = Instant::now() + WAIT;
-      let mut kept = Vec::new();
-      let mut dropped = 0;
-      while Instant::now() < deadline && kept.len() < 3 {
-         assert!(
-            client.poll().is_none(),
-            "an unattended window must not be woken by routine traffic"
-         );
-         let (mut events, lost) = client.take_backlog();
-         dropped += lost;
-         kept.append(&mut events);
+      while Instant::now() < deadline && seen.lock().expect("read the sink").len() < 3 {
          thread::sleep(Duration::from_millis(20));
       }
 
+      let ports: Vec<u16> = seen
+         .lock()
+         .expect("read the sink")
+         .iter()
+         .map(|event| event.connection.remote_port)
+         .collect();
+      assert_eq!(
+         ports,
+         vec![1, 2, 3],
+         "every flow must reach the log"
+      );
       assert_eq!(
          woken.load(Ordering::SeqCst),
          wakes,
-         "routine traffic must not wake an unattended window"
+         "an unattended window must not be woken by routine traffic"
       );
-      assert_eq!(
-         kept.len(),
-         3,
-         "the three connection events must be kept"
-      );
-      let ports: Vec<u16> = kept
-         .iter()
-         .map(|event| match event {
-            IpcEvent::Message(response) => match &**response {
-               Response::Connection(event) => event.connection.remote_port,
-               other => panic!("expected a connection, got {other:?}"),
-            },
-            other => panic!("expected a message, got {other:?}"),
-         })
-         .collect();
-      assert_eq!(ports, vec![1, 2, 3]);
-      let (rest, more) = client.take_backlog();
       assert!(
-         rest.is_empty(),
-         "the backlog must be drained by the take"
+         client.poll().is_none(),
+         "a connection must not travel through the event queue"
       );
-      assert_eq!(dropped + more, 0, "three events fit the backlog");
+      let (kept, dropped) = client.take_backlog();
+      assert!(
+         kept.is_empty(),
+         "the backlog keeps no connections: the log is the queue"
+      );
+      assert_eq!(dropped, 0);
 
       fs::remove_file(&path).expect("remove the socket");
    }
@@ -825,7 +883,7 @@ mod tests {
       let path = socket_path("hidden-prompt");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -860,16 +918,16 @@ mod tests {
       let path = socket_path("hidden-cap");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
       client.attend(false);
       for port in 0..(HIDDEN_BACKLOG as u16 + 5) {
-         let frame = connection(port);
+         let frame = closed(port as u64);
          writer
-            .write_all(&encode_line(&frame).expect("encode the connection"))
-            .expect("write the connection");
+            .write_all(&encode_line(&frame).expect("encode the closed prompt"))
+            .expect("write the closed prompt");
       }
 
       // Let the socket thread stash the whole burst before draining, or the drain would keep
@@ -902,26 +960,134 @@ mod tests {
          HIDDEN_BACKLOG,
          "the backlog keeps its newest events"
       );
-      let ports: Vec<u16> = kept
+      let ids: Vec<u64> = kept
          .iter()
          .map(|event| match event {
             IpcEvent::Message(response) => match &**response {
-               Response::Connection(event) => event.connection.remote_port,
-               other => panic!("expected a connection, got {other:?}"),
+               Response::PromptClosed { id, .. } => *id,
+               other => panic!("expected a closed prompt, got {other:?}"),
             },
             other => panic!("expected a message, got {other:?}"),
          })
          .collect();
       assert_eq!(
-         ports.first().copied(),
+         ids.first().copied(),
          Some(5),
          "the oldest were dropped"
       );
       assert_eq!(
-         ports.last().copied(),
-         Some(HIDDEN_BACKLOG as u16 + 4),
+         ids.last().copied(),
+         Some(HIDDEN_BACKLOG as u64 + 4),
          "the newest were kept"
       );
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   #[test]
+   fn a_connection_wakes_a_window_that_is_on_screen() {
+      let path = socket_path("visible-sink");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, woken) = counted();
+      let (sink, seen) = recording_sink();
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
+      let (_reader, mut writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+
+      client.attend(true);
+      let wakes = woken.load(Ordering::SeqCst);
+      let frame = connection_for("brave-browser", 1);
+      writer
+         .write_all(&encode_line(&frame).expect("encode the connection"))
+         .expect("write the connection");
+
+      let deadline = Instant::now() + WAIT;
+      while Instant::now() < deadline && seen.lock().expect("read the sink").is_empty() {
+         thread::sleep(Duration::from_millis(20));
+      }
+      assert_eq!(
+         seen.lock().expect("read the sink").len(),
+         1,
+         "the flow must reach the log"
+      );
+      assert!(
+         woken.load(Ordering::SeqCst) > wakes,
+         "a window on screen must be woken for the new row"
+      );
+      assert!(
+         client.poll().is_none(),
+         "the wake is the frame; the row still does not travel through the queue"
+      );
+
+      fs::remove_file(&path).expect("remove the socket");
+   }
+
+   /// The owner's report: hidden to tray, a browser's new connections never appeared because the
+   /// torrent client's flood had evicted them from the shared backlog. The log's per-application
+   /// rings must decide what survives, not a queue's order.
+   #[test]
+   fn a_flood_does_not_evict_a_quiet_app_while_hidden() {
+      const PER_APP: usize = 50;
+      const QUIET: usize = 6;
+      let path = socket_path("hidden-flood");
+      let listener = UnixListener::bind(&path).expect("bind the listener");
+      let (waker, woken) = counted();
+      let log = Arc::new(Mutex::new(ConnectionLog::new(PER_APP, 8)));
+      let sink: ConnectionSink = {
+         let log = Arc::clone(&log);
+         Arc::new(move |event: &ConnectionEvent| {
+            log.lock().expect("apply the flow").push(event);
+         })
+      };
+      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}), sink);
+      let (_reader, mut writer) = accept_hello(&listener);
+      wait_connected(&client, true);
+
+      client.attend(false);
+      let wakes = woken.load(Ordering::SeqCst);
+      for n in 0..600_u16 {
+         let flood = connection_for("qbittorrent", n);
+         writer
+            .write_all(&encode_line(&flood).expect("encode the flood"))
+            .expect("write the flood");
+         if n % 100 == 0 {
+            let quiet = connection_for("brave", n);
+            writer
+               .write_all(&encode_line(&quiet).expect("encode the browser row"))
+               .expect("write the browser row");
+         }
+      }
+
+      let deadline = Instant::now() + WAIT;
+      while Instant::now() < deadline && log.lock().expect("read the log").len() < PER_APP + QUIET {
+         thread::sleep(Duration::from_millis(20));
+      }
+
+      let (quiet_rows, flood_rows) = {
+         let log = log.lock().expect("read the log");
+         let quiet = log.rows().filter(|row| row.app == "brave").count();
+         let flood = log.rows().filter(|row| row.app == "qbittorrent").count();
+         (quiet, flood)
+      };
+      assert_eq!(
+         quiet_rows, QUIET,
+         "the quiet app keeps every row it made"
+      );
+      assert_eq!(
+         flood_rows, PER_APP,
+         "the flood app keeps its own cap, and only its own"
+      );
+      assert_eq!(
+         woken.load(Ordering::SeqCst),
+         wakes,
+         "600 flows must paint nothing while the window is hidden"
+      );
+      let (kept, dropped) = client.take_backlog();
+      assert!(
+         kept.is_empty(),
+         "no connection may be queued for a later frame"
+      );
+      assert_eq!(dropped, 0);
 
       fs::remove_file(&path).expect("remove the socket");
    }
@@ -931,7 +1097,7 @@ mod tests {
       let path = socket_path("hidden-snapshot");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
@@ -976,7 +1142,7 @@ mod tests {
       let path = socket_path("pending-flush");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
 
       // Both are sent before the thread has a socket to write them to.
       assert!(client.send(&Request::Status));
@@ -1005,7 +1171,7 @@ mod tests {
       let path = socket_path("silent-read");
       let listener = UnixListener::bind(&path).expect("bind the listener");
       let (waker, _woken) = counted();
-      let client = IpcClient::spawn(path.clone(), waker, Arc::new(|_| {}));
+      let client = spawn_plain(path.clone(), waker);
       let (_reader, mut writer) = accept_hello(&listener);
       wait_connected(&client, true);
 
