@@ -1187,8 +1187,11 @@ fn dispatch(id: u64, request: Request, shared: &Shared, policy: &GuiPolicy, peer
             "refusing a policy change from client {id} (pid {}): {reason}",
             peer.pid
          );
+         // A refusal of the request, not of the peer: the connection stays open so the client can
+         // read the error and keep its subscription. Closing it makes the GUI read EOF as "daemon
+         // stopped" and raise the NOT-filtering banner over a request it was not allowed to make.
          shared.send(id, &Response::Error { message: reason });
-         return false;
+         return true;
       }
    }
 
@@ -1871,6 +1874,54 @@ mod tests {
          Mode::Alert,
          "a refused SetMode must not change the published mode"
       );
+
+      drop(client);
+      reader.join().expect("reader thread");
+   }
+
+   #[test]
+   fn a_refused_policy_change_keeps_the_connection() {
+      let shared = shared();
+      let handle = IpcHandle {
+         shared: Arc::clone(&shared),
+      };
+      handle.set_status(status(Mode::Alert, 0));
+
+      let (server, mut client) = pair();
+      let uid = our_uid().expect("our own uid");
+      client.set_read_timeout(Some(StdDuration::from_secs(5))).expect("read timeout");
+      let reader = thread::spawn(move || serve(server, shared, policy(Some(uid))));
+
+      client.write_all(&hello(PROTOCOL_VERSION)).expect("hello");
+      client
+         .write_all(&encode_line(&Request::SetMode { mode: Mode::Silent }).expect("set mode"))
+         .expect("send");
+
+      let mut buffered = Vec::new();
+      match read_response(&mut client, &mut buffered) {
+         Response::Error { message } => assert!(
+            message.contains("netshieldctl set-mode"),
+            "the refusal must say how root makes the change, got: {message}"
+         ),
+         other => panic!("expected the SetMode refusal, got {other:?}"),
+      }
+
+      // The same socket, after the refusal: a refusal is of the request, not of the peer, so the
+      // connection must still be there to read from. If it had been closed this read would hit
+      // EOF and the GUI would read that as "daemon stopped" and raise its NOT-filtering banner.
+      client
+         .write_all(&encode_line(&Request::Status).expect("status"))
+         .expect("send on the refused connection");
+      match read_response(&mut client, &mut buffered) {
+         Response::Status(status) => assert_eq!(
+            status.mode,
+            Mode::Alert,
+            "a refused SetMode must not change the published mode"
+         ),
+         other => {
+            panic!("the connection must survive the refusal; read {other:?} instead of a status")
+         }
+      }
 
       drop(client);
       reader.join().expect("reader thread");
