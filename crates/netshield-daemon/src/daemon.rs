@@ -252,15 +252,22 @@ fn adopt_or_install(config: &Config) -> Result<bool, DaemonError> {
    }
 
    info!("table inet {table} is absent or does not verify; installing it");
-   firewall::install(
-      table,
+   let (queue, dns_queue, filter_loopback) = install_args(config);
+   firewall::install(table, queue, dns_queue, filter_loopback, true)?;
+   firewall::verify(table, queue, dns_queue)?;
+   Ok(true)
+}
+
+/// The three values both install paths must take from the configuration.
+///
+/// `adopt_or_install` and `reinstall_table` used to pass their own literals, which is how
+/// `--filter-loopback` came to be honoured by `--probe` alone: two sites, one of them wrong.
+fn install_args(config: &Config) -> (u16, u16, bool) {
+   (
       config.queue_num,
       config.dns_queue_num,
-      false,
-      true,
-   )?;
-   firewall::verify(table, config.queue_num, config.dns_queue_num)?;
-   Ok(true)
+      config.filter_loopback,
+   )
 }
 
 /// The warning emitted when a prompt is raised with no GUI attached.
@@ -911,9 +918,8 @@ impl Daemon {
    /// operator-facing error, and repeating it every 30 s would bury it.
    fn reinstall_table(&mut self) {
       let table = self.config.table_name().to_owned();
-      let queue = self.config.queue_num;
-      let dns_queue = self.config.dns_queue_num;
-      let result = firewall::install(&table, queue, dns_queue, false, true)
+      let (queue, dns_queue, filter_loopback) = install_args(&self.config);
+      let result = firewall::install(&table, queue, dns_queue, filter_loopback, true)
          .and_then(|()| firewall::verify(&table, queue, dns_queue));
       match result {
          Ok(()) => {
@@ -2335,6 +2341,7 @@ fn single_host_net(addr: IpAddr) -> Option<IpNet> {
    IpNet::new(addr, prefix).ok()
 }
 
+
 /// Spawns the proc connector reader: seed the identity cache, then apply every event.
 ///
 /// A kernel without `CONFIG_PROC_EVENTS` cannot be distinguished from a transient socket
@@ -2731,6 +2738,14 @@ mod tests {
    use netshield_core::rule::Duration as RuleDuration;
 
    use super::*;
+
+   #[test]
+   fn install_args_reports_the_configured_loopback_filter() {
+      let mut config = Config::default();
+      assert_eq!(install_args(&config), (0, 1, false));
+      config.filter_loopback = true;
+      assert_eq!(install_args(&config), (0, 1, true));
+   }
 
    #[test]
    fn only_a_configured_resolver_may_teach_the_cache() {

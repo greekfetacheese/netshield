@@ -314,7 +314,9 @@ fn is_root() -> bool {
 
 /// Loads the configuration and dispatches to the daemon or to `--check`.
 fn load_and_run(args: &Args) -> Result<(), String> {
-   let config = Config::load(&args.config).map_err(|err| err.to_string())?;
+   let mut config = Config::load(&args.config).map_err(|err| err.to_string())?;
+   // The flag is the operator's answer; the config file may carry it too, and the CLI wins.
+   config.filter_loopback = args.filter_loopback;
    let rules = args.rules.clone().unwrap_or_else(|| config.rules_path.clone());
    let socket = args.socket.clone().unwrap_or_else(|| config.socket_path.clone());
 
