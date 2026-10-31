@@ -57,6 +57,21 @@ impl IpNet {
       })
    }
 
+   /// Builds the single-address network for `addr`: prefix 32 for IPv4, 128 for IPv6.
+   ///
+   /// Infallible by construction — the prefix is the family's own width, so nothing here can
+   /// fail the way [`IpNet::new`] validates a caller's prefix. A rule scoped to "the address
+   /// this flow reached" must not have a failure path that could widen it.
+   pub fn host(addr: IpAddr) -> Self {
+      let prefix = match addr {
+         IpAddr::V4(_) => 32,
+         IpAddr::V6(_) => 128,
+      };
+      // The prefix is the full width, so masking is the identity and the invariant
+      // `IpNet::new` documents (stored address is masked) holds unchanged.
+      Self { addr, prefix }
+   }
+
    /// Returns whether `ip` falls inside this network.
    ///
    /// Addresses from the other family are never contained; there is no implicit
@@ -168,6 +183,17 @@ mod tests {
 
    fn ip(s: &str) -> IpAddr {
       s.parse().expect("test address must parse")
+   }
+
+   #[test]
+   fn a_host_network_is_one_address() {
+      let v4 = IpNet::host(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)));
+      assert_eq!(v4.prefix, 32);
+      assert!(v4.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))));
+      assert!(!v4.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 6))));
+      let v6 = IpNet::host(IpAddr::V6(Ipv6Addr::LOCALHOST));
+      assert_eq!(v6.prefix, 128);
+      assert!(v6.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
    }
 
    #[test]

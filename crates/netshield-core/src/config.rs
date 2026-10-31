@@ -139,6 +139,13 @@ pub struct Config {
    /// is the historical behaviour and is reported at startup, never silently assumed.
    #[serde(default)]
    pub dns_servers: Vec<IpAddr>,
+   /// Whether the queue skips loopback traffic (`--filter-loopback`).
+   ///
+   /// `false` is the documented default and the shape every installed config predates: loopback is
+   /// returned on before the queue, so a local forwarder is not filtered. `#[serde(default)]` keeps
+   /// a config written before this key loading with the historical behaviour.
+   #[serde(default)]
+   pub filter_loopback: bool,
    pub log_level: LogLevel,
    /// Unix socket the GUI connects to.
    pub socket_path: PathBuf,
@@ -165,6 +172,7 @@ impl Default for Config {
          allowed_uid: None,
          gui_path: None,
          dns_servers: Vec::new(),
+         filter_loopback: false,
          log_level: LogLevel::Info,
          socket_path: PathBuf::from("/run/netshield/control.sock"),
          rules_path: PathBuf::from("/etc/netshield/rules.db"),
@@ -334,6 +342,22 @@ mod tests {
          PathBuf::from("/etc/netshield/rules.db")
       );
       assert!(config.validate().is_ok());
+   }
+
+   #[test]
+   fn filter_loopback_defaults_off_and_survives_a_round_trip() {
+      let config = Config::default();
+      assert!(
+         !config.filter_loopback,
+         "loopback stays unfiltered unless asked"
+      );
+      let json = serde_json::to_string(&config).expect("serialise the default config");
+      let back: Config = serde_json::from_str(&json).expect("read our own default back");
+      assert!(!back.filter_loopback);
+      let mut value: serde_json::Value = serde_json::from_str(&json).expect("json value");
+      value["filter_loopback"] = serde_json::Value::Bool(true);
+      let with: Config = serde_json::from_value(value).expect("load the key");
+      assert!(with.filter_loopback);
    }
 
    #[test]
