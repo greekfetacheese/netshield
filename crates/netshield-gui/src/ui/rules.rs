@@ -426,19 +426,28 @@ fn action_field(ui: &mut Ui, draft: &mut Draft) {
    });
 }
 
-/// The duration row: the three durations the model offers, in the table's own wording.
+/// The duration row, in the table's own wording.
+///
+/// `Forever` is selectable only while it is what the draft already holds: a rule that is already
+/// permanent must stay editable and keep its duration, while a new permanent rule is a root
+/// action — the daemon refuses one from an unprivileged peer, and a click here is not evidence of
+/// consent. Once the draft leaves `Forever` it cannot come back without reopening the rule.
 fn duration_field(ui: &mut Ui, draft: &mut Draft) {
    ui.horizontal(|ui| {
       for duration in [Duration::Once, Duration::Session, Duration::Forever] {
          let selected = draft.duration == duration;
-         if ui
-            .add(Button::selectable(
-               selected,
-               duration_label(duration),
-            ))
-            .clicked()
-         {
+         let selectable = duration != Duration::Forever || draft.duration == Duration::Forever;
+         let response = ui.add_enabled(
+            selectable,
+            Button::selectable(selected, duration_label(duration)),
+         );
+         if response.clicked() {
             draft.duration = duration;
+         }
+         if !selectable {
+            response.on_disabled_hover_text(
+               "a permanent rule is a root action: sudo netshieldctl allow --duration forever",
+            );
          }
       }
    });

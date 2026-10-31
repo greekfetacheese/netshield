@@ -205,8 +205,8 @@ pub fn waiting_label(waiting: usize) -> Option<String> {
 /// `duration` starts at `Session` ("until restart"). `scope` starts at `Any`, which is the
 /// broad, app-wide decision for an attributed app; [`AlertState::effective_scope`] resolves
 /// it per prompt, so an unattributed flow defaults to the narrowest destination scope that
-/// is available instead. `Forever` stays selectable but is never the default: an accidental
-/// click must not outlive the daemon.
+/// is available instead. `Forever` is never offered: a permanent rule is a root action
+/// (`sudo netshieldctl …`), so no click on this window can make one.
 #[derive(Debug)]
 pub struct AlertState {
    pub duration: Duration,
@@ -946,6 +946,10 @@ fn protocol_line(view: &ConnectionView) -> String {
 ///
 /// Radios rather than a pill row: they say the three choices are mutually exclusive, and
 /// there is no orphan `For` label left over from the old layout.
+///
+/// `Forever` is not offered: a permanent rule is a root action (`sudo netshieldctl …`), because
+/// a click on this window is not evidence of the owner's intent on a display where any client of
+/// the session can synthesise that click.
 fn duration_section(ui: &mut Ui, state: &mut AlertState) {
    let theme = Theme::current(ui.ctx());
    ui.label(
@@ -959,7 +963,6 @@ fn duration_section(ui: &mut Ui, state: &mut AlertState) {
       for (value, label) in [
          (Duration::Once, "Once"),
          (Duration::Session, "Until restart"),
-         (Duration::Forever, "Forever"),
       ] {
          ui.radio_value(&mut state.duration, value, label);
       }
