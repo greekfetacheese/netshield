@@ -409,18 +409,21 @@ fn peer_provenance(pid: u32, uid: u32, own_exe: Option<&Path>) -> Result<(), Str
 
 /// Why a request needs root, or `None` when the desktop user may make it.
 ///
-/// Three requests change what the firewall permits in a way that outlives the click or the
-/// session: turning enforcement off (`SetMode`), making a rule permanent (`Forever`), and
-/// withdrawing a denial. On a desktop where any process of the user's uid can start the GUI
-/// with its own loader, or click its window, none of them is evidence of the owner's intent —
-/// so they are made from a root shell (`netshieldctl`), which an unprivileged process cannot
-/// forge. Everything else stays available to the GUI: answering a prompt, a session rule, an
-/// edit that keeps an existing permanent rule permanent, and deleting an allow.
+/// Two requests change what the firewall permits in a way that outlives the click or the session,
+/// and neither is anchored to a prompt the user was looking at: turning enforcement off (`SetMode`)
+/// and writing a rule by hand (`UpsertRule` with `Forever`). On a desktop where any process of the
+/// user's uid can start the GUI with its own loader, or click its window, neither is evidence of the
+/// owner's intent — so they are made from a root shell (`netshieldctl`), which an unprivileged
+/// process cannot forge.
 ///
-/// `existing` is the rule set the daemon is serving, used for the two cases that depend on
-/// what is already stored. The toggle is gated in both widening directions — a denial switched
-/// off and an allow switched back on — because the daemon writes it to the store, so either
-/// survives a restart.
+/// A prompt answer may be permanent. The peer is already provenance-checked before this runs, and
+/// the permanence it creates is the one the user asked for at that prompt, so `Decide` is not gated
+/// here — including `Decide` with `Duration::Forever`. What is gated is the same rule written without
+/// a prompt in front of anyone.
+///
+/// `existing` is the rule set the daemon is serving, used for the two cases that depend on what is
+/// already stored. The toggle is gated in both widening directions — a denial switched off and an
+/// allow switched back on — because the daemon writes it to the store, so either survives a restart.
 fn persistence_refusal(peer_uid: u32, request: &Request, existing: &[Rule]) -> Option<String> {
    const PERMANENT: &str = "a permanent rule requires root: `sudo netshieldctl allow --exe <path> --dest <scope> --duration forever`";
 
@@ -432,7 +435,6 @@ fn persistence_refusal(peer_uid: u32, request: &Request, existing: &[Rule]) -> O
       Request::SetMode { .. } => Some(
          "changing the mode requires root: `sudo netshieldctl set-mode alert|silent`".to_owned(),
       ),
-      Request::Decide(decide) if decide.duration == Duration::Forever => Some(PERMANENT.to_owned()),
       Request::UpsertRule { rule } if rule.duration == Duration::Forever => {
          let unchanged = existing.iter().any(|stored| {
             stored.id == rule.id
@@ -2374,6 +2376,21 @@ mod tests {
       assert!(
          refusal.contains("permanent"),
          "the refusal must say the rule is permanent, got: {refusal}"
+      );
+   }
+
+   #[test]
+   fn a_permanent_decision_from_a_desktop_peer_is_allowed() {
+      let decide = Request::Decide(DecideRequest {
+         prompt_id: 9,
+         action: Action::Allow,
+         duration: Duration::Forever,
+         scope: ScopeChoice::AnyConnection,
+      });
+      assert_eq!(
+         persistence_refusal(1000, &decide, &[]),
+         None,
+         "a permanent answer at a prompt is the user's decision, not a socket client's"
       );
    }
 
