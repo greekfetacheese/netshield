@@ -1947,7 +1947,8 @@ enum CandidateOwner {
    Missing,
 }
 
-/// Tries candidates in order until one yields an owner that agrees with `uid`.
+/// Resolves the candidate inodes to the one owner that agrees with `uid`, and refuses when more
+/// than one does.
 ///
 /// `owner_of` is injected so this selection logic can be exercised without a live `/proc`.
 /// Two candidates of the same uid are ambiguous, because the uid is the same identity for

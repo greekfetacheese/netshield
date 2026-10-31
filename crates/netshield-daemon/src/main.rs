@@ -312,11 +312,21 @@ fn is_root() -> bool {
    ipc_server::effective_uid() == Some(0)
 }
 
+/// Applies the flags that override a configuration value.
+///
+/// `--filter-loopback` is a plain flag, so it cannot distinguish "not given" from "given false";
+/// assigning it unconditionally would make the configuration key inert, which is what an earlier
+/// version did.
+fn apply_cli_overrides(config: &mut Config, args: &Args) {
+   if args.filter_loopback {
+      config.filter_loopback = true;
+   }
+}
+
 /// Loads the configuration and dispatches to the daemon or to `--check`.
 fn load_and_run(args: &Args) -> Result<(), String> {
    let mut config = Config::load(&args.config).map_err(|err| err.to_string())?;
-   // The flag is the operator's answer; the config file may carry it too, and the CLI wins.
-   config.filter_loopback = args.filter_loopback;
+   apply_cli_overrides(&mut config, args);
    let rules = args.rules.clone().unwrap_or_else(|| config.rules_path.clone());
    let socket = args.socket.clone().unwrap_or_else(|| config.socket_path.clone());
 
@@ -511,6 +521,30 @@ mod tests {
       assert_eq!((parsed.queue, parsed.dns_queue), (0, 1));
       assert!(!parsed.filter_loopback);
       assert_eq!(parsed.count, None);
+   }
+
+   #[test]
+   fn the_loopback_flag_only_raises_the_configured_value() {
+      let mut config = Config {
+         filter_loopback: true,
+         ..Config::default()
+      };
+      apply_cli_overrides(&mut config, &args(&[]).expect("defaults"));
+      assert!(
+         config.filter_loopback,
+         "an absent flag must not clear the configured value"
+      );
+
+      let mut config = Config::default();
+      apply_cli_overrides(
+         &mut config,
+         &args(&["--filter-loopback"]).expect("flag"),
+      );
+      assert!(config.filter_loopback, "a passed flag raises it");
+
+      let mut config = Config::default();
+      apply_cli_overrides(&mut config, &args(&[]).expect("defaults"));
+      assert!(!config.filter_loopback, "the default stays off");
    }
 
    #[test]
