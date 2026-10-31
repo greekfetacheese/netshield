@@ -129,6 +129,9 @@ pub struct App {
    /// Synthetic prompt and connection stream; always present in `--mock`.
    mock_stream: Mock,
    mode: Mode,
+   /// The mode a click asked for, until the daemon's answer replaces it: a window with nothing to
+   /// animate is not repainted, so without this the switch sits still until the poll comes round.
+   pending_mode: Option<Mode>,
    /// Latest snapshot; `None` until the daemon answers the first `Status` request.
    status: Option<StatusInfo>,
    next_refresh: Instant,
@@ -298,6 +301,7 @@ impl App {
          alert_registered: false,
          mock_stream: Mock::new(),
          mode: Mode::Alert,
+         pending_mode: None,
          status: None,
          next_refresh: Instant::now() + REFRESH_EVERY,
          rules: Ruleset::default(),
@@ -461,6 +465,7 @@ impl App {
    /// starts `false`; the retry loop repeats it every second, and only a change after the
    /// first report is news.
    fn set_connected(&mut self, connected: bool) {
+      self.pending_mode = None;
       if !self.connection_logged || connected != self.connected {
          log::info!("daemon connected: {connected}");
          self.connection_logged = true;
@@ -479,6 +484,8 @@ impl App {
             Response::Connection(event) => self.log.push(&event),
             Response::Status(status) => {
                self.mode = status.mode;
+               // The daemon's mode is the truth, so a pending click has now been answered.
+               self.pending_mode = None;
                self.status = Some(status);
             }
             Response::Prompt(prompt) => self.enqueue_prompt(prompt),
@@ -486,6 +493,8 @@ impl App {
             Response::Rules { rules } => self.rules.install(rules),
             Response::Error { message } => {
                log::warn!("the daemon refused a request: {message}");
+               // A refused switch must not stay where the click put it.
+               self.pending_mode = None;
                self.refusal = Some((message, Instant::now()));
             }
             _ => {}
@@ -846,7 +855,7 @@ impl App {
                egui::Layout::right_to_left(egui::Align::Center),
                |ui| {
                   ui.add_space(12.0);
-                  let mut ask = self.mode == Mode::Alert;
+                  let mut ask = self.pending_mode.unwrap_or(self.mode) == Mode::Alert;
                   let switch = elegance::Switch::new(&mut ask, "Ask before connecting");
                   if ui.add_enabled(!self.mock, switch).changed() {
                      requested = Some(if ask { Mode::Alert } else { Mode::Silent });
@@ -872,7 +881,13 @@ impl App {
       if let Some(mode) = requested
          && let Some(client) = &self.ipc
       {
+         // Where the click put it, until the daemon answers: a `Status` confirms it, an `Error`
+         // takes it back and the banner says why. Asking for `Status` here means the client never
+         // depends on the five-second tick — the answer is a socket frame, and a frame wakes the UI.
+         self.pending_mode = Some(mode);
+         ui.ctx().request_repaint();
          client.send(&Request::SetMode { mode });
+         client.send(&Request::Status);
       }
    }
 
@@ -1581,6 +1596,60 @@ mod tests {
          presented.dests.len(),
          2,
          "the alert state gets the whole group, not just the first destination"
+      );
+   }
+
+   /// A status frame answering the poll, with only the mode under test.
+   fn status_info(mode: Mode) -> StatusInfo {
+      StatusInfo {
+         daemon_pid: 0,
+         mode,
+         rule_count: 0,
+         pending_prompts: 0,
+         queue_num: 0,
+         queue_drops: 0,
+         table_verified: false,
+         mutation_gated: false,
+         started_at: 0,
+      }
+   }
+
+   #[test]
+   fn a_mode_click_shows_at_once_and_reconciles_with_the_daemon() {
+      let mut app = app();
+      app.pending_mode = Some(Mode::Silent);
+      assert_eq!(
+         app.pending_mode.unwrap_or(app.mode),
+         Mode::Silent,
+         "the switch must show the click before the daemon answers"
+      );
+      app.install(ipc::IpcEvent::Message(Box::new(
+         Response::Status(status_info(Mode::Alert)),
+      )));
+      assert_eq!(app.mode, Mode::Alert);
+      assert_eq!(
+         app.pending_mode, None,
+         "a status answers the click"
+      );
+   }
+
+   #[test]
+   fn a_refused_mode_click_goes_back_to_the_daemon_mode() {
+      let mut app = app();
+      app.pending_mode = Some(Mode::Silent);
+      app.install(ipc::IpcEvent::Message(Box::new(
+         Response::Error {
+            message: "changing the mode requires root".to_owned(),
+         },
+      )));
+      assert_eq!(
+         app.pending_mode, None,
+         "a refusal takes the switch back"
+      );
+      assert_eq!(
+         app.mode,
+         Mode::Alert,
+         "and the daemon's mode is what stands"
       );
    }
 }
