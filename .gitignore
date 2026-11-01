@@ -3,3 +3,5 @@
 
 # Python bytecode from the dev/ harnesses
 dev/__pycache__/
+
+packaging/deb/out/

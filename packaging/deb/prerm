@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stops the daemon before its files go away. The unit stays enabled here; postrm disables it,
+# so a failed unpack leaves the service able to start again.
+set -e
+
+case "$1" in
+   remove|deconfigure)
+      if [ -d /run/systemd/system ]; then
+         systemctl stop netshield.service || true
+      fi
+      ;;
+   *)
+      ;;
+esac
+
+exit 0

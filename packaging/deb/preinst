@@ -1,0 +1,39 @@
+#!/bin/sh
+# Refuses to unpack over a source install. /usr/local/bin wins on PATH and a unit in
+# /etc/systemd/system wins over the package's unit in /usr/lib/systemd/system, so the two
+# together would leave this package installed while the old daemon kept running, with the
+# control socket pinned to a gui_path the package does not own.
+set -e
+
+case "$1" in
+   install|upgrade) ;;
+   *) exit 0 ;;
+esac
+
+stale=""
+for path in /usr/local/bin/netshieldd /usr/local/bin/netshield-gui /usr/local/bin/netshieldctl \
+            /etc/systemd/system/netshield.service; do
+   if [ -e "$path" ]; then
+      stale="$stale
+  $path"
+   fi
+done
+
+if [ -n "$stale" ]; then
+   cat >&2 <<EOF
+netshield: a source install is present:$stale
+
+Two installs cannot share one firewall: /usr/local/bin takes precedence on PATH and
+/etc/systemd/system takes precedence over the package's unit, so this package's daemon
+would never run while its binaries still replaced the ones in use.
+
+Remove the source install first — it keeps /etc/netshield and its rules:
+
+  sudo packaging/install.sh --uninstall          # from the NetShield checkout
+
+then install this package again. Its postinst adopts the existing config.
+EOF
+   exit 1
+fi
+
+exit 0
