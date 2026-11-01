@@ -22,6 +22,8 @@ REVISION="1"
 ARCH="$(dpkg --print-architecture)"
 MAINTAINER="Michalis Molfetas <greekfetacheese@proton.me>"
 KEEP=0
+LIBC_FLOOR=""
+LIBC_FLOOR_SOURCE=""
 
 usage() {
    cat <<'EOF'
@@ -38,6 +40,8 @@ Options:
   --out DIR           output directory (default: packaging/deb/out)
   --arch ARCH         architecture (default: dpkg --print-architecture)
   --maintainer TEXT   Maintainer field (default: Michalis Molfetas <...>)
+  --glibc VERSION     override the glibc floor written into Depends (default: read from
+                      the binaries, which is what they actually require)
   --keep              keep the staging tree and print its path
   --help              print this help and exit
 EOF
@@ -99,6 +103,17 @@ while [ "$#" -gt 0 ]; do
          ARCH="${1#--arch=}"
          shift
          ;;
+      --glibc)
+         [ "$#" -ge 2 ] || fail "--glibc needs a version, e.g. 2.31"
+         LIBC_FLOOR="$2"
+         LIBC_FLOOR_SOURCE="--glibc"
+         shift 2
+         ;;
+      --glibc=*)
+         LIBC_FLOOR="${1#--glibc=}"
+         LIBC_FLOOR_SOURCE="--glibc"
+         shift
+         ;;
       --maintainer)
          [ "$#" -ge 2 ] || fail "--maintainer needs a value"
          MAINTAINER="$2"
@@ -133,6 +148,30 @@ command -v dpkg-deb >/dev/null 2>&1 || fail "dpkg-deb is not installed"
 for binary in netshieldd netshield-gui netshieldctl; do
    [ -x "$BIN_DIR/$binary" ] || fail "missing prebuilt binary: $BIN_DIR/$binary (run 'cargo build --profile prod', or pass --bin-dir)"
 done
+
+# The floor belongs to the binaries, not to the script: a package must never claim an older
+# glibc than its executables reference, and it must not claim a newer one either (the whole
+# point of the zigbuild target in the README is a package that installs on 2.31).
+if [ -z "$LIBC_FLOOR" ]; then
+   command -v objdump >/dev/null 2>&1 || fail "objdump is not installed (binutils); pass --glibc to set the floor by hand"
+   for binary in netshieldd netshield-gui netshieldctl; do
+      used="$(objdump -T "$BIN_DIR/$binary" 2>/dev/null \
+         | grep -o 'GLIBC_[0-9.]*' | sed 's/^GLIBC_//' | sort -uV | tail -1)"
+      [ -n "$used" ] || fail "could not read the glibc floor from $BIN_DIR/$binary"
+      if [ -z "$LIBC_FLOOR" ] || [ "$(printf '%s\n%s\n' "$LIBC_FLOOR" "$used" | sort -V | tail -1)" = "$used" ]; then
+         LIBC_FLOOR="$used"
+      fi
+   done
+fi
+case "$LIBC_FLOOR" in
+   ''|*[!0-9.]*) fail "implausible glibc floor: '$LIBC_FLOOR'" ;;
+esac
+[ -n "$LIBC_FLOOR_SOURCE" ] || LIBC_FLOOR_SOURCE="the binaries in $BIN_DIR"
+note "glibc floor: $LIBC_FLOOR (from $LIBC_FLOOR_SOURCE; release target is 2.31)"
+if [ "$(printf '%s\n%s\n' "$LIBC_FLOOR" "2.31" | sort -V | tail -1)" != "2.31" ]; then
+   note "warning: these binaries need glibc $LIBC_FLOOR, so the package installs only on distros that new."
+   note "warning: for the widest package, build with 'cargo zigbuild --profile prod --target x86_64-unknown-linux-gnu.2.31' (README)"
+fi
 for script in preinst postinst prerm postrm; do
    [ -f "$SCRIPT_DIR/$script" ] || fail "missing maintainer script: $SCRIPT_DIR/$script"
 done
@@ -191,7 +230,7 @@ Version: $DEB_VERSION
 Architecture: $ARCH
 Maintainer: $MAINTAINER
 Installed-Size: $installed_size
-Depends: libc6 (>= 2.39), libgcc-s1, nftables, systemd, python3-minimal
+Depends: libc6 (>= $LIBC_FLOOR), libgcc-s1, nftables, systemd, python3-minimal
 Recommends: libgl1, libegl1, libxkbcommon0, libx11-6, libwayland-client0
 Section: net
 Priority: optional

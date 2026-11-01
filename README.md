@@ -11,7 +11,7 @@ Linux with nftables and systemd, root for the daemon, and a logged-in user for t
 
 ### From a .deb
 
-Ubuntu 24.04+ / Linux Mint 22+, amd64:
+amd64, on Ubuntu 20.04+ / Mint 20+ / Debian 11+ when built against glibc 2.31 (see below); a plain host build needs Ubuntu 24.04+ / Mint 22+:
 
 ```sh
 cargo build --profile prod
@@ -27,6 +27,23 @@ and enables the service. It **refuses to unpack over a source install**: remove 
 `sudo packaging/install.sh --uninstall`, which keeps `/etc/netshield` and its rules. If no desktop user
 can be determined the package configures but does not start the service, and says so: a control socket
 without an `allowed_uid` would time out every prompt into a deny.
+
+#### Building for older distributions
+
+`cargo build --profile prod` links against the glibc of the machine it runs on, and the package inherits
+that floor (glibc 2.39 on Mint 22 / Ubuntu 24.04). For a package that installs on Ubuntu 20.04+, Mint 20+
+and Debian 11+ (glibc 2.31), link against that glibc instead:
+
+```sh
+cargo install cargo-zigbuild          # one-off; needs a zig on PATH (>= 0.15)
+cargo zigbuild --profile prod --target x86_64-unknown-linux-gnu.2.31
+packaging/deb/build-deb.sh --bin-dir target/x86_64-unknown-linux-gnu/prod
+```
+
+`build-deb.sh` reads the floor out of the binaries themselves and writes it into `Depends`, so the package
+cannot claim a glibc older than it needs; it warns when the binaries in `--bin-dir` need more than 2.31.
+The 2.31 build references nothing newer than `GLIBC_2.30` and runs on both 2.31 and 2.39. `--glibc X`
+overrides the derived value.
 
 ### From source
 

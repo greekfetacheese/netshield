@@ -470,6 +470,10 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
   `prerm` stops the daemon; `postrm` disables the unit, deletes the `inet netshield` table as a safety
   net, and removes `/etc/netshield` on purge. An upgrade restarts the daemon, which loses in-memory
   `Session` rules and leaves the firewall fail-open for the relink.
+  The `libc6` floor in `Depends` is read from the binaries (`objdump -T`, highest
+  `GLIBC_x.y` symbol version) rather than hardcoded, so a package built against an older glibc
+  (`cargo zigbuild --profile prod --target x86_64-unknown-linux-gnu.2.31`) declares the lower floor
+  it actually needs and a host build declares the higher one it actually needs.
 
 ## 10. Crates and dependencies
 
