@@ -8,6 +8,28 @@ Rules and decisions are persisted as JSON in `/etc/netshield`.
 ## Install
 
 Linux with nftables and systemd, root for the daemon, and a logged-in user for the GUI.
+
+### From a .deb
+
+Ubuntu 24.04+ / Linux Mint 22+, amd64:
+
+```sh
+cargo build --profile prod
+packaging/deb/build-deb.sh
+sudo apt install ./packaging/deb/out/netshield_0.1.0-1_amd64.deb
+```
+
+`build-deb.sh` names the file from the workspace version (`ls packaging/deb/out` shows it). The
+package installs the same file set `packaging/install.sh` installs — the daemon, the GUI and
+`netshieldctl` in `/usr/bin`, the hardened unit in `/usr/lib/systemd/system`, the menu entry with its
+icon set, and the tray autostart — creates `/etc/netshield/config.json` for the user who installed it,
+and enables the service. It **refuses to unpack over a source install**: remove that first with
+`sudo packaging/install.sh --uninstall`, which keeps `/etc/netshield` and its rules. If no desktop user
+can be determined the package configures but does not start the service, and says so: a control socket
+without an `allowed_uid` would time out every prompt into a deny.
+
+### From source
+
 Build the binaries first, then install them:
 
 ```sh
@@ -15,7 +37,7 @@ cargo build --profile prod
 sudo packaging/install.sh --bin-dir target/prod
 ```
 
-The installer never builds. It installs `netshieldd` and `netshield-gui` to
+The installer never builds. It installs `netshieldd`, `netshield-gui` and `netshieldctl` to
 `/usr/local/bin`, writes `/etc/netshield/config.json` (keeping an existing one), installs
 the hardened systemd unit, the application-menu entry with its icon set, and the XDG
 autostart entry, and enables the service. Use
@@ -33,12 +55,20 @@ denies the prompt when it times out.
 
 ## Uninstall
 
+For a package install:
+
+```sh
+sudo apt purge netshield               # also removes /etc/netshield; `apt remove` keeps it
+```
+
+For a source install:
+
 ```sh
 sudo packaging/install.sh --uninstall   # keeps /etc/netshield
 sudo packaging/install.sh --purge       # also removes /etc/netshield
 ```
 
-Both stop and disable the service, remove the unit, the autostart entry and the binaries,
+All of these stop and disable the service, remove the unit, the autostart entry and the binaries,
 and delete the `inet netshield` nftables table.
 
 ## Known limitations

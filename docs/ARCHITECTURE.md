@@ -457,6 +457,19 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
   the XDG autostart entry with the invoking user's UID recorded as `allowed_uid`, enables
   the service, and refuses to run while another application firewall (OpenSnitch) is
   active. It never builds; the GUI is launched by the session's autostart entry.
+- `packaging/deb/build-deb.sh` — stages that same file set through `install.sh --root` and builds
+  `netshield_<version>-<revision>_<arch>.deb`: binaries in `/usr/bin`, the unit in
+  `/usr/lib/systemd/system` (a package does not own `/etc/systemd/system`), the autostart entry as the
+  one conffile, the icon theme, and `/usr/share/doc/netshield`. `/etc/netshield/config.json` is **not** a
+  conffile: `allowed_uid` and `gui_path` are per-machine, so `postinst` writes the file for the desktop
+  user (`SUDO_UID`, then `PKEXEC_UID`, then the active login session) and does not enable the service
+  when it cannot resolve one, because a socket owned by root alone times out every prompt into a deny.
+  It also corrects the two values that are install facts rather than preferences — a `gui_path` naming a
+  binary that no longer exists, and an `allowed_uid` of `null`. `preinst` refuses to unpack over a source
+  install, since `/usr/local/bin` wins on PATH and `/etc/systemd/system` wins over the package unit.
+  `prerm` stops the daemon; `postrm` disables the unit, deletes the `inet netshield` table as a safety
+  net, and removes `/etc/netshield` on purge. An upgrade restarts the daemon, which loses in-memory
+  `Session` rules and leaves the firewall fail-open for the relink.
 
 ## 10. Crates and dependencies
 
