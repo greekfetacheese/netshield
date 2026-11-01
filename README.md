@@ -1,14 +1,24 @@
 # NetShield
+NetShield is an interactive application firewall for Linux.
 
-NetShield is a Linux application firewall: the root daemon `netshieldd` holds the first
+## How it works
+The root daemon `netshieldd` holds the first
 packet of every new outbound flow in the kernel and asks the unprivileged `netshield-gui`
 what to do with it, per application, with an optional scope to the domain being contacted.
-Rules and decisions are persisted as JSON in `/etc/netshield`.
+Rules and decisions are persisted in `/etc/netshield`.
+
+> [!WARNING]
+> **NetShield is alpha software. It has not been hardened and may contain security bugs.**
+>
+> The daemon runs as root, holds the first packet of every new outbound flow, and is the only thing
+> deciding whether that traffic proceeds. A bug in it can let through traffic it meant to block, or
+> block traffic it meant to allow — and the control socket's executable check is a convenience
+> boundary, not a security boundary (see [Known limitations](#known-limitations)).
 
 ## Install
 
 ### From .deb package (Easiest)
-Go to the latest release, download and run the .deb package installer
+Go to the latest [release](https://github.com/greekfetacheese/netshield/releases), download and run the .deb package installer
 
 ### From source
 
