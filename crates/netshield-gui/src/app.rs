@@ -11,7 +11,7 @@ use netshield_core::ipc::{
 
 use crate::alert::{self, AlertModel, AlertState, Decision};
 use crate::mock::{Mock, MockEvent};
-use crate::tray::{self, Action, Tray};
+use crate::tray::{self, Action, State, Tray};
 use crate::ui;
 use crate::{
    Cli,
@@ -364,9 +364,11 @@ impl App {
          self.tray = Tray::new(ctx);
       }
 
+      let state = State::of(self.connected || self.mock, self.mode);
       let Some(tray) = self.tray.as_mut() else {
          return;
       };
+      tray.set_state(state);
       for action in tray.drain() {
          match action {
             Action::Show => {
