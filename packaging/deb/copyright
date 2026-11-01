@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: netshield
+Source: https://github.com/greekfetacheese/netshield
+
+Files: *
+Copyright: 2026 Michalis Molfetas <greekfetacheese@proton.me>
+License: MIT or Apache-2.0
+ This project is dual-licensed, at your option: the MIT licence in
+ /usr/share/doc/netshield/LICENSE-MIT, and the Apache License, Version 2.0 in
+ /usr/share/doc/netshield/LICENSE-APACHE.
+ .
+ On Debian systems the complete text of the Apache License 2.0 is in
+ /usr/share/common-licenses/Apache-2.0.

@@ -1,0 +1,232 @@
+#!/bin/sh
+# Prepares a NetShield install: creates the per-machine config for the desktop user, adds
+# the keys a newer version needs, and starts the daemon.
+set -e
+
+CONFIG_DIR=/etc/netshield
+CONFIG_FILE=$CONFIG_DIR/config.json
+GUI_PATH=/usr/bin/netshield-gui
+SOCKET_PATH=/run/netshield/control.sock
+MERGE=/usr/share/netshield/merge-config.sh
+UNIT=netshield.service
+
+note() {
+   printf '%s\n' "$*"
+}
+
+warn() {
+   printf 'netshield: %s\n' "$*" >&2
+}
+
+systemd_running() {
+   [ -d /run/systemd/system ]
+}
+
+# The uid the GUI runs as. `apt install` from a terminal carries SUDO_UID; a desktop package
+# manager (mintinstall, gdebi, pkexec) does not, so the active session is consulted next.
+# This matters more than it looks: the control socket accepts `allowed_uid` and root only, so
+# a config with allowed_uid null leaves a root-only socket, the GUI never connects, every
+# prompt times out, and a timeout is a DENY — the box would silently drop every new flow.
+resolve_gui_uid() {
+   for candidate in "${SUDO_UID:-}" "${PKEXEC_UID:-}"; do
+      case "$candidate" in
+         ''|*[!0-9]*) continue ;;
+      esac
+      if [ "$candidate" -ge 1000 ]; then
+         printf '%s' "$candidate"
+         return 0
+      fi
+   done
+   if command -v loginctl >/dev/null 2>&1; then
+      for session in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}'); do
+         [ "$(loginctl show-session "$session" -p State --value 2>/dev/null)" = active ] || continue
+         session_uid=$(loginctl show-session "$session" -p UID --value 2>/dev/null)
+         case "$session_uid" in
+            ''|*[!0-9]*) continue ;;
+         esac
+         [ "$session_uid" -ge 1000 ] || continue
+         printf '%s' "$session_uid"
+         return 0
+      done
+   fi
+   for bus in /run/user/*/bus; do
+      [ -S "$bus" ] || continue
+      bus_uid=${bus#/run/user/}
+      bus_uid=${bus_uid%/bus}
+      case "$bus_uid" in
+         ''|*[!0-9]*) continue ;;
+      esac
+      [ "$bus_uid" -ge 1000 ] || continue
+      printf '%s' "$bus_uid"
+      return 0
+   done
+   if command -v getent >/dev/null 2>&1; then
+      passwd_uid=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ {print $3; exit}')
+      if [ -n "$passwd_uid" ]; then
+         printf '%s' "$passwd_uid"
+         return 0
+      fi
+   fi
+   return 1
+}
+
+# Writes the same config packaging/install.sh writes, for this machine's paths.
+write_config() {
+   write_uid="$1"
+   dns_servers=$("$MERGE" --print-dns-servers) || return 1
+   [ -n "$dns_servers" ] || return 1
+   cat > "$CONFIG_FILE" <<EOF
+{
+  "queue_num": 0,
+  "dns_queue_num": 1,
+  "prompt_timeout_secs": 30,
+  "default_action": "prompt",
+  "unattributable_closed_flow": "drop",
+  "allowed_uid": $write_uid,
+  "gui_path": "$GUI_PATH",
+  "dns_servers": $dns_servers,
+  "log_level": "info",
+  "socket_path": "$SOCKET_PATH",
+  "rules_path": "/etc/netshield/rules.db"
+}
+EOF
+   chmod 0640 "$CONFIG_FILE"
+}
+
+# Two values in an existing config are install facts, not preferences, and a stale one
+# silently breaks the GUI: gui_path naming /usr/local/bin/netshield-gui (deleted when the
+# source install was removed) refuses every write, and allowed_uid null leaves the socket
+# root-only. Those two are corrected; every other key is the user's and is left alone.
+reconcile_config() {
+   reconcile_uid="$1"
+   [ -f "$CONFIG_FILE" ] || return 0
+   python3 - "$CONFIG_FILE" "$GUI_PATH" "$reconcile_uid" <<'PY'
+import json
+import os
+import sys
+
+path, gui_path, uid = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as handle:
+        config = json.load(handle)
+except Exception:
+    print("netshield: %s is not valid JSON; leaving it untouched" % path, file=sys.stderr)
+    sys.exit(0)
+
+changed = []
+current_gui = config.get("gui_path")
+if isinstance(current_gui, str) and current_gui and not os.access(current_gui, os.X_OK):
+    config["gui_path"] = gui_path
+    changed.append("gui_path %s -> %s (the old path no longer exists)" % (current_gui, gui_path))
+if not isinstance(config.get("allowed_uid"), int) and uid:
+    config["allowed_uid"] = int(uid)
+    changed.append("allowed_uid -> %s (it was null, which leaves the socket root-only)" % uid)
+
+if not changed:
+    sys.exit(0)
+
+tmp = path + ".new"
+with open(tmp, "w") as handle:
+    json.dump(config, handle, indent=2)
+    handle.write("\n")
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+for line in changed:
+    print("netshield: %s: %s" % (path, line), file=sys.stderr)
+PY
+}
+
+config_uid() {
+   [ -f "$CONFIG_FILE" ] || return 0
+   python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as handle:
+        value = json.load(handle).get("allowed_uid")
+except Exception:
+    value = None
+print(value if isinstance(value, int) else "")
+PY
+}
+
+refresh_caches() {
+   if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+   fi
+   if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q /usr/share/applications >/dev/null 2>&1 || true
+   fi
+}
+
+case "$1" in
+   configure)
+      install -d -m 0750 -o root -g root "$CONFIG_DIR"
+
+      if gui_uid=$(resolve_gui_uid); then
+         :
+      else
+         gui_uid=""
+      fi
+
+      if [ -e "$CONFIG_FILE" ]; then
+         if [ -x "$MERGE" ]; then
+            "$MERGE" "$CONFIG_FILE" /usr \
+               || warn "could not add this version's keys to $CONFIG_FILE; see $MERGE"
+         fi
+         reconcile_config "$gui_uid"
+      elif [ -n "$gui_uid" ]; then
+         if write_config "$gui_uid"; then
+            note "wrote $CONFIG_FILE for uid $gui_uid"
+         else
+            warn "could not write $CONFIG_FILE; the daemon will not start"
+         fi
+      fi
+
+      effective_uid=$(config_uid || true)
+
+      if ! systemd_running; then
+         note "systemd is not running; start $UNIT when it is"
+         exit 0
+      fi
+      systemctl daemon-reload || true
+
+      if systemctl is-active --quiet opensnitch; then
+         warn "OpenSnitch is active; two application firewalls must not share the NFQUEUE."
+         warn "Not starting $UNIT. Run 'systemctl stop opensnitch && systemctl disable opensnitch',"
+         warn "then 'sudo systemctl enable --now $UNIT'."
+         exit 0
+      fi
+
+      if [ -z "$effective_uid" ]; then
+         warn "no desktop user could be determined and $CONFIG_FILE has no allowed_uid."
+         warn "The control socket would accept root only, the GUI would never connect, and every"
+         warn "prompt would time out into a DENY, so $UNIT is NOT being started."
+         warn "Set \"allowed_uid\" to your uid in $CONFIG_FILE, then run:"
+         warn "  sudo systemctl enable --now $UNIT"
+         exit 0
+      fi
+
+      if [ -n "${2:-}" ]; then
+         # dpkg passes the version being replaced: an upgrade of a running service restarts it
+         # so the new binary runs. In-memory "until restart" rules are lost with it.
+         if systemctl is-active --quiet "$UNIT"; then
+            systemctl restart "$UNIT" || warn "could not restart $UNIT"
+         else
+            systemctl enable --now "$UNIT" || warn "could not start $UNIT"
+         fi
+      else
+         systemctl enable --now "$UNIT" || warn "could not start $UNIT"
+      fi
+
+      refresh_caches
+      note "control socket: $SOCKET_PATH (served to uid $effective_uid)"
+      ;;
+   abort-upgrade|abort-remove|abort-deconfigure)
+      ;;
+   *)
+      ;;
+esac
+
+exit 0

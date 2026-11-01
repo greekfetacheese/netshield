@@ -1,0 +1,36 @@
+#!/bin/sh
+# Disables the unit and removes what the package created outside dpkg's file list.
+#
+# The daemon removes its own nftables table on SIGTERM, but a crashed or killed daemon leaves
+# it behind, and a leftover `inet netshield` table queues every new flow to a queue nobody
+# reads. The delete here is that safety net and never worth failing an uninstall over.
+set -e
+
+case "$1" in
+   remove|purge)
+      if [ -d /run/systemd/system ]; then
+         systemctl disable netshield.service || true
+         systemctl daemon-reload || true
+      fi
+      if command -v nft >/dev/null 2>&1; then
+         nft delete table inet netshield || true
+      fi
+      ;;
+   upgrade|failed-upgrade)
+      if [ -d /run/systemd/system ]; then
+         systemctl daemon-reload || true
+      fi
+      ;;
+   *)
+      ;;
+esac
+
+case "$1" in
+   purge)
+      rm -rf /etc/netshield
+      ;;
+   *)
+      ;;
+esac
+
+exit 0
