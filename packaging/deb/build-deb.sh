@@ -24,6 +24,7 @@ MAINTAINER="Michalis Molfetas <greekfetacheese@proton.me>"
 KEEP=0
 LIBC_FLOOR=""
 LIBC_FLOOR_SOURCE=""
+NOTES_FILE=""
 
 usage() {
    cat <<'EOF'
@@ -42,6 +43,8 @@ Options:
   --maintainer TEXT   Maintainer field (default: Michalis Molfetas <...>)
   --glibc VERSION     override the glibc floor written into Depends (default: read from
                       the binaries, which is what they actually require)
+  --notes FILE        release notes for the generated changelog, one bullet per line
+                      (default: the commit subjects since the previous version bump)
   --keep              keep the staging tree and print its path
   --help              print this help and exit
 EOF
@@ -114,6 +117,15 @@ while [ "$#" -gt 0 ]; do
          LIBC_FLOOR_SOURCE="--glibc"
          shift
          ;;
+      --notes)
+         [ "$#" -ge 2 ] || fail "--notes needs a file"
+         NOTES_FILE="$2"
+         shift 2
+         ;;
+      --notes=*)
+         NOTES_FILE="${1#--notes=}"
+         shift
+         ;;
       --maintainer)
          [ "$#" -ge 2 ] || fail "--maintainer needs a value"
          MAINTAINER="$2"
@@ -143,6 +155,8 @@ if [ -z "$VERSION" ]; then
    [ -n "$VERSION" ] || fail "could not read [workspace.package] version from $REPO/Cargo.toml"
 fi
 DEB_VERSION="$VERSION-$REVISION"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || date +%s)}"
+export SOURCE_DATE_EPOCH
 
 command -v dpkg-deb >/dev/null 2>&1 || fail "dpkg-deb is not installed"
 for binary in netshieldd netshield-gui netshieldctl; do
@@ -180,9 +194,24 @@ for size in 16 24 32 48 64 128 256; do
       || fail "missing icon ${size}x${size} (regenerate with python3 scripts/make-icons.py)"
 done
 
-changelog_version="$(sed -n "1s/^$PACKAGE (\([^)]*\)).*/\1/p" "$SCRIPT_DIR/changelog")"
-[ "$changelog_version" = "$DEB_VERSION" ] \
-   || fail "packaging/deb/changelog's top entry is '${changelog_version:-missing}', expected '$DEB_VERSION'"
+# The Debian changelog is generated, never tracked. Its version line has to equal the package
+# version, and a hand-maintained copy is one version bump away from refusing to build — which is
+# exactly what happened the first time the version moved. Notes come from --notes FILE, else from
+# the commit subjects since the previous version bump, else a single line for a first release.
+changelog_notes() {
+   if [ -n "$NOTES_FILE" ]; then
+      [ -r "$NOTES_FILE" ] || fail "cannot read the --notes file: $NOTES_FILE"
+      sed -e 's/^[[:space:]]*//' -e '/^$/d' -e 's/^/* /' "$NOTES_FILE"
+      return 0
+   fi
+   since="$(git -C "$REPO" log --format=%H -G'^version = "' -- Cargo.toml 2>/dev/null | sed -n '2p')"
+   if [ -n "$since" ]; then
+      git -C "$REPO" log --no-merges --format='%s' "$since..HEAD" -- . ':(exclude)Cargo.toml' 2>/dev/null \
+         | grep -vE '^[[:space:]]*$' | sed 's/^/* /'
+      return 0
+   fi
+   printf '* Upstream release %s.\n' "$VERSION"
+}
 
 STAGE_ROOT="$(mktemp -d "$REPO/target/deb-stage.XXXXXX")"
 cleanup() {
@@ -207,7 +236,12 @@ DOC_DIR="$STAGE/usr/share/doc/$PACKAGE"
 install -d -m 0755 "$DOC_DIR"
 install -m 0644 "$REPO/README.md" "$REPO/LICENSE-MIT" "$REPO/LICENSE-APACHE" "$DOC_DIR/"
 install -m 0644 "$SCRIPT_DIR/copyright" "$DOC_DIR/copyright"
-gzip -9n -c "$SCRIPT_DIR/changelog" > "$DOC_DIR/changelog.gz"
+{
+   printf '%s (%s) unstable; urgency=medium\n\n' "$PACKAGE" "$DEB_VERSION"
+   changelog_notes | sed 's/^/  /'
+   printf '\n -- %s  %s\n' "$MAINTAINER" "$(date -R -d "@$SOURCE_DATE_EPOCH")"
+} > "$DOC_DIR/changelog"
+gzip -9n "$DOC_DIR/changelog"
 chmod 0644 "$DOC_DIR/changelog.gz"
 
 CONTROL_DIR="$STAGE/DEBIAN"
@@ -251,8 +285,6 @@ chmod 0644 "$CONTROL_DIR/md5sums"
 
 install -d -m 0755 "$OUT_DIR"
 DEB="$OUT_DIR/${PACKAGE}_${DEB_VERSION}_${ARCH}.deb"
-SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO" log -1 --format=%ct)}"
-export SOURCE_DATE_EPOCH
 dpkg-deb --root-owner-group --build "$STAGE" "$DEB"
 
 note ""

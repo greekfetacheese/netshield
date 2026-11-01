@@ -43,11 +43,13 @@ amd64, on Ubuntu 20.04+ / Mint 20+ / Debian 11+ when built against glibc 2.31 (s
 ```sh
 cargo build --profile prod
 packaging/deb/build-deb.sh
-sudo apt install ./packaging/deb/out/netshield_0.1.0-1_amd64.deb
+sudo apt install ./packaging/deb/out/netshield_*_amd64.deb
 ```
 
-`build-deb.sh` names the file from the workspace version (`ls packaging/deb/out` shows it). The
-package installs the same file set `packaging/install.sh` installs — the daemon, the GUI and
+`build-deb.sh` takes the version from `[workspace.package]` in `Cargo.toml`, so a version bump needs no
+other edit: the Debian changelog is generated from that version and the commit subjects since the last
+bump (`--notes FILE` overrides it). The package installs the same file set
+`packaging/install.sh` installs — the daemon, the GUI and
 `netshieldctl` in `/usr/bin`, the hardened unit in `/usr/lib/systemd/system`, the menu entry with its
 icon set, and the tray autostart — creates `/etc/netshield/config.json` for the user who installed it,
 and enables the service. It **refuses to unpack over a source install**: remove that first with

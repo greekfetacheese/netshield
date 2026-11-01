@@ -1,6 +1,0 @@
-netshield (0.1.0-1) unstable; urgency=medium
-
-  * Initial .deb: root daemon, desktop GUI and control CLI, the hardened systemd unit,
-    the application-menu entry with its icon set, and the tray autostart.
-
- -- Michalis Molfetas <greekfetacheese@proton.me>  Sun, 01 Nov 2026 11:00:00 +0200
