@@ -7,9 +7,26 @@ Rules and decisions are persisted as JSON in `/etc/netshield`.
 
 ## Install
 
-Linux with nftables and systemd, root for the daemon, and a logged-in user for the GUI.
+### From .deb package (Easiest)
+Go to the latest release, download and run the .deb package installer
 
-### From a .deb
+### From source
+
+Build the binaries first, then install them:
+
+```sh
+cargo build --profile prod
+sudo packaging/install.sh --bin-dir target/prod
+```
+
+The installer never builds. It installs `netshieldd`, `netshield-gui` and `netshieldctl` to
+`/usr/local/bin`, writes `/etc/netshield/config.json` (keeping an existing one), installs
+the hardened systemd unit, the application-menu entry with its icon set, and the XDG
+autostart entry, and enables the service. Use
+`--prefix DIR` to install under a different prefix, and `--help` for every flag. It
+refuses to run while OpenSnitch is active: stop and disable OpenSnitch first.
+
+### Build your own .deb package
 
 amd64, on Ubuntu 20.04+ / Mint 20+ / Debian 11+ when built against glibc 2.31 (see below); a plain host build needs Ubuntu 24.04+ / Mint 22+:
 
@@ -44,22 +61,6 @@ packaging/deb/build-deb.sh --bin-dir target/x86_64-unknown-linux-gnu/prod
 cannot claim a glibc older than it needs; it warns when the binaries in `--bin-dir` need more than 2.31.
 The 2.31 build references nothing newer than `GLIBC_2.30` and runs on both 2.31 and 2.39. `--glibc X`
 overrides the derived value.
-
-### From source
-
-Build the binaries first, then install them:
-
-```sh
-cargo build --profile prod
-sudo packaging/install.sh --bin-dir target/prod
-```
-
-The installer never builds. It installs `netshieldd`, `netshield-gui` and `netshieldctl` to
-`/usr/local/bin`, writes `/etc/netshield/config.json` (keeping an existing one), installs
-the hardened systemd unit, the application-menu entry with its icon set, and the XDG
-autostart entry, and enables the service. Use
-`--prefix DIR` to install under a different prefix, and `--help` for every flag. It
-refuses to run while OpenSnitch is active: stop and disable OpenSnitch first.
 
 ## First run
 
