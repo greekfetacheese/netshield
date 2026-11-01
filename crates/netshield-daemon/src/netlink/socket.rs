@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use log::{debug, info};
+use log::{debug, info, warn};
 
 /// Size of `struct nlmsghdr`, included in `nlmsg_len`.
 pub(crate) const NLMSG_HDRLEN: usize = 16;
@@ -29,9 +29,13 @@ pub(crate) const RECV_BUF_LEN: usize = 128 * 1024;
 
 /// Receive buffer requested for a queue's netlink socket.
 ///
-/// The kernel caps this at `net.core.rmem_max` (4 MiB on a stock box) and `getsockopt` reports the
-/// value it was given, not the double it actually allocates. A queued packet costs ~768 bytes of socket
-/// memory, so the kernel's 208 KiB default is a few hundred packets of headroom.
+/// `setsockopt(SO_RCVBUF)` clamps the value to `net.core.rmem_max` and stores **twice** the result for
+/// bookkeeping, and `getsockopt` reports that stored figure — so this asks for an 8 MiB budget on a
+/// stock box (`rmem_max` 4 MiB), not 4 MiB. A queued packet costs ~768 bytes of socket memory, so
+/// `2 * RECV_BUFFER_BYTES` is ~10 900 datagrams: more than `QUEUE_MAXLEN` (8192) can hold, which is the
+/// point — the socket stops being what bounds a burst before the queue does. The kernel's 208 KiB
+/// default holds only a few hundred. This is a ceiling, not a reservation: socket memory is charged per
+/// datagram as it arrives, so an idle daemon pays nothing for it.
 pub(crate) const RECV_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 
 /// The kernel reports success and failure of a request through this message type.
@@ -98,13 +102,18 @@ impl NetlinkSocket {
       }
       // A packet that will not fit in the socket's receive buffer is dropped and reported as
       // `ENOBUFS` on the next receive — that is the "No buffer space available" line a torrent client's
-      // peer burst produces. The kernel's default buffer holds a few hundred packets; ask for what the
-      // machine allows and log what was actually granted, because a kernel capped below the request is
-      // the case where this silently does nothing. Not fatal: an unsized buffer is the behaviour this
-      // replaces, and refusing to start a firewall over a socket-tuning hint would be worse.
-      match set_receive_buffer(fd.as_raw_fd()) {
-         Ok(effective) => info!(
-            "netlink receive buffer: asked for {RECV_BUFFER_BYTES} bytes, kernel granted {effective}"
+      // peer burst produces. The kernel's default buffer holds only a few hundred packets, so raise it,
+      // but leave a buffer the machine already gave us alone: a firewall must never be what lowers a
+      // tuned box. Log what is actually in effect, so a kernel that caps the request is visible instead
+      // of silent. Not fatal either way: an unsized buffer is the behaviour this replaces, and refusing
+      // to start a firewall over a socket-tuning hint would be worse.
+      match ensure_receive_buffer(fd.as_raw_fd()) {
+         Ok((before, after)) if after < before => warn!(
+            "netlink receive buffer: kernel gave {after} bytes, below the {before} this socket already \
+             had — net.core.rmem_max caps the request"
+         ),
+         Ok((before, after)) => info!(
+            "netlink receive buffer: {after} bytes (asked for {RECV_BUFFER_BYTES}, was {before})"
          ),
          Err(err) => debug!("could not size the netlink receive buffer: {err}"),
       }
@@ -319,30 +328,41 @@ pub fn peer_uid(fd: std::os::fd::RawFd) -> io::Result<u32> {
    Ok(peer_creds(fd)?.uid)
 }
 
-/// Asks for the largest receive buffer the kernel will grant, returning the effective size.
+/// Ensures the socket's receive buffer is at least [`RECV_BUFFER_BYTES`], never lowering a larger one.
+///
+/// Returns the buffer in effect before and after, as `getsockopt` reports it. A machine tuned with a
+/// large `net.core.rmem_default` hands a fresh socket more than the request would buy, and a plain
+/// `setsockopt` would then spend the daemon's startup shrinking it — a firewall that lowers a tuned
+/// machine is a regression it caused, not a symptom it fixed. A raise the kernel caps below what the
+/// socket already held cannot be undone through `SO_RCVBUF` (nothing can exceed `2 * rmem_max`), so the
+/// caller reports the loss instead of pretending it did not happen.
 ///
 /// Split from [`NetlinkSocket::open`] and given a raw descriptor so a test can prove the option took
 /// effect on a socket of its own, without a privileged queue.
-fn set_receive_buffer(raw: libc::c_int) -> io::Result<i32> {
-   let size = RECV_BUFFER_BYTES;
-   // SAFETY: `raw` is a descriptor the caller owns and keeps open for the call; the option value is a
-   // live `c_int` whose address is valid for the call, and the kernel only reads it.
-   let set = unsafe {
-      libc::setsockopt(
-         raw,
-         libc::SOL_SOCKET,
-         libc::SO_RCVBUF,
-         (&size as *const libc::c_int).cast(),
-         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-      )
-   };
-   if set < 0 {
-      return Err(io::Error::last_os_error());
+fn ensure_receive_buffer(raw: libc::c_int) -> io::Result<(i32, i32)> {
+   let before = receive_buffer(raw)?;
+   if !needs_raise(before) {
+      return Ok((before, before));
    }
+   set_receive_buffer(raw, RECV_BUFFER_BYTES)?;
+   Ok((before, receive_buffer(raw)?))
+}
+
+/// Whether a socket already holding `current` bytes still benefits from [`RECV_BUFFER_BYTES`].
+///
+/// `setsockopt` stores twice the request it is handed, so `2 * RECV_BUFFER_BYTES` is the most the
+/// option can ever buy: a socket already at or above that cannot be improved on, and asking anyway
+/// could only lower it.
+fn needs_raise(current: i32) -> bool {
+   current < RECV_BUFFER_BYTES * 2
+}
+
+/// The socket's receive buffer, as the kernel reports it.
+fn receive_buffer(raw: libc::c_int) -> io::Result<i32> {
    let mut effective: libc::c_int = 0;
    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-   // SAFETY: `raw` is the same live descriptor, and `effective`/`len` are a `c_int` and its size that
-   // the kernel writes into; both outlive the call.
+   // SAFETY: `raw` is a live descriptor the caller keeps open; `effective` and `len` are a `c_int` and
+   // its size that the kernel writes into, both outliving the call.
    let got = unsafe {
       libc::getsockopt(
          raw,
@@ -356,6 +376,27 @@ fn set_receive_buffer(raw: libc::c_int) -> io::Result<i32> {
       return Err(io::Error::last_os_error());
    }
    Ok(effective)
+}
+
+/// Asks the kernel for `size` bytes of receive buffer.
+///
+/// It stores twice what it is given, so [`receive_buffer`] answers a figure near `2 * size`.
+fn set_receive_buffer(raw: libc::c_int, size: i32) -> io::Result<()> {
+   // SAFETY: `raw` is a live descriptor the caller keeps open for the call; `size` is a live `c_int`
+   // whose address is valid for the call, and the kernel only reads it.
+   let set = unsafe {
+      libc::setsockopt(
+         raw,
+         libc::SOL_SOCKET,
+         libc::SO_RCVBUF,
+         (&size as *const libc::c_int).cast(),
+         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+      )
+   };
+   if set < 0 {
+      return Err(io::Error::last_os_error());
+   }
+   Ok(())
 }
 
 /// Builds one netlink datagram: header, then the caller's payload.
@@ -628,10 +669,56 @@ mod tests {
          "reading the default receive buffer must succeed"
       );
 
-      let effective = set_receive_buffer(raw).expect("the option must be applied");
+      let (before, after) = ensure_receive_buffer(raw).expect("the option must be applied");
+      assert_eq!(
+         before, default_size,
+         "the reported starting size must be what getsockopt answers"
+      );
       assert!(
-         effective > default_size,
-         "asked for {RECV_BUFFER_BYTES}, the default was {default_size}, got {effective}"
+         after > before,
+         "asked for {RECV_BUFFER_BYTES}, the default was {before}, got {after}"
+      );
+
+      // SAFETY: `raw` is still owned here and closed exactly once.
+      unsafe { libc::close(raw) };
+   }
+
+   #[test]
+   fn a_socket_already_above_the_request_is_not_raised() {
+      // `setsockopt` stores twice the request, so 2 * RECV_BUFFER_BYTES is the ceiling the option can
+      // reach: anything below it is worth raising, everything at or above it is left alone.
+      assert!(needs_raise(212_992));
+      assert!(needs_raise(6 * 1024 * 1024));
+      assert!(!needs_raise(RECV_BUFFER_BYTES * 2));
+      assert!(!needs_raise(16 * 1024 * 1024));
+   }
+
+   /// A buffer the machine already gave us must survive a second call: the request cannot buy more than
+   /// `2 * RECV_BUFFER_BYTES`, so asking again could only lower it.
+   #[test]
+   fn a_second_call_leaves_the_receive_buffer_alone() {
+      // SAFETY: constant arguments; the descriptor is the only resource created and is checked.
+      let raw = unsafe {
+         libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_NETFILTER,
+         )
+      };
+      assert!(
+         raw >= 0,
+         "a netlink socket must open unprivileged"
+      );
+
+      let (_, first) = ensure_receive_buffer(raw).expect("the option must be applied");
+      let (before, after) = ensure_receive_buffer(raw).expect("the option must be read back");
+      assert_eq!(
+         before, first,
+         "the second call must see the size the first one left"
+      );
+      assert_eq!(
+         after, first,
+         "a receive buffer of {first} bytes must not be lowered"
       );
 
       // SAFETY: `raw` is still owned here and closed exactly once.
