@@ -847,8 +847,10 @@ impl Daemon {
             self.queue_drops = self.queue_drops.saturating_add(1);
             if self.queue_warn.due(Instant::now()) {
                warn!(
-                  "NFQUEUE {} receive failed: {err} ({} failed receive(s) so far; a full queue drops \
-                   packets, see queue_drops)",
+                  "NFQUEUE {} receive failed: {err} ({} failed receive(s) so far). `No buffer space \
+                   available` means this socket's receive buffer overflowed, not a full queue — a full \
+                   queue drops silently. The datagrams it dropped were never seen, so their packets \
+                   stayed unverdicted and those flows stall until the queue is torn down.",
                   self.config.queue_num, self.queue_drops
                );
             }
@@ -2075,7 +2077,7 @@ const QUEUE_WARN_GAP: Duration = Duration::from_secs(5);
 
 /// A one-line-per-gap log gate for an event that has no useful key.
 ///
-/// A queue overflow arrives in bursts, one failed receive per burst, so keying it would buy nothing:
+/// A failed receive arrives in bursts, one per burst, so keying it would buy nothing:
 /// the first line names the cause and every later one is noise at exactly the moment the journal is
 /// most needed. The count still rises, and `StatusInfo::queue_drops` publishes it.
 struct WarnGate {
