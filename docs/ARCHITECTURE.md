@@ -460,7 +460,10 @@ connect to *host*", a duration selector, a scope radio group ("Any connection" /
 - `packaging/deb/build-deb.sh` — stages that same file set through `install.sh --root` and builds
   `netshield_<version>-<revision>_<arch>.deb`: binaries in `/usr/bin`, the unit in
   `/usr/lib/systemd/system` (a package does not own `/etc/systemd/system`), the autostart entry as the
-  one conffile, the icon theme, and `/usr/share/doc/netshield`. `/etc/netshield/config.json` is **not** a
+  one conffile, the icon theme, and `/usr/share/doc/netshield`. The Debian changelog is
+  generated at build time — its version line is the package version and its notes are the
+  commit subjects since the previous version bump — so bumping `Cargo.toml` never needs a
+  second file edited in lockstep. `/etc/netshield/config.json` is **not** a
   conffile: `allowed_uid` and `gui_path` are per-machine, so `postinst` writes the file for the desktop
   user (`SUDO_UID`, then `PKEXEC_UID`, then the active login session) and does not enable the service
   when it cannot resolve one, because a socket owned by root alone times out every prompt into a deny.
