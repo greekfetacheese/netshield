@@ -5,11 +5,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
 BIN_DIR="target/prod"
+ROOT=""
+STAGE=0
+UNIT_DEST="/etc/systemd/system/netshield.service"
 DRY_RUN=0
 UNINSTALL=0
 PURGE=0
 
-UNIT_DEST="/etc/systemd/system/netshield.service"
 AUTOSTART_DEST="/etc/xdg/autostart/netshield.desktop"
 MENU_DEST="/usr/share/applications/netshield.desktop"
 ICON_ROOT="/usr/share/icons/hicolor"
@@ -31,6 +33,13 @@ Options:
                    the autostart entry (default: /usr/local)
   --bin-dir DIR    directory holding the prebuilt netshieldd and netshield-gui
                    (default: target/prod)
+  --unit-dir DIR   install the systemd unit into DIR (default: /etc/systemd/system;
+                   a package ships it in /usr/lib/systemd/system)
+  --root DIR       stage every file under DIR instead of installing it on this
+                   machine: no configuration is written, the service is not touched,
+                   no cache is refreshed and no root is required. Used by
+                   packaging/deb/build-deb.sh; ownership is normalised afterwards
+                   by dpkg-deb --root-owner-group.
   --dry-run        print every path and command instead of touching anything
   --uninstall      stop and disable the service, remove the unit, the menu entry,
                    the autostart entry, the icon set, the nftables table and the
@@ -93,13 +102,17 @@ install_binaries() {
    [ -x "$gui" ] || fail "missing prebuilt binary: $gui (pass --bin-dir DIR)"
    [ -x "$ctl" ] || fail "missing prebuilt binary: $ctl (pass --bin-dir DIR)"
 
-   run install -d -m 0755 "$PREFIX/bin"
-   run install -m 0755 "$daemon" "$PREFIX/bin/netshieldd"
-   run install -m 0755 "$gui" "$PREFIX/bin/netshield-gui"
-   run install -m 0755 "$ctl" "$PREFIX/bin/netshieldctl"
+   run install -d -m 0755 "$ROOT$PREFIX/bin"
+   run install -m 0755 "$daemon" "$ROOT$PREFIX/bin/netshieldd"
+   run install -m 0755 "$gui" "$ROOT$PREFIX/bin/netshield-gui"
+   run install -m 0755 "$ctl" "$ROOT$PREFIX/bin/netshieldctl"
 }
 
 install_config() {
+   if [ "$STAGE" -eq 1 ]; then
+      note "staged: the package's postinst writes $CONFIG_DIR/config.json for the desktop user"
+      return 0
+   fi
    if [ "$DRY_RUN" -eq 1 ]; then
       note "would create $CONFIG_DIR (mode 0750 root:root)"
    else
@@ -151,11 +164,12 @@ EOF
 
 install_unit() {
    if [ "$DRY_RUN" -eq 1 ]; then
-      note "would write $UNIT_DEST (prefix $PREFIX)"
-      return
+      note "would write $ROOT$UNIT_DEST (prefix $PREFIX)"
+      return 0
    fi
-   render "$SCRIPT_DIR/netshield.service" > "$UNIT_DEST"
-   chmod 0644 "$UNIT_DEST"
+   install -d -m 0755 "$(dirname "$ROOT$UNIT_DEST")"
+   render "$SCRIPT_DIR/netshield.service" > "$ROOT$UNIT_DEST"
+   chmod 0644 "$ROOT$UNIT_DEST"
 }
 
 # A stale cache shows the generic fallback and reads exactly like a missing icon, so the
@@ -163,6 +177,9 @@ install_unit() {
 # system, and a missing one is not a failed install.
 refresh_caches() {
    if [ "$DRY_RUN" -eq 1 ]; then
+      return 0
+   fi
+   if [ "$STAGE" -eq 1 ]; then
       return 0
    fi
    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -183,8 +200,8 @@ install_icons() {
    for size in $ICON_SIZES; do
       source="$SCRIPT_DIR/icons/hicolor/${size}x${size}/apps/netshield.png"
       [ -f "$source" ] || fail "missing icon: $source (regenerate with python3 scripts/make-icons.py)"
-      install -d -m 0755 "$ICON_ROOT/${size}x${size}/apps"
-      install -m 0644 "$source" "$ICON_ROOT/${size}x${size}/apps/netshield.png"
+      install -d -m 0755 "$ROOT$ICON_ROOT/${size}x${size}/apps"
+      install -m 0644 "$source" "$ROOT$ICON_ROOT/${size}x${size}/apps/netshield.png"
    done
 }
 
@@ -193,11 +210,11 @@ install_desktop() {
       note "would write $MENU_DEST and $AUTOSTART_DEST (prefix $PREFIX)"
       return
    fi
-   install -d -m 0755 "$(dirname "$MENU_DEST")" "$(dirname "$AUTOSTART_DEST")"
-   render "$SCRIPT_DIR/netshield.desktop" > "$MENU_DEST"
-   chmod 0644 "$MENU_DEST"
-   render "$SCRIPT_DIR/netshield-autostart.desktop" > "$AUTOSTART_DEST"
-   chmod 0644 "$AUTOSTART_DEST"
+   install -d -m 0755 "$ROOT$(dirname "$MENU_DEST")" "$ROOT$(dirname "$AUTOSTART_DEST")"
+   render "$SCRIPT_DIR/netshield.desktop" > "$ROOT$MENU_DEST"
+   chmod 0644 "$ROOT$MENU_DEST"
+   render "$SCRIPT_DIR/netshield-autostart.desktop" > "$ROOT$AUTOSTART_DEST"
+   chmod 0644 "$ROOT$AUTOSTART_DEST"
 }
 
 remove_icons() {
@@ -208,14 +225,22 @@ remove_icons() {
 }
 
 do_install() {
-   require_root
-   refuse_second_firewall
+   if [ "$STAGE" -eq 1 ]; then
+      note "staging into $ROOT (prefix $PREFIX, unit $UNIT_DEST); nothing on this machine is touched"
+   else
+      require_root
+      refuse_second_firewall
+   fi
    install_binaries
    install_config
    install_unit
    install_icons
    install_desktop
    refresh_caches
+
+   if [ "$STAGE" -eq 1 ]; then
+      return 0
+   fi
 
    run systemctl daemon-reload
    run systemctl enable --now netshield.service
@@ -286,6 +311,28 @@ while [ "$#" -gt 0 ]; do
          BIN_DIR="${1#--bin-dir=}"
          shift
          ;;
+      --unit-dir)
+         [ "$#" -ge 2 ] || fail "--unit-dir needs a directory"
+         UNIT_DEST="${2%/}/netshield.service"
+         shift 2
+         ;;
+      --unit-dir=*)
+         UNIT_DEST="${1#--unit-dir=}"
+         UNIT_DEST="${UNIT_DEST%/}/netshield.service"
+         shift
+         ;;
+      --root)
+         [ "$#" -ge 2 ] || fail "--root needs a directory"
+         ROOT="${2%/}"
+         STAGE=1
+         shift 2
+         ;;
+      --root=*)
+         ROOT="${1#--root=}"
+         ROOT="${ROOT%/}"
+         STAGE=1
+         shift
+         ;;
       --dry-run)
          DRY_RUN=1
          shift
@@ -308,6 +355,10 @@ while [ "$#" -gt 0 ]; do
          ;;
    esac
 done
+
+if [ "$STAGE" -eq 1 ] && [ "$UNINSTALL" -eq 1 ]; then
+   fail "--root only stages an install; it cannot uninstall (remove the package with apt)"
+fi
 
 if [ "$UNINSTALL" -eq 1 ]; then
    do_uninstall
