@@ -16,13 +16,50 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use netshield_core::ipc::Mode;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::{ICON_RGBA, ICON_SIDE};
+use crate::icon;
 
-/// The hover text and item title the desktop shows for the icon.
-const TITLE: &str = "NetShield";
+/// What the tray icon is reporting about the daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+   Ok,
+   Warning,
+   Alert,
+}
+
+impl State {
+   /// `connected` is the control socket, `mode` is whether unmatched traffic is still asked
+   /// about. A pending mode is deliberately not consulted: the daemon's published `Status`
+   /// is the only writer of displayed daemon state, so a click moves the mark only once the
+   /// answer lands.
+   pub fn of(connected: bool, mode: Mode) -> Self {
+      match (connected, mode) {
+         (false, _) => Self::Alert,
+         (true, Mode::Alert) => Self::Ok,
+         (true, Mode::Silent) => Self::Warning,
+      }
+   }
+
+   fn rgba(self) -> &'static [u8] {
+      match self {
+         Self::Ok => icon::OK,
+         Self::Warning => icon::WARNING,
+         Self::Alert => icon::ALERT,
+      }
+   }
+
+   /// The hover text, so the state is readable without decoding the mark.
+   pub fn title(self) -> &'static str {
+      match self {
+         Self::Ok => "NetShield — filtering",
+         Self::Warning => "NetShield — not filtering (alerts off)",
+         Self::Alert => "NetShield — daemon not running",
+      }
+   }
+}
 
 /// What a tray interaction asks the app to do.
 ///
@@ -41,11 +78,12 @@ pub enum Action {
 /// The tray icon and the actions its callbacks have queued since the last drain.
 pub struct Tray {
    /// Dropping this removes the icon, so the app owns it for its whole lifetime.
-   /// It is never read afterwards: owning it is the whole point.
-   #[allow(dead_code)]
+   /// It is also how the mark and its hover text are replaced as the state moves.
    icon: TrayIcon,
    /// Written by the callbacks' thread, read by `App::logic` on the GUI thread.
    actions: Arc<Mutex<Vec<Action>>>,
+   /// The daemon state the mark and its hover text currently show.
+   state: State,
 }
 
 impl Tray {
@@ -55,13 +93,14 @@ impl Tray {
    /// A missing host is a normal desktop configuration, not an error: the app runs without
    /// a tray and the window keeps its close button behaviour.
    pub fn new(ctx: &egui::Context) -> Option<Tray> {
+      let state = State::Alert;
       debug_assert_eq!(
-         ICON_RGBA.len(),
-         (ICON_SIDE * ICON_SIDE * 4) as usize,
+         state.rgba().len(),
+         (icon::SIDE * icon::SIDE * 4) as usize,
          "the tray icon must be raw RGBA8, 64x64"
       );
 
-      let icon = match Icon::from_rgba(ICON_RGBA.to_vec(), ICON_SIDE, ICON_SIDE) {
+      let icon = match Icon::from_rgba(state.rgba().to_vec(), icon::SIDE, icon::SIDE) {
          Ok(icon) => icon,
          Err(err) => {
             log::warn!("cannot decode the tray icon, running without a tray: {err}");
@@ -90,9 +129,9 @@ impl Tray {
       // renders it twice: `ksni` maps it to `(title, tooltip)`. Windows/macOS read
       // `tooltip`, Linux/BSD read the item `title` and show nothing without it.
       #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-      let builder = builder.with_title(TITLE);
+      let builder = builder.with_title(state.title());
       #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-      let builder = builder.with_tooltip(TITLE);
+      let builder = builder.with_tooltip(state.title());
 
       let icon = match builder.build() {
          Ok(icon) => icon,
@@ -149,7 +188,40 @@ impl Tray {
       }
 
       log::info!("system tray icon registered");
-      Some(Self { icon, actions })
+      Some(Self {
+         icon,
+         actions,
+         state,
+      })
+   }
+
+   /// Replaces the mark and its hover text, doing nothing when the state has not moved.
+   ///
+   /// `set_icon` re-registers the item with the StatusNotifier host, so calling it on every
+   /// pass would make an idle tray churn: the early return is what keeps this free.
+   pub fn set_state(&mut self, state: State) {
+      if self.state == state {
+         return;
+      }
+      match Icon::from_rgba(state.rgba().to_vec(), icon::SIDE, icon::SIDE) {
+         Ok(mark) => {
+            if let Err(err) = self.icon.set_icon(Some(mark)) {
+               log::warn!("cannot set the tray icon for {:?}: {err}", state);
+            }
+         }
+         Err(err) => log::warn!("cannot decode the tray icon for {state:?}: {err}"),
+      }
+      self.apply_title(state);
+      self.state = state;
+   }
+
+   /// Linux reads the item title as its hover text, Windows and macOS read the tooltip, and
+   /// setting both renders it twice.
+   fn apply_title(&self, state: State) {
+      #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+      self.icon.set_title(Some(state.title()));
+      #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+      let _ = self.icon.set_tooltip(Some(state.title()));
    }
 
    /// Every action queued since the last call, without blocking.
@@ -179,4 +251,28 @@ pub fn show_window(ctx: &egui::Context) {
    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
    ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn the_state_follows_the_socket_and_the_mode() {
+      assert_eq!(State::of(false, Mode::Alert), State::Alert);
+      assert_eq!(State::of(false, Mode::Silent), State::Alert);
+      assert_eq!(State::of(true, Mode::Alert), State::Ok);
+      assert_eq!(State::of(true, Mode::Silent), State::Warning);
+   }
+
+   #[test]
+   fn every_state_embeds_a_full_frame() {
+      for state in [State::Ok, State::Warning, State::Alert] {
+         assert_eq!(
+            state.rgba().len(),
+            (icon::SIDE * icon::SIDE * 4) as usize,
+            "{state:?}"
+         );
+      }
+   }
 }

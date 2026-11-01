@@ -17,18 +17,19 @@ sudo packaging/install.sh --bin-dir target/prod
 
 The installer never builds. It installs `netshieldd` and `netshield-gui` to
 `/usr/local/bin`, writes `/etc/netshield/config.json` (keeping an existing one), installs
-the hardened systemd unit and the XDG autostart entry, and enables the service. Use
+the hardened systemd unit, the application-menu entry with its icon set, and the XDG
+autostart entry, and enables the service. Use
 `--prefix DIR` to install under a different prefix, and `--help` for every flag. It
 refuses to run while OpenSnitch is active: stop and disable OpenSnitch first.
 
 ## First run
 
 The daemon creates the rule store on first start, and the GUI starts with your session
-from `/etc/xdg/autostart/netshield-gui.desktop` and connects to
-`/run/netshield/control.sock`. New connections then raise an alert; Allow or Deny, choose
-how long the decision lasts, and optionally scope it to the observed domain. If the GUI is
-not running when a prompt is raised, the daemon logs a warning and denies the prompt when
-it times out.
+from `/etc/xdg/autostart/netshield.desktop`, in the tray with no window on screen, and
+connects to `/run/netshield/control.sock`. New connections then raise an alert; Allow or
+Deny, choose how long the decision lasts, and optionally scope it to the observed
+domain. If the GUI is not running when a prompt is raised, the daemon logs a warning and
+denies the prompt when it times out.
 
 ## Uninstall
 
