@@ -41,6 +41,15 @@ const POLL_EVERY: Duration = Duration::from_millis(200);
 /// able to strand a prompt until the user restores the window.
 const PROMPT_REPAINT_EVERY: Duration = Duration::from_millis(500);
 
+/// How long the startup hide keeps being re-sent, and how often.
+///
+/// `Visible(false)` only takes effect against a window that already exists, and the first
+/// `logic` pass runs before winit maps the root viewport: a single send left the window
+/// mapped (1130x640, `IsViewable`) for the whole run in about half of all launches.
+/// Re-sending for a moment after startup is what makes the outcome the same every time.
+const STARTUP_HIDE_FOR: Duration = Duration::from_millis(1500);
+const STARTUP_HIDE_EVERY: Duration = Duration::from_millis(100);
+
 /// Red used by the offline banner; loud on purpose.
 const BANNER_RED: egui::Color32 = egui::Color32::from_rgb(0xA8, 0x1F, 0x1F);
 
@@ -164,6 +173,12 @@ pub struct App {
    /// Whether this app hid the window to the tray. `ViewportCommand::Visible` is not
    /// echoed back into `ViewportInfo`, so this flag is the single source of truth.
    hidden_to_tray: bool,
+   /// `--minimized`: whether the window was asked to start out of sight. Consumed on the
+   /// first pass, where the tray's absence turns it into "show the window after all".
+   start_minimized: bool,
+   /// When the startup hide stops being re-sent. `None` once it has settled, or when the app
+   /// was never asked to start minimized.
+   startup_hide_until: Option<Instant>,
    /// Whether the root window is somewhere the user can see it: not minimized and not
    /// hidden to the tray. Set on every pass from the same value the socket thread is told,
    /// and read by `ui` to skip drawing an unseen window -- a drawn frame re-arms the
@@ -341,7 +356,9 @@ impl App {
          refresh_rules: false,
          tray: None,
          tray_tried: false,
-         hidden_to_tray: false,
+         hidden_to_tray: cli.minimized,
+         start_minimized: cli.minimized,
+         startup_hide_until: None,
          attended: true,
          allow_close: false,
       }
@@ -366,9 +383,38 @@ impl App {
 
       let state = State::of(self.connected || self.mock, self.mode);
       let Some(tray) = self.tray.as_mut() else {
+         // No StatusNotifier host: there is no tray icon, so starting hidden would leave a
+         // process with no window and no way back to it.
+         if self.start_minimized {
+            self.start_minimized = false;
+            self.hidden_to_tray = false;
+            log::warn!("started minimized but this desktop has no tray; showing the window");
+            tray::show_window(ctx);
+         }
          return;
       };
       tray.set_state(state);
+      // `with_visible(false)` is not honoured for the root viewport on X11 -- measured: the
+      // window is still mapped 1130x640 -- so it is hidden here, the one way that works, as
+      // soon as the tray is known to exist and can bring it back.
+      if self.start_minimized {
+         self.start_minimized = false;
+         self.hidden_to_tray = true;
+         self.startup_hide_until = Some(Instant::now() + STARTUP_HIDE_FOR);
+         log::info!("started minimized, hidden to the tray");
+      }
+      // Keep asking while the window is still settling. `hidden_to_tray` is the guard that
+      // matters: a click on the tray icon clears it, and the retry must never fight the user.
+      if self.hidden_to_tray
+         && let Some(deadline) = self.startup_hide_until
+      {
+         if Instant::now() < deadline {
+            tray::hide_window(ctx);
+            ctx.request_repaint_after(STARTUP_HIDE_EVERY);
+         } else {
+            self.startup_hide_until = None;
+         }
+      }
       for action in tray.drain() {
          match action {
             Action::Show => {
@@ -1256,6 +1302,7 @@ mod tests {
          socket: PathBuf::from("/nonexistent/control.sock"),
          mock: true,
          alert: false,
+         minimized: false,
       })
    }
 

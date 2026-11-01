@@ -25,6 +25,7 @@ pub struct Cli {
    pub socket: PathBuf,
    pub mock: bool,
    pub alert: bool,
+   pub minimized: bool,
 }
 
 impl Default for Cli {
@@ -33,6 +34,7 @@ impl Default for Cli {
          socket: PathBuf::from(DEFAULT_SOCKET),
          mock: false,
          alert: false,
+         minimized: false,
       }
    }
 }
@@ -55,6 +57,7 @@ Options:
                        [default: /run/netshield/control.sock]
       --mock           run with no daemon, showing synthetic connection events
       --alert          start hidden and show only alerts (a root daemon never launches a GUI)
+      --minimized      start in the tray with no window (for the autostart entry)
 ";
 
 impl Cli {
@@ -85,6 +88,7 @@ impl Cli {
             },
             "--mock" => cli.mock = true,
             "--alert" => cli.alert = true,
+            "--minimized" => cli.minimized = true,
             other if other.starts_with("--socket=") => {
                let path = &other["--socket=".len()..];
                if path.is_empty() {
@@ -94,6 +98,13 @@ impl Cli {
             }
             other => return Err(format!("unknown option: {other}")),
          }
+      }
+      if cli.minimized && cli.alert {
+         return Err(
+            "--minimized has no meaning with --alert: the prompt window is already hidden until a \
+             prompt arrives"
+               .to_owned(),
+         );
       }
       Ok(Parsed::Run(cli))
    }
@@ -151,6 +162,7 @@ fn main() -> eframe::Result {
          .with_title("NetShield")
          .with_inner_size([1130.0, 640.0])
          .with_min_inner_size([760.0, 480.0])
+         .with_visible(!cli.minimized)
    }
    .with_icon(window_icon);
    let options = eframe::NativeOptions {
@@ -212,5 +224,12 @@ mod tests {
       assert!(parse(&["--socket"]).is_err());
       assert!(parse(&["--socket="]).is_err());
       assert!(parse(&["--socket", "--mock"]).is_err());
+   }
+
+   #[test]
+   fn the_minimized_flag_parses_and_rejects_alert() {
+      assert!(!run(&[]).minimized);
+      assert!(run(&["--minimized"]).minimized);
+      assert!(parse(&["--minimized", "--alert"]).is_err());
    }
 }
