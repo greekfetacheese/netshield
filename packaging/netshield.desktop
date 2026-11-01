@@ -1,11 +1,14 @@
 [Desktop Entry]
 Type=Application
+Version=1.0
 Name=NetShield
+GenericName=Application Firewall
 Comment=Connection alerts from the NetShield firewall daemon
 Exec=/usr/local/bin/netshield-gui
+TryExec=/usr/local/bin/netshield-gui
 Icon=netshield
 Terminal=false
-NoDisplay=false
 Categories=System;Security;
-X-GNOME-Autostart-enabled=true
-X-GNOME-Autostart-Delay=2
+StartupWMClass=netshield
+StartupNotify=true
+Keywords=firewall;network;security;

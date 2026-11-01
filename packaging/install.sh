@@ -10,7 +10,10 @@ UNINSTALL=0
 PURGE=0
 
 UNIT_DEST="/etc/systemd/system/netshield.service"
-DESKTOP_DEST="/etc/xdg/autostart/netshield-gui.desktop"
+AUTOSTART_DEST="/etc/xdg/autostart/netshield.desktop"
+MENU_DEST="/usr/share/applications/netshield.desktop"
+ICON_ROOT="/usr/share/icons/hicolor"
+ICON_SIZES="16 24 32 48 64 128 256"
 CONFIG_DIR="/etc/netshield"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 SOCKET_PATH="/run/netshield/control.sock"
@@ -20,7 +23,8 @@ usage() {
 Usage: packaging/install.sh [options]
 
 Installs the prebuilt netshieldd, netshield-gui and netshieldctl from --bin-dir, the
-hardened systemd unit and the XDG autostart entry. It never builds anything.
+hardened systemd unit, the application-menu entry with its icon set, and the XDG
+autostart entry. It never builds anything.
 
 Options:
   --prefix DIR     install binaries under DIR/bin and use them in the unit and
@@ -28,8 +32,9 @@ Options:
   --bin-dir DIR    directory holding the prebuilt netshieldd and netshield-gui
                    (default: target/prod)
   --dry-run        print every path and command instead of touching anything
-  --uninstall      stop and disable the service, remove the unit, the autostart
-                   entry, the nftables table and the binaries; keep /etc/netshield
+  --uninstall      stop and disable the service, remove the unit, the menu entry,
+                   the autostart entry, the icon set, the nftables table and the
+                   binaries; keep /etc/netshield
   --purge          like --uninstall, and also remove /etc/netshield
   --help           print this help and exit
 EOF
@@ -153,14 +158,53 @@ install_unit() {
    chmod 0644 "$UNIT_DEST"
 }
 
-install_desktop() {
+# A stale cache shows the generic fallback and reads exactly like a missing icon, so the
+# theme caches are refreshed after every change. Both tools are optional on a minimal
+# system, and a missing one is not a failed install.
+refresh_caches() {
    if [ "$DRY_RUN" -eq 1 ]; then
-      note "would write $DESKTOP_DEST (prefix $PREFIX)"
+      return 0
+   fi
+   if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+      gtk-update-icon-cache -f -t "$ICON_ROOT" >/dev/null 2>&1 \
+         || note "warning: gtk-update-icon-cache failed; the menu icon may stay generic until it does"
+   fi
+   if command -v update-desktop-database >/dev/null 2>&1; then
+      update-desktop-database -q "$(dirname "$MENU_DEST")" >/dev/null 2>&1 || true
+   fi
+}
+
+install_icons() {
+   local size source
+   if [ "$DRY_RUN" -eq 1 ]; then
+      note "would install the netshield mark at these sizes under $ICON_ROOT: $ICON_SIZES"
       return
    fi
-   install -d -m 0755 "$(dirname "$DESKTOP_DEST")"
-   render "$SCRIPT_DIR/netshield-gui.desktop" > "$DESKTOP_DEST"
-   chmod 0644 "$DESKTOP_DEST"
+   for size in $ICON_SIZES; do
+      source="$SCRIPT_DIR/icons/hicolor/${size}x${size}/apps/netshield.png"
+      [ -f "$source" ] || fail "missing icon: $source (regenerate with python3 scripts/make-icons.py)"
+      install -d -m 0755 "$ICON_ROOT/${size}x${size}/apps"
+      install -m 0644 "$source" "$ICON_ROOT/${size}x${size}/apps/netshield.png"
+   done
+}
+
+install_desktop() {
+   if [ "$DRY_RUN" -eq 1 ]; then
+      note "would write $MENU_DEST and $AUTOSTART_DEST (prefix $PREFIX)"
+      return
+   fi
+   install -d -m 0755 "$(dirname "$MENU_DEST")" "$(dirname "$AUTOSTART_DEST")"
+   render "$SCRIPT_DIR/netshield.desktop" > "$MENU_DEST"
+   chmod 0644 "$MENU_DEST"
+   render "$SCRIPT_DIR/netshield-autostart.desktop" > "$AUTOSTART_DEST"
+   chmod 0644 "$AUTOSTART_DEST"
+}
+
+remove_icons() {
+   local size
+   for size in $ICON_SIZES; do
+      rm -f "$ICON_ROOT/${size}x${size}/apps/netshield.png"
+   done
 }
 
 do_install() {
@@ -169,7 +213,9 @@ do_install() {
    install_binaries
    install_config
    install_unit
+   install_icons
    install_desktop
+   refresh_caches
 
    run systemctl daemon-reload
    run systemctl enable --now netshield.service
@@ -200,10 +246,13 @@ do_uninstall() {
 
    if [ "$DRY_RUN" -eq 1 ]; then
       note "would remove $PREFIX/bin/netshieldd, $PREFIX/bin/netshield-gui and $PREFIX/bin/netshieldctl"
-      note "would remove $DESKTOP_DEST"
+      note "would remove $MENU_DEST and $AUTOSTART_DEST"
+      note "would remove the netshield mark from $ICON_ROOT ($ICON_SIZES)"
    else
       rm -f "$PREFIX/bin/netshieldd" "$PREFIX/bin/netshield-gui" "$PREFIX/bin/netshieldctl"
-      rm -f "$DESKTOP_DEST"
+      rm -f "$MENU_DEST" "$AUTOSTART_DEST"
+      remove_icons
+      refresh_caches
    fi
 
    if [ "$PURGE" -eq 1 ]; then

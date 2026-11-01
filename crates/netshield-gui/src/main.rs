@@ -3,6 +3,7 @@
 mod alert;
 mod app;
 mod connlog;
+mod desktop_integration;
 mod icon;
 mod ipc;
 mod logging;
@@ -136,6 +137,10 @@ fn main() -> eframe::Result {
       log::info!("logging to {}", path.display());
    }
 
+   // Best effort, and deliberately not on the window's path: `install.sh` cannot set this,
+   // because the metadata is per-user and it runs as root.
+   desktop_integration::install();
+
    // The same frame the tray shows for a healthy daemon: without `with_icon` eframe
    // substitutes egui's own placeholder in the taskbar and Alt-Tab.
    let window_icon = std::sync::Arc::new(egui::IconData {
@@ -149,6 +154,7 @@ fn main() -> eframe::Result {
    let viewport = if cli.alert {
       egui::ViewportBuilder::default()
          .with_title("NetShield")
+         .with_app_id("netshield")
          .with_inner_size([460.0, 260.0])
          .with_min_inner_size([460.0, 260.0])
          .with_max_inner_size([460.0, 260.0])
@@ -160,6 +166,7 @@ fn main() -> eframe::Result {
    } else {
       egui::ViewportBuilder::default()
          .with_title("NetShield")
+         .with_app_id("netshield")
          .with_inner_size([1130.0, 640.0])
          .with_min_inner_size([760.0, 480.0])
          .with_visible(!cli.minimized)

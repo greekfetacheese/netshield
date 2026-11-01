@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NetShield
+Comment=Starts NetShield in the system tray
+Exec=/usr/local/bin/netshield-gui --minimized
+Icon=netshield
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2
