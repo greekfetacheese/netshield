@@ -1,5 +1,5 @@
 use crate::connection::Connection;
-use crate::rule::{Action, AppMatcher, Rule, RuleId};
+use crate::rule::{Action, AppMatcher, Rule, RuleId, fold_rules};
 
 /// The verdict for one connection.
 ///
@@ -10,6 +10,25 @@ pub enum Outcome {
    Allow { rule: RuleId },
    Deny { rule: RuleId },
    Ask,
+}
+
+/// What [`RuleSet::coalesce`] changed.
+///
+/// The caller persists both halves: the surviving rules the fold rewrote, and the ids it removed — a
+/// rule that left memory but not the store comes back as a second row at the next start.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Coalesced {
+   /// The surviving rules that absorbed at least one other, which have to be written again.
+   pub rewritten: Vec<Rule>,
+   /// The ids the fold removed.
+   pub absorbed: Vec<RuleId>,
+}
+
+impl Coalesced {
+   /// Whether the set already held one rule per entry, so nothing has to be written.
+   pub fn is_empty(&self) -> bool {
+      self.rewritten.is_empty() && self.absorbed.is_empty()
+   }
 }
 
 /// The in-memory rule set.
@@ -74,6 +93,43 @@ impl RuleSet {
       }
       self.rules.push(rule);
       None
+   }
+
+   /// Folds every rule that is one entry of the table into the first rule of that entry.
+   ///
+   /// Insertion order survives: the survivor keeps the place and the id of the first rule folded,
+   /// which is the id the store and the GUI already refer to. A set that already holds one rule per
+   /// entry comes back unchanged, so this is safe to run at every start.
+   pub fn coalesce(&mut self) -> Coalesced {
+      let mut kept: Vec<Rule> = Vec::with_capacity(self.rules.len());
+      let mut changed: Vec<RuleId> = Vec::new();
+      let mut absorbed: Vec<RuleId> = Vec::new();
+
+      for rule in self.rules.drain(..) {
+         let mut folded = false;
+         for survivor in kept.iter_mut() {
+            if let Some(merged) = fold_rules(survivor, &rule) {
+               if !changed.contains(&merged.id) {
+                  changed.push(merged.id.clone());
+               }
+               *survivor = merged;
+               folded = true;
+               break;
+            }
+         }
+         if folded {
+            absorbed.push(rule.id);
+         } else {
+            kept.push(rule);
+         }
+      }
+
+      let rewritten = kept.iter().filter(|rule| changed.contains(&rule.id)).cloned().collect();
+      self.rules = kept;
+      Coalesced {
+         rewritten,
+         absorbed,
+      }
    }
 
    /// Removes a rule, reporting whether it existed.
@@ -580,6 +636,64 @@ mod tests {
       assert_eq!(hits.last_matched, Some(100));
 
       set.record_hit(&RuleId::new_unique(), 5);
+   }
+
+   #[test]
+   fn coalesce_folds_one_entry_per_application_and_says_what_it_removed() {
+      let app = firefox();
+      let first = rule(
+         app.clone(),
+         DestMatcher::Ip("198.51.100.20/32".parse::<IpNet>().unwrap()),
+         Action::Deny,
+         10,
+      );
+      let second = rule(
+         app.clone(),
+         DestMatcher::Ip("198.51.100.21/32".parse::<IpNet>().unwrap()),
+         Action::Deny,
+         20,
+      );
+      let allowed = rule(
+         app.clone(),
+         DestMatcher::Ip("198.51.100.22/32".parse::<IpNet>().unwrap()),
+         Action::Allow,
+         30,
+      );
+
+      let mut set = RuleSet::new();
+      for candidate in [&first, &second, &allowed] {
+         set.upsert(candidate.clone());
+      }
+
+      let coalesced = set.coalesce();
+      assert_eq!(
+         coalesced.absorbed,
+         vec![second.id.clone()],
+         "the second answer is the record the fold removes"
+      );
+      assert_eq!(
+         coalesced.rewritten.len(),
+         1,
+         "only the survivor changed, so only it has to be written again"
+      );
+      assert_eq!(coalesced.rewritten[0].id, first.id);
+      assert_eq!(
+         set.iter().map(|rule| rule.id.clone()).collect::<Vec<_>>(),
+         vec![first.id.clone(), allowed.id.clone()],
+         "the survivor keeps its place, and another verdict is a row of its own"
+      );
+      assert_eq!(
+         set.get(&first.id).map(|rule| rule.dest.clone()),
+         Some(DestMatcher::Set(vec![
+            DestMatcher::Ip("198.51.100.20/32".parse::<IpNet>().unwrap()),
+            DestMatcher::Ip("198.51.100.21/32".parse::<IpNet>().unwrap()),
+         ]))
+      );
+
+      assert!(
+         set.coalesce().is_empty(),
+         "a set that already holds one rule per entry is left alone"
+      );
    }
 
    #[test]

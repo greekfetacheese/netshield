@@ -305,6 +305,13 @@ struct Rule {
 }
 ```
 
+One application is one entry of the rules table: the same application, verdict and duration
+is one rule, whose destination is the union of every destination answered for it (`Set`). An
+answer about a new destination extends that rule instead of adding a row, and a store written by
+an older build — one rule per answered destination — is folded when it is loaded. A different
+verdict, duration or enabled state stays a separate entry, because each of those is a separate
+decision.
+
 Specificity, highest first. The comparison is **lexicographic on (app rank, destination
 rank)**: application scope is the outer dimension, so a rule about one application always
 outranks a rule about all applications. That ordering is deliberate — a global
