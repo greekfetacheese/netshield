@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use netshield_core::DefaultAction;
 use netshield_core::connection::{Attribution, Connection, Endpoint, L4Proto};
-use netshield_core::rule::{Action, Rule, RuleId};
+use netshield_core::rule::{Action, Rule, RuleId, fold_rules};
 use netshield_core::ruleset::{Outcome, RuleSet};
 
 /// The verdict for one connection, before it becomes a packet verdict.
@@ -81,10 +81,12 @@ pub fn grant_key(conn: &Connection) -> Option<GrantKey> {
 /// How an inserted rule related to the rules already present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
-   /// No equivalent rule existed, so a new one was added.
+   /// No rule for this application and verdict existed, so a new one was added.
    Created,
-   /// An equivalent rule existed and was updated in place.
+   /// The rule already covered this destination and was answered again.
    Refreshed,
+   /// The rule for this application and verdict gained the answered destination.
+   Merged,
 }
 
 /// The rule engine plus the state that sits in front of it.
@@ -160,15 +162,39 @@ impl Policy {
       self.ruleset.upsert(rule);
    }
 
-   /// Inserts `rule`, or refreshes an equivalent rule already in the set.
+   /// Inserts `rule`, or folds it into the rule that is already this application's entry.
    ///
-   /// A rule is equivalent when its application matcher, destination matcher, action and
-   /// duration all match exactly. Answering the same prompt twice must not leave two rules
-   /// that can disagree, so an equivalent incumbent keeps its id and its place in the
-   /// insertion order, gets `updated_at`, and is enabled again if the user had disabled it.
-   /// The caller persists whichever rule comes back: a refresh replaces the stored copy.
+   /// An entry is one application, one verdict and one duration — see [`fold_rules`] — so an answer
+   /// about a destination the policy has no rule for extends that entry's destination list instead
+   /// of adding one row per answered destination. The fold keeps the incumbent's id, its place in the
+   /// insertion order and its history, and takes the newest answer's `updated_at`.
+   ///
+   /// A disabled rule of the same application, verdict and duration is re-enabled by an answer that
+   /// names its exact destination rather than shadowed by a new rule the user would have to find and
+   /// switch on; an answer that names another destination leaves it alone, because re-enabling it
+   /// would decide traffic the user never answered.
+   ///
+   /// The caller persists whichever rule comes back: a fold or a refresh replaces the stored copy.
    pub fn apply(&mut self, rule: Rule) -> (Rule, Applied) {
-      let existing = self
+      let incumbent = self
+         .ruleset
+         .iter()
+         .find(|existing| fold_rules(existing, &rule).is_some())
+         .cloned();
+      if let Some(incumbent) = incumbent {
+         let merged =
+            fold_rules(&incumbent, &rule).expect("the incumbent was found by the same fold");
+         let applied = if merged.dest == incumbent.dest {
+            // The entry already covered this destination: it was answered again, not widened.
+            Applied::Refreshed
+         } else {
+            Applied::Merged
+         };
+         self.ruleset.upsert(merged.clone());
+         return (merged, applied);
+      }
+
+      let disabled = self
          .ruleset
          .iter()
          .find(|existing| {
@@ -179,7 +205,7 @@ impl Policy {
          })
          .cloned();
 
-      let Some(mut existing) = existing else {
+      let Some(mut existing) = disabled else {
          self.ruleset.upsert(rule.clone());
          return (rule, Applied::Created);
       };
@@ -400,6 +426,134 @@ mod tests {
       let stored = policy.ruleset().get(&rule.id).expect("rule is present");
       assert_eq!(stored.hits, 1);
       assert_eq!(stored.last_matched, Some(42));
+   }
+
+   /// Every answer is remembered against the application's entry, so answering one destination after
+   /// another leaves one rule per app and verdict rather than a row per destination.
+   #[test]
+   fn an_answer_folds_into_the_application_entry() {
+      let to = |dest: DestMatcher, updated_at: u64| {
+         rule_from_scope(
+            RuleId::new_unique(),
+            AppMatcher::Exe(PathBuf::from(FIREFOX)),
+            &netshield_core::ScopeRequest {
+               action: Action::Allow,
+               duration: Duration::Forever,
+               dest,
+            },
+            updated_at,
+         )
+      };
+      let port = || DestMatcher::Port(443);
+      let domain = || DestMatcher::Domain {
+         host: "api.github.com".to_owned(),
+         subdomains: false,
+      };
+
+      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
+      let (first, applied) = policy.apply(to(port(), 10));
+      assert_eq!(applied, Applied::Created);
+
+      let (folded, applied) = policy.apply(to(domain(), 20));
+      assert_eq!(
+         applied,
+         Applied::Merged,
+         "another destination widens the app's rule"
+      );
+      assert_eq!(
+         policy.ruleset().len(),
+         1,
+         "an app is one entry in the table"
+      );
+      assert_eq!(
+         folded.id, first.id,
+         "the entry keeps the id the table shows"
+      );
+      assert_eq!(
+         folded.dest,
+         DestMatcher::Set(vec![port(), domain()]),
+         "the destinations are one list, in answer order"
+      );
+      assert_eq!(folded.updated_at, 20);
+
+      let (again, applied) = policy.apply(to(port(), 30));
+      assert_eq!(
+         applied,
+         Applied::Refreshed,
+         "a destination the entry already covered is a refresh, not a fold"
+      );
+      assert_eq!(
+         again.dest, folded.dest,
+         "the list does not grow on a repeat"
+      );
+      assert_eq!(
+         again.updated_at, 30,
+         "the entry takes the newest answer"
+      );
+
+      let (_, applied) = policy.apply(rule_from_scope(
+         RuleId::new_unique(),
+         AppMatcher::Exe(PathBuf::from(FIREFOX)),
+         &netshield_core::ScopeRequest {
+            action: Action::Deny,
+            duration: Duration::Forever,
+            dest: port(),
+         },
+         40,
+      ));
+      assert_eq!(applied, Applied::Created, "a deny is its own row");
+      assert_eq!(policy.ruleset().len(), 2);
+   }
+
+   /// A disabled rule of the same app and verdict is re-enabled only by an answer about its own
+   /// destination: another destination extends the enabled entry and leaves the disabled rule alone.
+   #[test]
+   fn an_answer_does_not_reenable_a_rule_it_did_not_answer() {
+      let to = |dest: DestMatcher| {
+         rule_from_scope(
+            RuleId::new_unique(),
+            AppMatcher::Exe(PathBuf::from(FIREFOX)),
+            &netshield_core::ScopeRequest {
+               action: Action::Allow,
+               duration: Duration::Forever,
+               dest,
+            },
+            10,
+         )
+      };
+      let ports = DestMatcher::Port(443);
+      let other = DestMatcher::Port(53);
+
+      let mut policy = Policy::new(RuleSet::new(), DefaultAction::Prompt);
+      let (mut disabled, _) = policy.apply(to(ports.clone()));
+      disabled.enabled = false;
+      policy.upsert_rule(disabled);
+
+      let (created, applied) = policy.apply(to(other.clone()));
+      assert_eq!(
+         applied,
+         Applied::Created,
+         "a destination the disabled rule does not cover is a new enabled entry"
+      );
+      assert!(created.enabled, "a new entry is switched on");
+      assert_eq!(
+         policy.ruleset().iter().filter(|rule| rule.enabled).count(),
+         1,
+         "the switched-off rule stays off instead of being widened by an unrelated answer"
+      );
+      assert!(
+         policy.ruleset().iter().any(|rule| !rule.enabled),
+         "and it is still there to be switched back on"
+      );
+
+      let (answered, applied) = policy.apply(to(ports));
+      assert_eq!(
+         applied,
+         Applied::Merged,
+         "answering the disabled rule's own destination extends the enabled entry"
+      );
+      assert!(answered.enabled);
+      assert_eq!(policy.ruleset().len(), 2);
    }
 
    #[test]

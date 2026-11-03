@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::{Attribution, Connection};
+use crate::destlist::MAX_LIST_ENTRIES;
 use crate::ipnet::IpNet;
 
 /// A stable identifier for a rule.
@@ -288,6 +289,60 @@ pub fn rule_from_scope(id: RuleId, app: AppMatcher, scope: &ScopeRequest, now: u
       updated_at: now,
       last_matched: None,
       hits: 0,
+   }
+}
+
+/// Folds `incoming` into `incumbent` when the two are one entry of the rules table.
+///
+/// One application carries one verdict for one duration, so those three fields — plus whether the
+/// rule is switched on — are what a person reads as "the rule for this app". An answer about another
+/// destination therefore extends that rule instead of adding a second row that says the same thing,
+/// and the editor's list is exactly the union it accumulates. The fold changes nothing about what is
+/// enforced: a `Set` ranks by the entry that matched, so the union decides exactly what the separate
+/// rules decided.
+///
+/// `None` means the two are not one entry: another application, verdict, duration or state, or a
+/// union that would exceed [`MAX_LIST_ENTRIES`]. That last case stays two rules rather than becoming
+/// one the editor could not render back.
+pub fn fold_rules(incumbent: &Rule, incoming: &Rule) -> Option<Rule> {
+   if incumbent.app != incoming.app
+      || incumbent.action != incoming.action
+      || incumbent.duration != incoming.duration
+      || incumbent.enabled != incoming.enabled
+   {
+      return None;
+   }
+
+   let mut entries = destination_entries(&incumbent.dest);
+   for entry in destination_entries(&incoming.dest) {
+      if !entries.contains(&entry) {
+         entries.push(entry);
+      }
+   }
+   if entries.len() > MAX_LIST_ENTRIES {
+      return None;
+   }
+
+   Some(Rule {
+      id: incumbent.id.clone(),
+      enabled: incumbent.enabled,
+      app: incumbent.app.clone(),
+      dest: DestMatcher::from_entries(entries)?,
+      action: incumbent.action,
+      duration: incumbent.duration,
+      note: incumbent.note.clone().or_else(|| incoming.note.clone()),
+      created_at: incumbent.created_at.min(incoming.created_at),
+      updated_at: incumbent.updated_at.max(incoming.updated_at),
+      last_matched: incumbent.last_matched.max(incoming.last_matched),
+      hits: incumbent.hits.saturating_add(incoming.hits),
+   })
+}
+
+/// The entries a destination matcher is a union of, so a fold can rebuild that union.
+fn destination_entries(dest: &DestMatcher) -> Vec<DestMatcher> {
+   match dest {
+      DestMatcher::Set(entries) => entries.clone(),
+      single => vec![single.clone()],
    }
 }
 
@@ -858,6 +913,168 @@ mod tests {
             ..conn()
          }),
          "an entry that matches alone cannot make the set match"
+      );
+   }
+
+   /// The helper for the fold tests: firefox, deny, forever, at t=100.
+   fn guarded(dest: DestMatcher) -> Rule {
+      rule_from_scope(
+         RuleId::new_unique(),
+         AppMatcher::Exe(PathBuf::from("/usr/lib/firefox/firefox")),
+         &ScopeRequest {
+            action: Action::Deny,
+            duration: Duration::Forever,
+            dest,
+         },
+         100,
+      )
+   }
+
+   #[test]
+   fn a_fold_is_one_rule_for_the_application() {
+      let mut first = guarded(DestMatcher::Ip(
+         "198.51.100.20/32".parse().unwrap(),
+      ));
+      first.hits = 3;
+      first.last_matched = Some(500);
+      first.note = Some("the deny for firefox".to_owned());
+
+      let mut second = guarded(DestMatcher::Ip(
+         "198.51.100.21/32".parse().unwrap(),
+      ));
+      second.created_at = 200;
+      second.updated_at = 300;
+      second.hits = 4;
+      second.last_matched = Some(600);
+
+      let folded = fold_rules(&first, &second).expect("one application is one entry");
+      assert_eq!(
+         folded.id, first.id,
+         "the incumbent keeps the id the table, the store and the GUI refer to"
+      );
+      assert_eq!(
+         folded.dest,
+         DestMatcher::Set(vec![
+            DestMatcher::Ip("198.51.100.20/32".parse().unwrap()),
+            DestMatcher::Ip("198.51.100.21/32".parse().unwrap()),
+         ]),
+         "the union is one destination list, in the order the answers arrived"
+      );
+      assert_eq!(
+         folded.created_at, 100,
+         "the entry keeps the age of its first answer"
+      );
+      assert_eq!(
+         folded.updated_at, 300,
+         "the entry takes the newest answer"
+      );
+      assert_eq!(
+         folded.hits, 7,
+         "the counters are the entry's whole history, not the last answer's"
+      );
+      assert_eq!(folded.last_matched, Some(600));
+      assert_eq!(
+         folded.note.as_deref(),
+         Some("the deny for firefox")
+      );
+   }
+
+   #[test]
+   fn rules_that_are_not_one_entry_do_not_fold() {
+      let base = guarded(DestMatcher::Port(443));
+      let other = guarded(DestMatcher::Port(53));
+      assert!(
+         fold_rules(&base, &other).is_some(),
+         "the same app, verdict and duration is one entry whatever its destinations"
+      );
+
+      let mut allow = other.clone();
+      allow.action = Action::Allow;
+      assert_eq!(
+         fold_rules(&base, &allow),
+         None,
+         "a verdict is never merged with its opposite"
+      );
+
+      let mut session = other.clone();
+      session.duration = Duration::Session;
+      assert_eq!(
+         fold_rules(&base, &session),
+         None,
+         "how long a decision lasts is part of the entry"
+      );
+
+      let mut disabled = other.clone();
+      disabled.enabled = false;
+      assert_eq!(
+         fold_rules(&base, &disabled),
+         None,
+         "a switched-off rule must not be widened by an answer"
+      );
+
+      let mut elsewhere = other.clone();
+      elsewhere.app = AppMatcher::Exe(PathBuf::from("/usr/bin/curl"));
+      assert_eq!(
+         fold_rules(&base, &elsewhere),
+         None,
+         "another application is always another row"
+      );
+   }
+
+   #[test]
+   fn a_fold_widens_a_list_and_anywhere_covers_it() {
+      let incumbent = guarded(DestMatcher::Set(vec![
+         DestMatcher::Domain {
+            host: "api.github.com".to_owned(),
+            subdomains: false,
+         },
+         DestMatcher::Ip("140.82.0.0/16".parse().unwrap()),
+      ]));
+
+      let repeated = guarded(DestMatcher::Domain {
+         host: "api.github.com".to_owned(),
+         subdomains: false,
+      });
+      assert_eq!(
+         fold_rules(&incumbent, &repeated).map(|rule| rule.dest),
+         Some(incumbent.dest.clone()),
+         "a destination the rule already covers changes nothing"
+      );
+
+      let anywhere = guarded(DestMatcher::Any);
+      assert_eq!(
+         fold_rules(&incumbent, &anywhere).map(|rule| rule.dest),
+         Some(DestMatcher::Any),
+         "an answer for anywhere is the union of the list with everything"
+      );
+   }
+
+   #[test]
+   fn a_fold_that_would_exceed_the_list_cap_stays_two_rules() {
+      let net = |index: usize| {
+         DestMatcher::Ip(IpNet::host(IpAddr::V4(Ipv4Addr::new(
+            10,
+            (index / 256) as u8,
+            (index % 256) as u8,
+            1,
+         ))))
+      };
+      let entries = (0..MAX_LIST_ENTRIES).map(net).collect::<Vec<_>>();
+
+      let at_cap = guarded(DestMatcher::Set(
+         entries[..MAX_LIST_ENTRIES - 1].to_vec(),
+      ));
+      assert_eq!(
+         fold_rules(&at_cap, &guarded(net(MAX_LIST_ENTRIES - 1))).map(|rule| rule.dest),
+         Some(DestMatcher::Set(entries.clone())),
+         "the cap itself is allowed"
+      );
+
+      let full = guarded(DestMatcher::Set(entries));
+      assert_eq!(
+         fold_rules(&full, &guarded(net(MAX_LIST_ENTRIES))),
+         None,
+         "a union past the cap is its own rule, not a list the editor could not show"
       );
    }
 

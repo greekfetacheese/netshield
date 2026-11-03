@@ -292,6 +292,18 @@ fn missing_client_warning(id: u64, app: &str, dest: &str, timeout_secs: u64) -> 
    )
 }
 
+/// How a prompt's answer reached the rule set, for the decision log.
+///
+/// A fold is worth naming separately from a refresh: the user's complaint was a table with one row
+/// per answered destination, and this is the count that proves an answer extended the app's row
+/// instead of adding one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AppliedRules {
+   created: usize,
+   refreshed: usize,
+   folded: usize,
+}
+
 /// The daemon's runtime state, owned by the main loop.
 struct Daemon {
    config: Config,
@@ -610,6 +622,34 @@ fn ruleset_from_store(store: &RuleStore) -> netshield_core::RuleSet {
    set
 }
 
+/// Folds the stored rules that are one entry of the rules table into one, so a store written while
+/// an answer still added a row per destination does not keep showing those rows.
+///
+/// The fold is derived from the store itself, so a failed write costs only this start: the next one
+/// folds the same records again. The rewritten rule is written before the absorbed ids are removed,
+/// so a failure in between leaves a duplicate rather than a lost destination.
+fn fold_stored_rules(store: &mut RuleStore) -> usize {
+   let mut set = ruleset_from_store(store);
+   let folded = set.coalesce();
+   if folded.is_empty() {
+      return 0;
+   }
+   if let Err(err) = store.upsert_many(&folded.rewritten) {
+      error!("could not persist the folded rules: {err}");
+      return 0;
+   }
+   for id in &folded.absorbed {
+      if let Err(err) = store.remove(id) {
+         error!("could not remove a folded duplicate rule {id}: {err}");
+      }
+   }
+   info!(
+      "folded {} stored rule(s) into their application's rule",
+      folded.absorbed.len()
+   );
+   folded.absorbed.len()
+}
+
 /// Seconds since the Unix epoch, or 0 when the clock is before it.
 fn now_secs() -> u64 {
    SystemTime::now()
@@ -642,7 +682,8 @@ pub fn run(config: Config, rules_path: &Path, socket_path: &Path) -> Result<(), 
    SHUTDOWN.store(false, Ordering::SeqCst);
    install_signal_handlers().map_err(DaemonError::Thread)?;
 
-   let (store, _seeded) = RuleStore::load_or_seed(&config.rules_path);
+   let (mut store, _seeded) = RuleStore::load_or_seed(&config.rules_path);
+   fold_stored_rules(&mut store);
    info!(
       "loaded {} rule(s) from {}",
       store.rules().len(),
@@ -1135,7 +1176,7 @@ impl Daemon {
          ScopeChoice::Address => first.connection.remote.addr.to_string(),
          ScopeChoice::TheseDestinations => format!("{} destinations", record.dests.len()),
       };
-      let (mechanism, created, updated) = match decide.duration {
+      let (mechanism, applied) = match decide.duration {
          RuleDuration::Once => {
             for dest in &record.dests {
                // Only a flow the daemon can tie to a process is worth remembering: an unattributed
@@ -1156,26 +1197,23 @@ impl Daemon {
             }
             (
                format!("created a once flow grant for {app}"),
-               0, // a grant is not a rule
-               0,
+               AppliedRules::default(), // a grant is not a rule
             )
          }
          RuleDuration::Session => {
-            let (created, updated) = self.apply_rules(&record, &decide, now);
+            let applied = self.apply_rules(&record, &decide, now);
             self.publish_rules();
             (
                format!("created an in-memory {app_kind} rule for {app}"),
-               created,
-               updated,
+               applied,
             )
          }
          RuleDuration::Forever => {
-            let (created, updated) = self.apply_rules(&record, &decide, now);
+            let applied = self.apply_rules(&record, &decide, now);
             self.publish_rules();
             (
                format!("created and persisted a forever {app_kind} rule for {app}"),
-               created,
-               updated,
+               applied,
             )
          }
       };
@@ -1183,8 +1221,9 @@ impl Daemon {
       let line = decision_line(record.id, &app, &dest, &decide, &scope);
       info!("{line}");
       info!(
-         "answer for prompt {}: {created} rules created, {updated} refreshed",
-         record.id
+         "answer for prompt {}: {} rule(s) created, {} refreshed, {} folded into the application's \
+          rule",
+         record.id, applied.created, applied.refreshed, applied.folded
       );
 
       let Some(resolved) = self.pending.resolve(record.id) else {
@@ -1221,29 +1260,28 @@ impl Daemon {
       self.publish_status();
    }
 
-   /// Applies the rules a prompt's answer implies, refreshing equivalents instead of
-   /// duplicating them, and persists each rule whose duration is `Forever`.
+   /// Applies the rules a prompt's answer implies, folding each into the application's entry
+   /// instead of duplicating it, and persists each rule whose duration is `Forever`.
    ///
-   /// Returns how many rules were created and how many already-present rules were
-   /// refreshed, so the decision log can say which happened.
+   /// Returns what the answer did to the rule set, so the decision log can say which happened.
    fn apply_rules(
       &mut self,
       record: &PromptRecord,
       decide: &DecideRequest,
       now: u64,
-   ) -> (usize, usize) {
-      let mut created = 0;
-      let mut updated = 0;
-      let mut forever = Vec::new();
+   ) -> AppliedRules {
+      let mut applied = AppliedRules::default();
+      let mut forever: Vec<Rule> = Vec::new();
       for rule in rules_for(record, decide, now) {
          // Read before the move: `policy.apply` takes the rule by value.
          let persist = rule.duration == RuleDuration::Forever;
-         let (rule, applied) = self.policy.apply(rule);
-         match applied {
-            Applied::Created => created += 1,
-            Applied::Refreshed => updated += 1,
+         let (rule, outcome) = self.policy.apply(rule);
+         match outcome {
+            Applied::Created => applied.created += 1,
+            Applied::Refreshed => applied.refreshed += 1,
+            Applied::Merged => applied.folded += 1,
          }
-         if persist {
+         if persist && !forever.iter().any(|stored| stored.id == rule.id) {
             forever.push(rule);
          }
       }
@@ -1256,7 +1294,7 @@ impl Daemon {
             forever.len()
          );
       }
-      (created, updated)
+      applied
    }
 
    /// Answers the open prompts that the current policy already decides, so the user is not
@@ -4343,9 +4381,9 @@ mod tests {
 
    /// Answering the same group with the same scope twice refreshes the one rule instead of
    /// adding a second, a disabled equivalent is re-enabled rather than shadowed, and the same
-   /// app answered for another address is a different destination whose rule list must grow.
+   /// app answered for another address widens that one rule rather than adding a row per address.
    #[test]
-   fn an_answer_refreshes_an_identical_rule_or_creates_a_new_one() {
+   fn an_answer_refreshes_an_identical_rule_or_folds_a_new_destination_into_it() {
       // The same group, same scope: the second answer is an update of the one rule.
       let (id, record) = six_destination_group();
       let decide = DecideRequest {
@@ -4400,8 +4438,8 @@ mod tests {
       );
       assert_eq!(stored.updated_at, 200);
 
-      // The same app answered for another address is a different destination, not a
-      // duplicate: the rule list must grow.
+      // The same app answered for another address is the same entry, not a duplicate row: the
+      // one rule the table shows gains the destination.
       let decide = || DecideRequest {
          prompt_id: 1,
          action: Action::Allow,
@@ -4421,12 +4459,129 @@ mod tests {
       );
 
       assert_eq!(policy.apply(first).1, Applied::Created);
-      assert_eq!(policy.apply(second).1, Applied::Created);
+      assert_eq!(policy.apply(second).1, Applied::Merged);
       assert_eq!(
          policy.ruleset().len(),
-         2,
-         "another address is another rule"
+         1,
+         "one application is one entry in the rules table"
       );
+      let stored = policy.ruleset().iter().next().expect("the entry");
+      assert_eq!(
+         stored.dest,
+         DestMatcher::Set(vec![
+            DestMatcher::Ip("198.51.100.20/32".parse().expect("a literal address")),
+            DestMatcher::Ip("198.51.100.21/32".parse().expect("a literal address")),
+         ]),
+         "the answered destinations are one list, in the order they were answered"
+      );
+   }
+
+   /// One answer that covers several destinations leaves one row for the application, with every
+   /// destination the prompt showed in its list -- the shape the alert's scope already describes.
+   #[test]
+   fn one_answer_for_several_destinations_is_one_rule() {
+      let (id, record) = six_destination_group();
+      let decide = DecideRequest {
+         prompt_id: id,
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         scope: ScopeChoice::TheseDestinations,
+      };
+      let answered = rules_for(&record, &decide, 100);
+      assert_eq!(
+         answered.len(),
+         6,
+         "the scope still names every destination the prompt showed"
+      );
+
+      let mut policy = prompting_policy();
+      for rule in answered {
+         policy.apply(rule);
+      }
+
+      assert_eq!(
+         policy.ruleset().len(),
+         1,
+         "the rules table must show one row for the application"
+      );
+      let stored = policy.ruleset().iter().next().expect("the entry");
+      match &stored.dest {
+         DestMatcher::Set(entries) => assert_eq!(
+            entries.len(),
+            6,
+            "every answered destination is in the one list"
+         ),
+         other => panic!("the six destinations must be one list, got {other:?}"),
+      }
+   }
+
+   /// A store written before the table held one row per application is folded when the daemon loads
+   /// it: the merged rule is written back and the records it absorbed are gone from the file.
+   #[test]
+   fn loading_a_store_folds_the_rows_for_one_application() {
+      use std::time::{SystemTime, UNIX_EPOCH};
+
+      let nanos = SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+         .map_or(0, |elapsed| elapsed.as_nanos());
+      let path = std::env::temp_dir().join(format!("netshield-daemon-fold-{nanos}.db"));
+      let (mut store, _seeded) = RuleStore::load_or_seed(&path);
+
+      let stored = |dest: &str| Rule {
+         id: RuleId::new_unique(),
+         enabled: true,
+         app: AppMatcher::Exe(std::path::PathBuf::from(
+            "/usr/lib/firefox/firefox",
+         )),
+         dest: DestMatcher::Ip(dest.parse().expect("a literal address")),
+         action: Action::Allow,
+         duration: RuleDuration::Forever,
+         note: None,
+         created_at: 1,
+         updated_at: 1,
+         last_matched: None,
+         hits: 0,
+      };
+      let first = stored("198.51.100.20/32");
+      let second = stored("198.51.100.21/32");
+      store
+         .upsert_many(&[first.clone(), second.clone()])
+         .expect("the fixture rules persist");
+
+      assert_eq!(
+         fold_stored_rules(&mut store),
+         1,
+         "the second row folds into the first"
+      );
+      assert!(
+         store.rules().iter().all(|rule| rule.id != second.id),
+         "the absorbed row is gone from memory"
+      );
+
+      let entry = |store: &RuleStore| {
+         store
+            .rules()
+            .iter()
+            .find(|rule| rule.id == first.id)
+            .map(|rule| rule.dest.clone())
+      };
+      let expected = Some(DestMatcher::Set(vec![
+         DestMatcher::Ip("198.51.100.20/32".parse().expect("a literal address")),
+         DestMatcher::Ip("198.51.100.21/32".parse().expect("a literal address")),
+      ]));
+      assert_eq!(
+         entry(&store),
+         expected,
+         "the surviving row carries both"
+      );
+
+      drop(store);
+      let (reloaded, _seeded) = RuleStore::load_or_seed(&path);
+      assert!(
+         reloaded.rules().iter().all(|rule| rule.id != second.id),
+         "the absorbed record must leave the file, or it returns at the next start"
+      );
+      assert_eq!(entry(&reloaded), expected);
    }
 
    /// A rule revokes the executable it names, and nothing wider.

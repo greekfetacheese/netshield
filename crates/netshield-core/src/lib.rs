@@ -24,4 +24,4 @@ pub use rule::{
    Action, AppMatcher, DestMatcher, Duration, Rule, RuleError, RuleId, ScopeRequest,
    normalize_host, rule_from_scope,
 };
-pub use ruleset::{Outcome, RuleSet};
+pub use ruleset::{Coalesced, Outcome, RuleSet};
