@@ -2385,10 +2385,12 @@ fn app_exe_and_uid(connection: &Connection) -> Option<(std::path::PathBuf, u32)>
    }
 }
 
-/// Whether `exe` sits in a directory `uid` can write.
+/// Whether `exe` sits in a directory a user can replace the binary in.
 ///
 /// A path whose directory cannot be read is not writable: it cannot be shown plantable, and
-/// guessing in the narrow direction would refuse answers for absent binaries.
+/// guessing in the narrow direction would refuse answers for absent binaries. A root-owned
+/// directory is not one `uid` may write unless it is world-writable, which is what keeps a root-run
+/// system daemon's app-wide answer from being narrowed to whatever destination was on screen.
 fn exe_directory_writable(exe: &std::path::Path, uid: u32) -> bool {
    let Some(parent) = exe.parent() else {
       return false;

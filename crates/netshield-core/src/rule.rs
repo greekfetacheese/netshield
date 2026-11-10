@@ -402,9 +402,14 @@ pub fn exe_is_interpreter(exe: &Path) -> bool {
 /// Whether a directory with this owner and mode can be written by `uid`.
 ///
 /// Owner-write or other-write: the group case needs `/etc/group` and buys nothing here, because
-/// the writer we are worried about is the app's own uid.
+/// the writer we are worried about is the app's own uid. A root-owned directory never answers yes on
+/// the owner bit, not even for root: root can write anywhere, so counting `/usr/bin` and `/usr/sbin`
+/// as writable by the system daemons that run out of them narrowed every app-wide answer for one to
+/// the destinations that happened to be on screen, and those daemons prompted again on every new
+/// connection. What the check is for is a directory a user could replace the binary in, so a
+/// world-writable one still answers yes.
 pub fn directory_writable_by(dir_uid: u32, dir_mode: u32, uid: u32) -> bool {
-   (dir_uid == uid && dir_mode & 0o200 != 0) || dir_mode & 0o002 != 0
+   (dir_uid != 0 && dir_uid == uid && dir_mode & 0o200 != 0) || dir_mode & 0o002 != 0
 }
 
 /// Why a raw hostname could not be normalized.
@@ -1230,6 +1235,10 @@ mod tests {
       assert!(
          !directory_writable_by(0, 0o040755, 1000),
          "a root-owned 0755 directory is not writable by uid 1000"
+      );
+      assert!(
+         !directory_writable_by(0, 0o040755, 0),
+         "root's own 0755 directory is not one a user replaces a binary in, even when root runs it"
       );
       assert!(
          directory_writable_by(0, 0o041777, 1000),
