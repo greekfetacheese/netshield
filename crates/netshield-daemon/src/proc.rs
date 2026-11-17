@@ -30,9 +30,9 @@ use crate::firewall::Flow;
 
 /// How long an inode→pid, pid→fd or flow→owner answer may be reused.
 ///
-/// Short on purpose: inodes and port tuples are recycled as soon as a socket closes, so a
-/// longer TTL could attribute a new socket to the previous owner. One second still
-/// collapses the burst of per-packet lookups a single connection produces.
+/// Short on purpose: a port tuple is recycled as soon as a socket closes, so a longer TTL could
+/// attribute a new socket to the previous owner. One second still collapses the burst of
+/// per-packet lookups a single connection produces.
 const CACHE_TTL: StdDuration = StdDuration::from_secs(1);
 
 /// How long a flow that just missed stays marked so its next packets do not rescan.
@@ -466,6 +466,22 @@ impl Attributor {
    /// every packet the caller has already received, because a socket exists before the packet it sends.
    pub fn begin_batch(&mut self, arrived_at: Instant) {
       self.batch_arrived = Some(arrived_at);
+   }
+
+   /// Drops cached answers whose one-second life has passed.
+   ///
+   /// Both maps normally prune lazily on a lookup of the same key, which works for a flow tuple
+   /// but not for a socket inode or a pid: the kernel does not hand one inode to a second socket
+   /// and a dead pid never returns, so an entry whose key never repeats would otherwise stay for
+   /// the life of the daemon. The daemon loop calls this once per second, so each cache holds at
+   /// most one second of attribution traffic.
+   pub fn expire(&mut self, now: Instant) {
+      self
+         .inode_to_pid
+         .retain(|_, entry| now.saturating_duration_since(entry.at) < CACHE_TTL);
+      self
+         .pid_fds
+         .retain(|_, entry| now.saturating_duration_since(entry.at) < CACHE_TTL);
    }
 
    /// Attributes the socket owning this outbound flow.
@@ -3404,6 +3420,55 @@ mod tests {
          );
       }
       assert!(attributor.flow_owners.len() <= MAX_FLOWS);
+   }
+
+   #[test]
+   fn the_attributor_sweep_drops_entries_older_than_one_second() {
+      let mut attributor = Attributor::new();
+      let start = Instant::now();
+      attributor.inode_to_pid.insert(
+         7,
+         InodeCacheEntry {
+            pid: 11,
+            uid: 1000,
+            created: None,
+            at: start,
+         },
+      );
+      attributor.pid_fds.insert(
+         11,
+         FdCacheEntry {
+            sockets: vec![SocketInode {
+               inode: 7,
+               fd: 3,
+               created: None,
+            }],
+            uid: 1000,
+            at: start,
+         },
+      );
+
+      attributor.expire(start);
+      assert_eq!(
+         attributor.inode_to_pid.len(),
+         1,
+         "a fresh inode entry survives"
+      );
+      assert_eq!(
+         attributor.pid_fds.len(),
+         1,
+         "a fresh descriptor snapshot survives"
+      );
+
+      attributor.expire(start + CACHE_TTL);
+      assert!(
+         attributor.inode_to_pid.is_empty(),
+         "an inode the kernel will not reuse must not outlive its TTL"
+      );
+      assert!(
+         attributor.pid_fds.is_empty(),
+         "a dead pid's descriptor snapshot must not outlive its TTL"
+      );
    }
 
    #[test]
