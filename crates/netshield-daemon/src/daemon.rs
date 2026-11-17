@@ -1796,6 +1796,10 @@ impl Daemon {
          // evidence of a bug, not a reason to stop enforcing — and a panic here leaves the table
          // installed with no queue bound, which the kernel accepts.
          self.dns_cache.lock().unwrap_or_else(PoisonError::into_inner).expire(epoch);
+         // Both attributor caches are keyed by values the kernel never reuses — a socket inode
+         // and a pid — so their lazy per-key expiry can never run for an entry whose key does not
+         // repeat. Sweeping them here bounds them to one second of attribution traffic.
+         self.attributor.expire(now);
       }
    }
 
