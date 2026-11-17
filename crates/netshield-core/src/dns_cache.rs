@@ -17,6 +17,14 @@ pub const MAX_TTL_SECS: u32 = 3600;
 /// oldest name is dropped, which is the one `names_for` would have ranked last anyway.
 pub const MAX_NAMES_PER_ADDR: usize = 16;
 
+/// Most distinct addresses the cache holds at once.
+///
+/// The TTL bounds how long a name lives; this bounds how much the cache can hold while a flood
+/// keeps every entry live. A desktop names a few thousand addresses an hour, so the cap is far
+/// above normal use; past it a new address is not cached and the flow stays unattributed, which
+/// is the same answer a cache miss gives.
+pub const MAX_ADDRESSES: usize = 8192;
+
 /// One name learned for one address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -48,8 +56,13 @@ impl DnsCache {
    /// Records that `name` resolved to `ip` with `ttl` seconds of life.
    ///
    /// The TTL is clamped to `1..=MAX_TTL_SECS`. Re-inserting a name refreshes its expiry
-   /// and moves it to the front instead of duplicating it.
+   /// and moves it to the front instead of duplicating it. A new address past
+   /// [`MAX_ADDRESSES`] is not cached: the sweep frees the expired ones, and waiting for it
+   /// is the bound that keeps a flood from growing the cache.
    pub fn insert(&mut self, ip: IpAddr, name: &str, ttl: u32, now: u64) {
+      if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_ADDRESSES {
+         return;
+      }
       let ttl = ttl.clamp(1, MAX_TTL_SECS);
       let expires_at = now.saturating_add(u64::from(ttl));
       let names = self.entries.entry(ip).or_default();
@@ -225,6 +238,43 @@ mod tests {
          !names.contains(&"n0.example"),
          "the oldest name is the one dropped"
       );
+   }
+
+   #[test]
+   fn a_flood_of_addresses_is_capped() {
+      let mut cache = DnsCache::new();
+      for index in 0..(MAX_ADDRESSES + 8) {
+         let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            (index >> 8) as u8,
+            (index & 0xFF) as u8,
+            1,
+         ));
+         cache.insert(ip, "flood.example", 60, 0);
+      }
+      assert_eq!(
+         cache.len(),
+         MAX_ADDRESSES,
+         "the cache bounds distinct addresses as well as names per address"
+      );
+
+      let rejected = IpAddr::V4(Ipv4Addr::new(
+         10,
+         (MAX_ADDRESSES >> 8) as u8,
+         (MAX_ADDRESSES & 0xFF) as u8,
+         1,
+      ));
+      assert_eq!(
+         cache.primary(rejected, 1),
+         None,
+         "past the cap, a new address is not cached"
+      );
+
+      // The once-per-second sweep is what frees the room again.
+      cache.expire(61);
+      assert_eq!(cache.len(), 0);
+      cache.insert(rejected, "later.example", 60, 61);
+      assert_eq!(cache.primary(rejected, 61), Some("later.example"));
    }
 
    #[test]
