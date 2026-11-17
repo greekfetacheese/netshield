@@ -59,6 +59,15 @@ const MAX_PIDS: usize = 4096;
 /// Most descriptors one pid's scan may examine.
 const MAX_FDS: usize = 4096;
 
+/// Most identities the process cache keeps.
+///
+/// The proc connector's exit feed is the normal bound; this is the backstop that keeps one
+/// missed exit from pinning a `CachedIdentity` for the life of the daemon.
+const MAX_IDENTITIES: usize = 4096;
+
+/// The capacity a swept cache falls back to once a burst is over.
+const CACHE_SHRINK_FLOOR: usize = 1024;
+
 /// Most unconnected UDP rows one lookup may consider as ownership candidates.
 ///
 /// A local port shared by more sockets than this is not a desktop resolver pattern; the
@@ -272,7 +281,14 @@ impl ProcessCache {
    }
 
    /// Inserts one identity, replacing any earlier record for the pid.
+   ///
+   /// At [`MAX_IDENTITIES`] the cache is dropped rather than grown: every entry can be rebuilt
+   /// from `/proc` on the next lookup, while a missed exit would otherwise keep a dead pid's
+   /// identity for the life of the daemon.
    fn insert(&mut self, pid: u32, identity: CachedIdentity) {
+      if self.identities.len() >= MAX_IDENTITIES && !self.identities.contains_key(&pid) {
+         self.identities.clear();
+      }
       self.identities.insert(pid, identity);
    }
 }
@@ -482,6 +498,8 @@ impl Attributor {
       self
          .pid_fds
          .retain(|_, entry| now.saturating_duration_since(entry.at) < CACHE_TTL);
+      shrink_after_burst(&mut self.inode_to_pid);
+      shrink_after_burst(&mut self.pid_fds);
    }
 
    /// Attributes the socket owning this outbound flow.
@@ -984,12 +1002,16 @@ impl Attributor {
          return None;
       }
       let per_lookup_ms = |nanos: u64| nanos as f64 / 1_000_000.0 / lookups as f64;
+      let identities = self.process_cache.lock().map(|cache| cache.len()).unwrap_or_default();
       let line = format!(
          "attribution: {lookups} lookups in 30s, {table_reads} table reads, {fd_scans} fd scans, \
-          {:.2}ms/lookup (table {:.2}ms, fd {:.2}ms)",
+          {:.2}ms/lookup (table {:.2}ms, fd {:.2}ms), caches: inode {} fd {} identities {}",
          per_lookup_ms(attribute_ns),
          per_lookup_ms(table_ns),
          per_lookup_ms(fd_ns),
+         self.inode_to_pid.len(),
+         self.pid_fds.len(),
+         identities,
       );
       self.last_perf_summary = Some(now);
       self.last_summary_stats = current;
@@ -1526,6 +1548,16 @@ fn uid_label(uid: Option<u32>) -> String {
 /// Elapsed nanoseconds since `started`, saturated so a long-lived daemon cannot wrap a counter.
 fn elapsed_ns(started: Instant) -> u64 {
    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Returns a swept cache's bucket array once a burst is over.
+///
+/// `retain` drops the entries but keeps the capacity the cache needed at its peak, so a
+/// one-second flood would otherwise leave that allocation resident for the rest of the run.
+fn shrink_after_burst<K: Eq + std::hash::Hash, V>(map: &mut HashMap<K, V>) {
+   if map.capacity() > CACHE_SHRINK_FLOOR * 4 && map.len() <= CACHE_SHRINK_FLOOR {
+      map.shrink_to(CACHE_SHRINK_FLOOR);
+   }
 }
 
 impl Default for Attributor {
@@ -3468,6 +3500,54 @@ mod tests {
       assert!(
          attributor.pid_fds.is_empty(),
          "a dead pid's descriptor snapshot must not outlive its TTL"
+      );
+   }
+
+   #[test]
+   fn a_swept_cache_gives_a_burst_capacity_back() {
+      let mut attributor = Attributor::new();
+      let start = Instant::now();
+      for inode in 0..10_000u32 {
+         attributor.inode_to_pid.insert(
+            inode,
+            InodeCacheEntry {
+               pid: 1,
+               uid: 1000,
+               created: None,
+               at: start,
+            },
+         );
+      }
+      assert!(attributor.inode_to_pid.capacity() >= 10_000);
+
+      attributor.expire(start + CACHE_TTL);
+      assert!(attributor.inode_to_pid.is_empty());
+      assert!(
+         attributor.inode_to_pid.capacity() <= CACHE_SHRINK_FLOOR * 2,
+         "a sweep must return a burst's capacity, not keep it: {}",
+         attributor.inode_to_pid.capacity()
+      );
+   }
+
+   #[test]
+   fn the_identity_cache_is_capped() {
+      let mut cache = ProcessCache::new();
+      for pid in 0..=MAX_IDENTITIES as u32 {
+         cache.insert(
+            pid,
+            CachedIdentity {
+               exe: Some(PathBuf::from("/usr/bin/curl")),
+               comm: "curl".to_owned(),
+               uid: 1000,
+               starttime: 1,
+               image_started: None,
+            },
+         );
+      }
+      assert!(
+         cache.len() <= MAX_IDENTITIES,
+         "a missed exit must not grow the identity cache without bound: {} entries",
+         cache.len()
       );
    }
 

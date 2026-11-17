@@ -78,6 +78,12 @@ const MAX_BATCH: usize = 512;
 /// Minimum gap between `dns: no name` debug lines for one address.
 const DNS_MISS_LOG_GAP: Duration = Duration::from_secs(1);
 
+/// How long one closed-flow line stays quiet for its address.
+///
+/// The same peers are seen repeatedly, and a line per address per second buried the journal;
+/// the connection log already carries every drop.
+const CLOSED_FLOW_LOG_GAP: Duration = Duration::from_secs(60);
+
 /// Minimum gap between denial lines for one unmodelled transport and ICMP type.
 ///
 /// A ping flood or an SCTP association would otherwise put one line per packet in the
@@ -365,7 +371,7 @@ impl Daemon {
          table_verified,
          verify_schedule: VerifySchedule::new(Instant::now(), TABLE_VERIFY_INTERVAL),
          dns_misses: MissLimiter::new(),
-         closed_flows: MissLimiter::new(),
+         closed_flows: MissLimiter::with_gap(CLOSED_FLOW_LOG_GAP),
          prompt_limit: MissLimiter::with_gap(PROMPT_LIMIT_LOG_GAP),
          transport_denials: KeyLimiter::new(TRANSPORT_LOG_GAP, TRANSPORT_LOG_LIMIT),
          multicast_logged: HashSet::new(),
@@ -909,7 +915,8 @@ impl Daemon {
          let now = Instant::now();
          self.sweep(now);
          if let Some(line) = self.attributor.perf_summary(now) {
-            info!("{line}");
+            let names = self.dns_cache.lock().unwrap_or_else(PoisonError::into_inner).len();
+            info!("{line}, dns names {names}");
          }
          self.verify_table(now);
       }
